@@ -12,13 +12,12 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    # Non-gating for the first run: the vsearch-tests suite already contains a
+    # Gating. The vsearch-tests suite already contains a
     # `valgrind --leak-check=full` block in every command script (guarded by
     # `which valgrind`). Installing valgrind activates all of them; each block
-    # fails its test on any leak or Memcheck error, so this job is gating by
-    # nature. continue-on-error keeps it from blocking merges until the first
-    # run confirms it is green on the (non-root) CI runner; flip to gating then.
-    continue-on-error: true
+    # fails its test on any leak or Memcheck error. The first CI run on the
+    # non-root runner was clean (94 valgrind sub-tests passed, 0 failed), so
+    # this job blocks merges on any new leak or uninitialised-memory read.
 
     env:
       # -O1 + frame pointers keeps the binary close to release behaviour while
