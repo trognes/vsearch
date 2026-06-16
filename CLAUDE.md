@@ -141,3 +141,41 @@ commands are not reentrant.
 issues with file:line references, severity ratings, and a suggested fix
 sequence. Consult it before changing the option parser, the binary-format
 parsers (UDB/SFF), the search/cluster hit handling, or the library lifecycle.
+
+## Contributing a fix upstream
+
+This is a development fork; upstream is `torognes/vsearch`. The fork carries
+commits that must **never** go upstream — `CODE_REVIEW.md`, `CLAUDE.md`,
+`.github/workflows/{sanitizers,valgrind}.yml`. So you never merge a whole fork
+branch upstream; you lift the individual fix commit(s) onto a branch based on
+upstream's tip and open a PR with exactly that diff.
+
+**The enabling habit: one fix = one atomic commit** touching only the real
+source files for that fix, with a message written as if addressing upstream.
+Keep edits to the review docs / CI workflows in *separate* commits. When fixes
+are isolated this way, sending one upstream is a single `git cherry-pick`.
+
+One-time setup:
+
+```bash
+git remote add upstream https://github.com/torognes/vsearch.git
+git fetch upstream
+```
+
+Per fix:
+
+```bash
+git switch -c fix/short-name upstream/master   # branch off upstream, not the fork
+git cherry-pick <sha-of-fix>                    # lift just the fix commit(s)
+./autogen.sh && ./configure CFLAGS="-O2" CXXFLAGS="-O2" && make ARFLAGS="cr"
+git push -u origin fix/short-name
+```
+
+Then open the PR from `fix/short-name` targeting `torognes/vsearch:master`.
+Because the branch is based on `upstream/master` and contains only the fix
+commit, the PR diff is exactly the fix — no review-doc or CI noise.
+
+If a fix is entangled with unrelated changes in one commit, isolate it before
+cherry-picking: `git cherry-pick -n <sha>` then unstage/keep only the relevant
+hunks, or `git format-patch -1 <sha>`, edit the patch, and `git am` it onto the
+clean branch.
