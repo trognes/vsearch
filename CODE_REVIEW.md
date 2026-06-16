@@ -614,6 +614,64 @@ consistent guard), so the reachability of each is edge-case but real.
 
 ---
 
+## Assertions / NDEBUG
+
+### A1. Input validation expressed as `assert()` is compiled out of every shipped build
+
+**The NDEBUG cliff is real and active.** The default build defines `NDEBUG`:
+`--enable-debug` defaults to `no` (`configure.ac:79–86`), so the `else` branch
+`AM_CFLAGS += -DNDEBUG` (`src/Makefile.am:44`) is selected. The generated
+Makefile confirms it — `am__append_6 = -DNDEBUG` is active and the `-UNDEBUG`
+debug profile is commented out. Therefore **all 137 `assert()` calls evaluate to
+nothing in every release/CI binary** (the `build-all.yml` release artifacts and
+`build-and-test.yml` both configure without `--enable-debug`). Even the
+sanitizer and Valgrind CI build without `--enable-debug`, so they do not
+exercise the asserts either.
+
+Most of the 137 are legitimate "can't happen" invariants and are fine as
+asserts — e.g. `assert(input_handle != nullptr)` in the fastx/fasta/fastq
+parsers (`fastx.cc:469`, `fasta.cc:175`, `fastq.cc:290`), the `log_handle !=
+nullptr` guards in `fastq_stats.cc` (×6), and `assert(a_string.back() == '\0')`
+(`sff_convert.cc:330, 349`). A null handle there is a program bug, not
+malformed input.
+
+**The problem is the subset that validates file-derived input.** These guard
+integer-overflow bounds on values read straight from an SFF file, and they are
+the *only* check on those values — so under NDEBUG a crafted SFF passes
+unchecked into the overflow the assert was meant to prevent:
+
+| Site | Asserted bound | Value source |
+|------|----------------|--------------|
+| `utils/round_up.hpp:117` | `input <= UINT16_MAX - stub` | the generic `round_up_to_8` overflow guard (the example the class note named) |
+| `sff_convert.cc:136` | `n_bytes <= UINT16_MAX - stub` | SFF flow/key region size |
+| `sff_convert.cc:258` | `flows_per_read <= UINT16_MAX - (header + key_length)` | `sff_header.flows_per_read`, read from file |
+| `sff_convert.cc:288` | `name_length <= UINT16_MAX - read_header_size` | `read_header.name_length`, read from file |
+| `sff_convert.cc:323` | `n_bytes_to_read < SIZE_MAX` | input-derived read length |
+
+The tell is that the **same parser already uses `fatal()` for the other
+malformed-input cases** — truncation and open failures (`sff_convert.cc:169,
+176, 180, 192, 217`). So the overflow bounds are the lone validations written as
+asserts; converting them to `fatal()` is consistent with the surrounding code
+and closes the hole in release builds. This compounds **S2** (the SFF
+`clip_start > clip_end` underflow): the SFF reader is the weakest input surface
+and several of its guards either vanish under NDEBUG (here) or are missing (S2).
+
+A borderline case worth a glance: `fastq_chars.cc:125–150` asserts a lookup
+index is in `[0, char_max]`. The index derives from an input byte but is bounded
+by `unsigned char` construction, so it is likely a true invariant — confirm the
+table is sized `char_max + 1` and leave as-is if so.
+
+- **Rule applied:** asserts are for "can't happen" invariants; a value read from
+  a file can happen, so it needs `fatal()` (or a recoverable error in the
+  library — see L1(a)), not `assert()`.
+- **Fix:** convert the five input-bound asserts above to `fatal()` with a clear
+  "invalid/corrupt SFF" message; leave the invariant asserts alone.
+- **Effort:** Low · **Impact:** Medium (closes release-build input-overflow
+  holes) · **Criticality:** Medium (crafted SFF; overlaps S2) · *verified
+  (NDEBUG default and the asserted input bounds)*
+
+---
+
 ## Enhancements
 
 ### E1. Half-finished migration from global `opt_*` variables to the `Parameters` struct
@@ -789,6 +847,7 @@ and low risk; listed for completeness only.
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
 | N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium |
+| A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
 | E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
@@ -805,7 +864,9 @@ and low risk; listed for completeness only.
 1. **Security first.** **S1** (critical OOB write from a crafted `.udb`), then
    **S2**, **S3**, **S4**, **S10** — all small, localized input/range checks.
    Confirm **S10** with an AddressSanitizer run. **S5–S9, S11** are
-   hardening/latent and can follow.
+   hardening/latent and can follow. Fix **A1** together with **S2** — both are
+   SFF-reader input checks (A1's overflow guards are asserts that vanish under
+   the default `-DNDEBUG`); convert them to `fatal()` in the same pass.
 2. **B1** — isolated, low-risk correctness fix.
 2b. **N1(a)** — high value for the cost: widening `count_t` removes a silent
    wrong-ranking bug on long-read data. Pair it with a long-read reference-output
