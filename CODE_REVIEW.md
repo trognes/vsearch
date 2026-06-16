@@ -434,6 +434,94 @@ section that follows, but is not confirmed as a bug here.)
 
 ---
 
+## Resource & lifecycle management
+
+### L1. Error-path resource handling — benign on the CLI, real leaks in the library API
+
+The premise of this class needs correcting before the real issues show up.
+`fatal()` is `__attribute__((noreturn))` and unconditionally calls
+`std::exit(EXIT_FAILURE)` (`utils/fatal.cpp`) — there is **no** recoverable
+error channel anywhere (no return codes, `setjmp`/`longjmp`, exceptions, or
+`atexit` handlers). Two consequences:
+
+1. On the **CLI**, every `fatal()` ends the process, so the open file handles
+   and `xmalloc`'d memory abandoned at an error are reclaimed by the OS — these
+   are **not real leaks**. The Valgrind CI confirms the happy path is clean:
+   "in use at exit: 0 bytes" across all 48 representative command runs.
+2. The real resource problems are all in the **library API** (`vsearch_api.h`,
+   shipped as `libvsearch_core.a`), where the process is *not* expected to exit.
+
+#### (a) `fatal()` terminates the caller's process — the dominant library issue
+
+Every core error path (parsers, allocators, the UDB/SFF readers behind S1–S4,
+and the search/cluster/chimera engines) bottoms out in `fatal()` →
+`std::exit()`. A library user who passes malformed input — and S1–S4 show such
+inputs exist — has their **entire host process killed**, with no chance to
+clean up. This is not a leak so much as the root cause that makes "error-path
+cleanup" moot on the CLI and unacceptable in a library. Overlaps E4 (global
+state) but is a distinct, higher-severity concern for library consumers.
+
+- **Effort:** High (thread a recoverable error channel through the core) ·
+  **Impact:** High · **Criticality:** Medium (library API) · *verified*
+
+#### (b) Session-mutex deadlock when the lifecycle is not completed
+
+`vsearch_init_defaults()` locks a global `session_mutex` (`vsearch.cc:803`) that
+only `vsearch_session_end()` unlocks (`vsearch.cc:1023`). Nothing guarantees the
+unlock runs: there is no scope guard, and the ~13-step teardown is manual. If a
+caller's session is abandoned before `vsearch_session_end()` (an exception in
+the embedding code, an early return, or a partial-failure handler), the mutex
+stays locked and the **next `vsearch_init_defaults()` blocks forever**. The
+header documents exactly this ("Forgetting to call `vsearch_session_end()` will
+cause the next `vsearch_init_defaults()` call to block indefinitely"). It is a
+lock leak with a deadlock payload, released on no error path.
+
+- **Effort:** Low (RAII/scope-guard unlock, or a try-lock with diagnostic) ·
+  **Impact:** Medium · **Criticality:** Medium · *verified*
+
+#### (c) Acknowledged heap leak across re-initialization
+
+`vsearch_init_defaults()` `xmalloc`s `opt_ee_cutoffs_values`, and the code
+comment (`vsearch.cc:785–787`) states plainly that "calling
+`vsearch_init_defaults` again … leaks the old allocation." Yet the header
+advertises "Multiple sequential sessions in the same process are supported."
+So the documented multi-session path leaks one allocation per session by
+design — small, but real and self-contradictory.
+
+- **Effort:** Low (free before re-alloc) · **Impact:** Low · **Criticality:** Low · *verified*
+
+#### (d) Manual, ordering-dependent teardown
+
+Cleanup is a hand-ordered reverse sequence (per-thread teardown → per-subsystem
+cleanup → `dbindex_free()` + `db_free()` → `vsearch_session_end()`). Nothing
+enforces it; a caller that mis-orders or skips a step leaks subsystem/thread
+state or the session lock (b). This compounds with E4: much per-command working
+state lives in file-`static` globals that the next session overwrites without
+freeing.
+
+- **Effort:** Medium · **Impact:** Medium · **Criticality:** Low–Medium
+
+#### Already clean (no action)
+
+- **Happy-path CLI runs** — Valgrind CI reports 0 bytes in use at exit for every
+  representative command (the `Valgrind (Memcheck)` workflow).
+- **Worker-thread mutex/alloc balance** — e.g. the allpairs worker unlocks
+  `mutex_output` and frees per-hit alignment strings on the normal path and
+  unlocks `mutex_input` on the no-work branch (`allpairs.cc:526, 540`); no
+  `fatal()` sits between a lock and its unlock in that worker.
+
+**Tooling note.** LeakSanitizer / Valgrind on *normal* runs will not surface any
+of the above — normal runs are clean. Catching (a)–(d) needs (i) error-input
+runs under Valgrind and (ii) an API-lifecycle test that runs **two** sessions
+and checks the mutex and heap. The recently added `api_examples/example_reinit.cc`
+is the natural vehicle for (ii).
+
+- **Overall — Effort:** High (driven by (a)) · **Impact:** High · **Criticality:** Medium
+- **Status:** *verified (fatal()=exit, session-lock/leak code paths, happy-path
+  cleanliness); library mis-use leaks are by construction, not reproduced*
+
+---
+
 ## Enhancements
 
 ### E1. Half-finished migration from global `opt_*` variables to the `Parameters` struct
@@ -607,6 +695,7 @@ and low risk; listed for completeness only.
 | B1 | `--log` qmin message → `stderr` not `fp_log` (×3) | Bug | Low | Low–Med | Medium |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
+| L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
 | E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
@@ -634,7 +723,11 @@ and low risk; listed for completeness only.
    priority while no big-endian target is supported.
 4. **E2 → E1 → E4** — the core architectural thread (single option table, finish
    the `Parameters` migration, then eliminate global state); E4 directly improves
-   library-API safety.
+   library-API safety. **L1** rides this thread: L1(b)/L1(c) are quick standalone
+   fixes (scope-guard the session unlock; free before re-init), but L1(a) — giving
+   the core a recoverable error channel instead of `fatal()`→`exit()` — is the
+   large library-API change that only becomes tractable once E4 removes the global
+   state it would have to unwind.
 5. **E3**, **E6**, **E7** — structural decomposition, largely unlocked by the above.
 
 > Note: several findings (S1–S4, S5, S6, S9) trace to file/CLI-derived values
