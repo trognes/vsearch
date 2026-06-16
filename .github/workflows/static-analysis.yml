@@ -78,7 +78,7 @@ jobs:
           echo
           echo "### cppcheck — findings by check id"
           echo '```'
-          grep -oE '\[[a-zA-Z]+\]' cppcheck.txt | sort | uniq -c | sort -rn
+          grep -oE '\[[a-zA-Z0-9_]+\]' cppcheck.txt | sort | uniq -c | sort -rn
           echo '```'
           echo "### cppcheck — error-severity findings"
           echo '```'
