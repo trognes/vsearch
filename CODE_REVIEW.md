@@ -346,6 +346,94 @@ compile-time warning.
 
 ---
 
+## Portability / undefined behavior
+
+### P1. Portability / UB sweep — width narrowing and endianness assumptions
+
+A pass for the portability/UB class. Two existing findings are concrete
+instances of it: **S5** (64-bit length → `int` in the print path) and **S12**
+(signed-`int` left-shift overflow in DUST, CI-confirmed). The sweep below
+covers the broader class and, importantly, records the two sub-areas that turn
+out to be **already handled** so no effort is spent re-checking them.
+
+#### Active issues
+
+**(a) Integer width-narrowing is wholesale, not isolated.** A `-Wconversion
+-Wsign-conversion` syntax pass over three files alone reports many narrowings:
+
+| File | `-Wconversion`/`-Wsign-conversion` warnings |
+|------|---------------------------------------------|
+| `src/fasta.cc` | 19 |
+| `src/sff_convert.cc` | 9 |
+| `src/mask.cc` | 43 |
+
+The specific `uint64_t length → int → "%.*s"` pattern that S5 documented for the
+fasta/fastq print interface recurs well beyond those sites — e.g. chimera output
+casts header lengths to `int` for `%.*s` in at least eight places
+(`chimera.cc:983, 985, 990, 995, 1580, 1582, …`, `(int)db_getheaderlen(...)`).
+Most warnings are benign sign-conversions, but they are the same family that
+produced S5 and S12, and there is no width-narrowing guard in the build.
+
+- **Tooling:** `-Wconversion`/`-Wsign-conversion` flags the narrowing at compile
+  time (not currently enabled — the build uses `-Wall -Wextra -Wpedantic`,
+  `src/Makefile.am:3`); UBSan catches the signed-overflow subset at runtime
+  (already wired up, and it found S12).
+- **Effort:** Medium–High (wholesale) · **Impact:** Medium · **Criticality:** Low–Medium
+
+**(b) Endianness assumptions — the code is little-endian-only in two places.**
+
+- **SFF reader:** `bswap_16/32/64` are applied **unconditionally** to convert
+  big-endian SFF fields to host order, with the explicit assumption that the
+  host is little-endian (`sff_convert.cc:195–197`, "vsearch expects
+  little-endian"). There is no `BYTE_ORDER` guard, so on a big-endian host every
+  multi-byte SFF field is swapped the wrong way and parsing is silently wrong.
+- **UDB database:** no byteswapping anywhere (`udb.cc`). The binary `.udb`
+  format is read and written in **host** byte order, so a `.udb` is not portable
+  across endianness — and, combined with the `int`-typed `header_index`
+  (see S9), not portable across int width either.
+- `sha1.c:105` carries a self-flagged `FIXME` about doing the transform in an
+  endian-proof way.
+- **Not exercised in CI:** the `build-all.yml` target matrix (x86-64, aarch64,
+  ppc64le, mips64el, riscv64) is **entirely little-endian**, so the big-endian
+  paths above are never built or run.
+- **Effort:** Medium · **Impact:** Low (no big-endian target in practice) ·
+  **Criticality:** Low — but it is a real gap against the cross-platform
+  portability the build matrix advertises.
+
+**(c) `fread` directly into a struct (SFF) relies on ABI layout.**
+`read_sff_header` does `std::fread(&sff_header, 1, n_bytes_in_header, …)`
+(`sff_convert.cc:190`), reading the file image straight into
+`struct sff_header_s`. Field layout/padding is implementation-defined; a
+`static_assert(n_bytes_in_header == 32, …)` guards the total size (the struct is
+documented as 31 meaningful bytes + 1 padding byte) but not the internal padding
+offsets across compilers/ABIs. Deterministic in practice given the field
+ordering, but a latent ABI assumption. (The 31-vs-32 read — one byte past the
+fixed header into the struct padding — is worth verifying against the SFF flow
+section that follows, but is not confirmed as a bug here.)
+
+- **Effort:** Low · **Impact:** Low · **Criticality:** Low · *latent ABI assumption*
+
+#### Checked and found already handled (no action)
+
+- **char-signedness in table indexing.** The `chrmap_*` lookup tables are
+  `unsigned char` / `unsigned int` vectors (`utils/maps.cpp`) and are reached
+  through `to_uchar()` accessors. A sweep found no site indexing a `chrmap_*`
+  table with a possibly-signed `char`; the original concern (signed `char`
+  sequence byte used as a negative index) does not appear in the current tree.
+- **Strict aliasing in the SIMD code.** Even with strict aliasing on (the build
+  has no `-fno-strict-aliasing`), `align_simd.cc` does not type-pun: the
+  `(VECTOR_SHORT *)` casts are either on fresh `xmalloc` memory (legal — the
+  first store sets the effective type, e.g. `align_simd.cc:1131, 1238, 1245`) or
+  feed `_mm_load_si128` / `_mm_store_si128` intrinsics (the blessed pattern,
+  `align_simd.cc:186–187`); `memcpy` is used for the remaining copies. The
+  byteswap helpers (`utils/os_byteswap.*`) use builtins, no casts.
+
+- **Overall — Effort:** Medium–High · **Impact:** Medium · **Criticality:** Low–Medium
+- **Status:** *verified (warning counts, endianness handling, mitigations);
+  big-endian misbehavior is by construction, not reproduced (no BE target)*
+
+---
+
 ## Enhancements
 
 ### E1. Half-finished migration from global `opt_*` variables to the `Parameters` struct
@@ -518,6 +606,7 @@ and low risk; listed for completeness only.
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (×3) | Bug | Low | Low–Med | Medium |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
+| P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
 | E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
@@ -539,6 +628,10 @@ and low risk; listed for completeness only.
 3. **E5**, **E8**, **E9** — quick, low-risk cleanups with immediate line-count payoff.
    Fold **I1**'s checked-close logic into the **E5** shared open/close helper so
    the write-error guard lands in one place rather than at ~110 call sites.
+   For **P1**, the cheap first step is tooling: add a non-gating `-Wconversion`
+   `-Wsign-conversion` CI lane (mirroring the sanitizer inventory) to size the
+   width-narrowing backlog before touching code; the endianness items are low
+   priority while no big-endian target is supported.
 4. **E2 → E1 → E4** — the core architectural thread (single option table, finish
    the `Parameters` migration, then eliminate global state); E4 directly improves
    library-API safety.
