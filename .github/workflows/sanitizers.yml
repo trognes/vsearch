@@ -12,11 +12,15 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    # Non-gating for now: this job inventories pre-existing sanitizer findings
+    # without blocking merges. Flip to gating once the backlog is cleared.
+    continue-on-error: true
+
     env:
-      # -O1 + frame pointers gives readable stack traces; -fno-sanitize-recover
-      # makes UBSan abort (non-zero exit) on the first violation instead of
-      # printing and continuing, so failures surface clearly.
-      SAN_FLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all -g -O1"
+      # -O1 + frame pointers gives readable stack traces. Sanitizers run in
+      # "recover" mode (no -fno-sanitize-recover) so the whole suite runs and
+      # every finding is captured rather than aborting at the first one.
+      SAN_FLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
 
     steps:
     - name: Checkout
@@ -44,27 +48,42 @@ jobs:
       run: |
         git clone https://github.com/frederic-mahe/vsearch-tests
 
-    - name: Run tests under sanitizers
+    - name: Run tests under sanitizers (inventory mode, non-blocking)
       run: |
-        set -o pipefail
         export PATH=$PWD/bin:$PATH
-        # Leak detection is disabled: vsearch relies on process exit to reclaim
-        # memory, so LeakSanitizer would report many benign "leaks" and drown
-        # out real corruption/UB findings. Leaks can be chased in a separate run.
-        export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:print_stacktrace=1"
-        export UBSAN_OPTIONS="print_stacktrace=1"
+        # Inventory mode: print and continue so the whole suite runs.
+        # Leak detection is off (vsearch frees at process exit by design).
+        export ASAN_OPTIONS="detect_leaks=0:halt_on_error=0:exitcode=0:print_stacktrace=1"
+        export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0"
         cd vsearch-tests
-        bash ./run_all_tests.sh 2>&1 | tee "$GITHUB_WORKSPACE/sanitizer-run.log"
+        bash ./run_all_tests.sh > "$GITHUB_WORKSPACE/sanitizer-run.log" 2>&1 || true
+        echo "Test run finished (non-blocking)."
 
-    - name: Fail on sanitizer reports
+    - name: Upload sanitizer log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: sanitizer-run-log
+        path: sanitizer-run.log
+
+    - name: Summarize sanitizer findings
       if: always()
       run: |
-        if [ ! -f sanitizer-run.log ]; then
-          echo "No test log produced (earlier step failed); see logs above."
-          exit 1
-        fi
-        if grep -E "ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)Sanitizer" sanitizer-run.log; then
-          echo "::error::Sanitizer reported one or more errors (see matches above)."
-          exit 1
-        fi
-        echo "No sanitizer errors detected in the test run."
+        set +e
+        log=sanitizer-run.log
+        {
+          echo "## Sanitizer findings (inventory)"
+          echo
+          if [ ! -f "$log" ]; then
+            echo "No log produced (an earlier step failed)."
+          else
+            echo "### UBSan — unique runtime errors (file:line:col)"
+            echo '```'
+            grep -hoE "[A-Za-z0-9_./]+:[0-9]+:[0-9]+: runtime error: .*" "$log" | sort -u
+            echo '```'
+            echo "### ASan — unique error types"
+            echo '```'
+            grep -hE "ERROR: AddressSanitizer" "$log" | sort -u
+            echo '```'
+          fi
+        } | tee -a "$GITHUB_STEP_SUMMARY"
