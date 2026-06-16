@@ -12,17 +12,19 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    # Non-gating for now: this job inventories Valgrind/Memcheck findings
-    # (notably reads of uninitialized memory, which ASan/UBSan do not catch)
-    # without blocking merges. Flip to gating once the backlog is cleared.
+    # Non-gating for the first run: the vsearch-tests suite already contains a
+    # `valgrind --leak-check=full` block in every command script (guarded by
+    # `which valgrind`). Installing valgrind activates all of them; each block
+    # fails its test on any leak or Memcheck error, so this job is gating by
+    # nature. continue-on-error keeps it from blocking merges until the first
+    # run confirms it is green on the (non-root) CI runner; flip to gating then.
     continue-on-error: true
 
     env:
       # -O1 + frame pointers keeps the binary close to release behaviour while
-      # still giving Valgrind readable stack traces. No -fsanitize flags here:
-      # Memcheck instruments the unmodified binary at run time, so it can run
-      # against an ordinary build (and even against system zlib/bzip2) without
-      # the recompiled-everything constraint that MemorySanitizer imposes.
+      # giving Valgrind readable stack traces. No -fsanitize flags: Memcheck
+      # instruments the unmodified binary at run time, so it needs no special
+      # toolchain or recompiled libc++/zlib/bzip2 the way MemorySanitizer would.
       VG_FLAGS: "-fno-omit-frame-pointer -g -O1"
 
     steps:
@@ -50,61 +52,46 @@ jobs:
       run: |
         git clone https://github.com/frederic-mahe/vsearch-tests
 
-    - name: Run tests under Valgrind (inventory mode, non-blocking)
+    - name: Run test suite (Valgrind blocks activated)
       run: |
-        # Wrap the real vsearch binary so the test suite, which calls "vsearch"
-        # on PATH, transparently runs every invocation under Memcheck.
-        mkdir -p "$GITHUB_WORKSPACE/vg-bin"
-        real_vsearch="$PWD/bin/vsearch"
-        log_dir="$GITHUB_WORKSPACE/valgrind-logs"
-        mkdir -p "$log_dir"
-        cat > "$GITHUB_WORKSPACE/vg-bin/vsearch" <<EOF
-        #!/bin/sh
-        exec valgrind \\
-          --tool=memcheck \\
-          --track-origins=yes \\
-          --leak-check=no \\
-          --error-exitcode=0 \\
-          --log-file="$log_dir/vg-%p.log" \\
-          "$real_vsearch" "\$@"
-        EOF
-        chmod +x "$GITHUB_WORKSPACE/vg-bin/vsearch"
-        # Put the wrapper ahead of the real binary on PATH.
-        export PATH="$GITHUB_WORKSPACE/vg-bin:$PWD/bin:$PATH"
+        # vsearch on PATH becomes the binary each test script resolves via
+        # `which vsearch`. Because valgrind is installed, every script's
+        # embedded `valgrind --leak-check=full vsearch ...` block runs and
+        # fails the test on any leak or Memcheck error.
+        export PATH=$PWD/bin:$PATH
         cd vsearch-tests
-        # Inventory mode: never fail the suite on a Valgrind finding.
-        bash ./run_all_tests.sh > "$GITHUB_WORKSPACE/valgrind-run.log" 2>&1 || true
-        # Concatenate the per-process Valgrind logs for the artifact/summary.
-        cat "$log_dir"/vg-*.log > "$GITHUB_WORKSPACE/valgrind-memcheck.log" 2>/dev/null || true
-        echo "Test run finished (non-blocking)."
+        bash ./run_all_tests.sh 2>&1 | tee "$GITHUB_WORKSPACE/valgrind-run.log"
 
-    - name: Upload Valgrind logs
+    - name: Upload test log
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: valgrind-logs
-        path: |
-          valgrind-run.log
-          valgrind-memcheck.log
+        name: valgrind-run-log
+        path: valgrind-run.log
 
-    - name: Summarize Valgrind findings
+    - name: Summarize Valgrind results
       if: always()
       run: |
         set +e
-        log=valgrind-memcheck.log
+        log=valgrind-run.log
         {
-          echo "## Valgrind/Memcheck findings (inventory)"
+          echo "## Valgrind/Memcheck results"
           echo
-          if [ ! -s "$log" ]; then
-            echo "No Memcheck output captured (no findings, or an earlier step failed)."
+          if [ ! -f "$log" ]; then
+            echo "No log produced (an earlier step failed)."
           else
-            echo "### Error kinds reported by Memcheck"
-            echo '```'
-            grep -hoE "(Conditional jump or move depends on uninitialised value|Use of uninitialised value|Invalid read of size [0-9]+|Invalid write of size [0-9]+|Invalid free|Mismatched free|Syscall param .* points to uninitialised)" "$log" | sort | uniq -c | sort -rn
-            echo '```'
-            echo "### Distinct top frames (first vsearch frame per error)"
-            echo '```'
-            grep -hoE "\(in .*vsearch\)|vsearch\.cc:[0-9]+|[a-z_]+\.cc:[0-9]+" "$log" | sort -u | head -50
-            echo '```'
+            # Strip ANSI colour codes before counting.
+            clean=$(sed 's/\x1b\[[0-9;]*m//g' "$log")
+            passed=$(printf '%s\n' "$clean" | grep -c "PASS:.*valgrind")
+            failed=$(printf '%s\n' "$clean" | grep -c "FAIL:.*valgrind")
+            echo "Valgrind sub-tests passed: ${passed}"
+            echo "Valgrind sub-tests failed: ${failed}"
+            if [ "${failed}" -gt 0 ]; then
+              echo
+              echo "### Failing Valgrind checks"
+              echo '```'
+              printf '%s\n' "$clean" | grep "FAIL:.*valgrind"
+              echo '```'
+            fi
           fi
         } | tee -a "$GITHUB_STEP_SUMMARY"
