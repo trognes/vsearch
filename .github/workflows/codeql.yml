@@ -1,0 +1,54 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [ "master", "dev" ]
+  pull_request:
+    branches: [ "master", "dev" ]
+  schedule:
+    # Weekly, so the security view stays fresh even without pushes.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    name: Analyze (c-cpp)
+    runs-on: ubuntu-latest
+
+    # CodeQL uploads results to the repository's Security tab.
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ghostscript groff libbz2-dev zlib1g-dev
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: c-cpp
+        # security-extended adds the deeper security queries (taint tracking
+        # from file/CLI input to array indices) that target the S1-S4 class of
+        # bugs in CODE_REVIEW.md — exactly what sanitizers cannot reach without
+        # a crafted triggering input.
+        queries: security-extended
+
+    # Manual build: the project requires `make ARFLAGS="cr"`, which autobuild
+    # does not pass.
+    - name: Build
+      run: |
+        ./autogen.sh
+        ./configure CFLAGS="-O2" CXXFLAGS="-O2"
+        make ARFLAGS="cr" -j"$(nproc)"
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:c-cpp"

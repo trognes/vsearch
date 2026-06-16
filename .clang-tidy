@@ -1,0 +1,30 @@
+# clang-tidy configuration for vsearch.
+#
+# Scoped deliberately to BUG-FINDING checks only. The auto-rewriting families
+# (modernize-*, readability-*) are intentionally excluded: this is a development
+# fork whose fixes are sent upstream one atomic commit at a time via
+# `git cherry-pick`, and large mechanical rewrites would make those diffs
+# unreviewable. Use this to find defects, not to reformat.
+#
+#   bugprone-*        likely-bug patterns (narrowing, widening, bad memcpy, …)
+#   cert-*            CERT secure-coding rules (incl. cert-err33-c: unchecked
+#                     fprintf/fclose return values — corroborates CODE_REVIEW I1)
+#   clang-analyzer-*  the path-sensitive Clang Static Analyzer (null deref,
+#                     leak, use-after-free)
+#   performance-*     cheap, low-risk performance fixes
+#
+# Excluded as noise for this codebase:
+#   misc-include-cleaner             header-hygiene churn, not bugs
+#   bugprone-easily-swappable-parameters   style noise on a C-style API
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -misc-include-cleaner
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/'
+FormatStyle: none

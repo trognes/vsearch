@@ -1,0 +1,91 @@
+name: Static analysis (cppcheck/clang-tidy)
+
+on:
+  push:
+    branches: [ "master", "dev" ]
+  pull_request:
+    branches: [ "master", "dev" ]
+  workflow_dispatch:
+
+jobs:
+  static-analysis:
+
+    runs-on: ubuntu-latest
+
+    # Non-gating inventory, mirroring the sanitizers job. These tools read every
+    # branch without needing a triggering input, so they cover code paths the
+    # vsearch-tests suite (and therefore ASan/UBSan/Valgrind) never exercises.
+    # Findings are summarized below and triaged into CODE_REVIEW.md by hand;
+    # flip to gating once the backlog is cleared.
+    continue-on-error: true
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          bear cppcheck clang-tidy ghostscript groff libbz2-dev zlib1g-dev
+
+    # cppcheck needs no build; it parses the sources directly.
+    - name: cppcheck
+      run: |
+        cppcheck \
+          --enable=warning,performance,portability \
+          --std=c++11 --language=c++ \
+          --suppress=missingIncludeSystem \
+          --inline-suppr --quiet \
+          -j"$(nproc)" \
+          -I src -I src/utils src 2> cppcheck.txt || true
+        echo "cppcheck findings: $(wc -l < cppcheck.txt)"
+
+    # clang-tidy needs a compilation database. Generate it with bear by
+    # observing a normal build, then run the bug-only check set from .clang-tidy.
+    - name: Build (generate compile_commands.json)
+      run: |
+        ./autogen.sh
+        ./configure CFLAGS="-O2" CXXFLAGS="-O2"
+        bear -- make ARFLAGS="cr" -j"$(nproc)"
+
+    - name: clang-tidy
+      run: |
+        # Analyze only the project's own .cc/.c translation units.
+        files=$(grep -oE '"file": "[^"]+\.(cc|c)"' compile_commands.json \
+                | sed 's/"file": "//; s/"$//' | sort -u)
+        : > clang-tidy.txt
+        for f in $files; do
+          clang-tidy -p . "$f" 2>/dev/null >> clang-tidy.txt || true
+        done
+        echo "clang-tidy warning lines: $(grep -c 'warning:' clang-tidy.txt || true)"
+
+    - name: Upload raw logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: static-analysis-logs
+        path: |
+          cppcheck.txt
+          clang-tidy.txt
+
+    - name: Summarize findings
+      if: always()
+      run: |
+        set +e
+        {
+          echo "## Static-analysis inventory"
+          echo
+          echo "### cppcheck — findings by check id"
+          echo '```'
+          grep -oE '\[[a-zA-Z]+\]' cppcheck.txt | sort | uniq -c | sort -rn
+          echo '```'
+          echo "### cppcheck — error-severity findings"
+          echo '```'
+          grep -E 'error:' cppcheck.txt | sort -u
+          echo '```'
+          echo "### clang-tidy — warnings by check id (top 30)"
+          echo '```'
+          grep -oE '\[[a-z]+-[a-z0-9.-]+\]$' clang-tidy.txt | sort | uniq -c | sort -rn | head -30
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"

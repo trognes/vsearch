@@ -751,6 +751,95 @@ not the db/index objects.
 
 ---
 
+## Static-analysis inventory (cppcheck)
+
+A `cppcheck` 2.13 pass over `src/` (`--enable=warning,performance,portability
+--std=c++11`, no `--inconclusive`) produced ~120 raw findings. Triaged below.
+The pass **independently corroborated** three existing items — **S11** (wrong
+`sizeof` in `dbmatched`), **S12** (DUST signed shift, also caught by UBSan), and
+**P1(a)** (width/sign narrowing) — and turned up one new genuine bug (ST1) plus
+a concrete format-mismatch batch (ST2). Notable **false positives** are recorded
+so they are not re-investigated. Line numbers here refer to the current tree.
+
+### ST1. `memset` on `searchinfo_s`, which contains three `std::vector` members — leak/UB risk
+
+`searchinfo_s` (`searchcore.h:130`) holds three non-trivial members —
+`std::vector<char> qsequence_v`, `std::vector<count_t> kmers_v`, and
+`std::vector<struct hit> hits_v`. Four sites zero a whole `searchinfo_s` with
+`memset` before calling the per-slot init:
+
+| Site | Context |
+|------|---------|
+| `cluster.cc:1971` | `memset((void*)(si_plus + i), 0, sizeof(struct searchinfo_s))` then `cluster_query_init` |
+| `cluster.cc:1977` | same, `si_minus` |
+| `search.cc:1391` | `memset((void*)(ctx.batch_si_plus + t), …)` then `search_thread_init` |
+| `search.cc:1395` | same, `batch_si_minus` |
+
+The `(void*)` cast is exactly what silences the compiler's own
+`-Wclass-memaccess` diagnostic, so the warning was knowingly suppressed.
+`memset`-ing a `std::vector` overwrites its internal pointers/size without
+destroying it: when a slot is zeroed while its vectors already hold an
+allocation, those heap buffers are **orphaned (leak)** and the vector is left in
+a zeroed (empty) state. On the very first init the vectors are freshly empty so
+the zero is benign-by-luck, but the pattern is fragile and is UB on any STL
+whose empty vector is not all-zero-bits. The correct reset is value-init /
+`clear()`, not `memset`.
+
+- **Type:** Latent bug (leak / UB depending on STL and slot reuse)
+- **Fix:** drop the `memset` and rely on the `*_init` routines to (re)initialize,
+  or value-initialize the struct; never `memset` a type with `std::vector` members.
+- **Effort:** Low–Medium · **Impact:** Medium · **Criticality:** Low–Medium · *verified*
+
+### ST2. `printf`-family format/argument signedness mismatches (batch)
+
+cppcheck pinpoints ~13 sites where a `%u`/`%d` conversion does not match the
+argument's signedness — concrete instances of the **P1(a)** width/sign family:
+
+| File:line | Mismatch |
+|-----------|----------|
+| `chimera.cc:2522, 2534, 2552, 2562` | `%u` ← signed `int` |
+| `fasta.cc:537`, `fastq.cc:719` | `%u` ← signed `int` |
+| `orient.cc:430` (×2) | `%d` ← `unsigned int` |
+| `sff_convert.cc:402` (×2), `:445`, `:452` | `%d` ← `unsigned int` |
+| `sha1.c:125` (×2) | `%d` ← `unsigned int` |
+| `udb.cc:725, 872` | `%u` ← signed `int` |
+
+Benign for in-range values on LP64 (where `int` and `unsigned` share a width),
+but a signed/unsigned format mismatch is technically UB and trivially fixed by
+matching the specifier. Also in this group: `fastx.cc:175` passes three
+arguments to a `format` that one caller fills with only two conversions
+(`wrongPrintfScanfArgNum`) — the extra argument is evaluated and ignored, so it
+is harmless, but worth aligning.
+
+- **Effort:** Low · **Impact:** Low · **Criticality:** Low · *verified*
+
+### Notable false positives (recorded — no action)
+
+- **`sff_convert.cc:482, 599` `containerOutOfBounds`** — *false positive*.
+  `index_kind` is `std::array<char, index_header_length + 1>` (9 elements), so
+  index 8 (`= index_header_length`) is the valid last slot used for the NUL
+  terminator. cppcheck mis-modeled the `+1` and reported the array size as 8.
+- **`util.cc:155` `returnDanglingLifetime`** — *false positive*. In `xstrdup`,
+  `dest` is `xmalloc`'d heap memory; `strcpy(dest, src)` returns that heap
+  pointer, not a local.
+- **`dynlibs.cc:82` `unknownMacro` (`ZEXPORT`)** — analysis-config artifact
+  (zlib macro not visible to cppcheck), not a code defect.
+- **`align_simd.cc:250, 260` `objectIndex`** — low confidence; `&x` is used as a
+  base for SIMD lane access, an intentional pattern in this file. Leave as-is.
+- **`memsetClassFloat` (`cluster.cc:1874`, `chimera.cc:2822`,
+  `fastq_mergepairs.cc:1784`)** — portability-only: `memset`-zeroing a struct
+  with a floating-point member assumes all-zero-bits == `0.0`, which holds on
+  every IEEE-754 target. Noted under **P1**; no action.
+
+**Tooling note.** This was a one-off local run; the recommended next step is a
+non-gating `Static analysis` CI lane (cppcheck + a bug-only-scoped clang-tidy:
+`-*,bugprone-*,cert-*,clang-analyzer-*`) mirroring the sanitizer inventory, and
+a separate **CodeQL** workflow for the input→index taint class (S1–S4) that
+neither sanitizers nor cppcheck reliably reach. Auto-fix / `modernize-*` /
+`readability-*` are deliberately excluded to keep upstream-cherry-pick diffs small.
+
+---
+
 ## Enhancements
 
 ### E1. Half-finished migration from global `opt_*` variables to the `Parameters` struct
@@ -921,6 +1010,8 @@ and low risk; listed for completeness only.
 | S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low |
 | S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low |
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low |
+| ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
+| ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (×3) | Bug | Low | Low–Med | Medium |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
