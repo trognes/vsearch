@@ -78,7 +78,9 @@ bash ./scripts/cluster_fast.sh /abs/path/to/vsearch   # or pass the binary as $1
 
 CI workflows (`.github/workflows/`): `build-and-test` (default gate),
 `sanitizers` (ASan/UBSan, non-gating inventory), `valgrind` (Memcheck, gating),
-`build-all` (cross-platform matrix, manual dispatch).
+`static-analysis` (cppcheck + clang-tidy, non-gating inventory; clang-tidy
+scoped to bug-finding checks via the repo `.clang-tidy`), `codeql` (C/C++
+`security-extended`), `build-all` (cross-platform matrix, manual dispatch).
 
 ## Architecture
 
@@ -146,7 +148,9 @@ parsers (UDB/SFF), the search/cluster hit handling, or the library lifecycle.
 
 This is a development fork; upstream is `torognes/vsearch`. The fork carries
 commits that must **never** go upstream — `CODE_REVIEW.md`, `CLAUDE.md`,
-`.github/workflows/{sanitizers,valgrind}.yml`. So you never merge a whole fork
+`.clang-tidy`, and the fork-only CI workflows
+(`.github/workflows/{sanitizers,valgrind,static-analysis,codeql}.yml`). So you
+never merge a whole fork
 branch upstream; you lift the individual fix commit(s) onto a branch based on
 upstream's tip and open a PR with exactly that diff.
 
