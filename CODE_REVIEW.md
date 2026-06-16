@@ -216,6 +216,43 @@ correcting for portability/correctness.
 
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low · *verified, benign on 64-bit*
 
+#### S12. Signed `int` left-shift overflow in DUST k-mer accumulator (Low — confirmed by CI sanitizers)
+
+`mask.cc:101` in `wo()` (called from `dust_core` → `dust`): the k-mer
+accumulator `word` is a signed `int` (`auto word = 0;`) and is shifted with
+`word <<= 2U` before being masked. Once enough 2-bit codes accumulate, the
+left shift exceeds `INT_MAX`, which is undefined behavior. UBSan flagged it on
+the very first masking command of the test suite:
+
+```
+mask.cc:101:12: runtime error: left shift of <value> by 2 places cannot be represented in type 'int'
+```
+
+Behaviour-preserving fix (later): make `word` unsigned — the stored value is
+already masked, so downstream indexing is unaffected. This is the same
+*class* as S5 (signed-overflow / width issues) but a distinct, concrete site.
+
+- **Effort:** Low · **Impact:** Low (UB; benign in practice as the value is masked) · **Criticality:** Low · *verified by CI ASan/UBSan run*
+
+### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
+
+The `Sanitizers (ASan/UBSan)` CI workflow builds vsearch with
+AddressSanitizer + UndefinedBehaviorSanitizer and runs the full
+`frederic-mahe/vsearch-tests` suite under instrumentation. A non-gating
+"inventory" run over the whole suite produced exactly one finding:
+
+- **UBSan:** `mask.cc:101` — the signed left-shift overflow above (S12), the
+  only UB site reported.
+- **AddressSanitizer:** **no errors** anywhere in the suite — no
+  out-of-bounds, use-after-free, or related memory corruption on the inputs
+  the suite exercises.
+
+Important caveat: the suite uses **valid / well-formed inputs**, so this run
+does **not** exercise the malformed-input bugs S1–S4 (crafted `.udb`/`.sff`
+files, out-of-range `--subseq_start`). Those still require targeted crafted
+inputs and/or fuzzing; the green ASan result here is not evidence they are
+absent.
+
 ### Checked and found safe (no action)
 
 - **No format-string vulnerabilities.** Across `results.cc`, `otutable.cc`,
@@ -414,6 +451,7 @@ and low risk; listed for completeness only.
 | S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low |
 | S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low |
 | S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low |
+| S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (×3) | Bug | Low | Low–Med | Medium |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
