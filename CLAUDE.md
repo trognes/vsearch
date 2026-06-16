@@ -1,0 +1,143 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+VSEARCH is a 64-bit C++11 tool for metagenomics sequence analysis (search,
+clustering, chimera detection, dereplication, FASTQ processing, paired-end
+merging). It is a single CLI binary (`bin/vsearch`) plus an optional static
+library. This is a development fork; upstream is `torognes/vsearch`.
+
+## Build
+
+```bash
+./autogen.sh
+./configure CFLAGS="-O2" CXXFLAGS="-O2"
+make ARFLAGS="cr"            # produces bin/vsearch
+```
+
+- **`ARFLAGS="cr"` is required** on the `make` line — the CI and release builds
+  all pass it; omitting it can break the archive step.
+- The build uses **autotools**; `./autogen.sh` regenerates `configure` from
+  `configure.ac` / `Makefile.am` / `src/Makefile.am`. Edit those, not the
+  generated `Makefile`/`configure`.
+- C++11 with **`-fno-exceptions`** — there is no exception-based error handling
+  anywhere (see `fatal()` below).
+- `-O3` is safe but note: `align_simd.cc` carries a pragma disabling
+  `-ftree-partial-pre`, which miscompiles the aligner on GCC ≥ 9.
+- zlib/bzip2 are optional and **loaded dynamically at runtime** (`dynlibs.cc`)
+  for `.gz`/`.bz2` input; disable with `--disable-zlib` / `--disable-bzip2`.
+
+### Debug builds and the NDEBUG default
+
+`./configure --enable-debug` switches the compile profile to `-UNDEBUG`
+(asserts **on**), `-D_GLIBCXX_DEBUG`, and a large extra-warning set. **The
+default build defines `-DNDEBUG`, so every `assert()` is compiled out** —
+including in CI and release binaries. Do not use `assert()` for input
+validation; use `fatal()`.
+
+### Sanitizer / Valgrind builds
+
+```bash
+./configure CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            CXXFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            LDFLAGS="-fsanitize=address,undefined"
+```
+
+See `.github/workflows/{sanitizers,valgrind}.yml` for the exact CI invocations.
+
+### Static library
+
+```bash
+make -C src libvsearch.a    # built with -DVSEARCH_NO_MAIN -fPIC
+```
+
+The library API is documented in `src/vsearch_api.h` and `LIBRARY_API.md`;
+runnable examples are in `api_examples/`.
+
+## Test
+
+Tests live in a **separate repository** (`frederic-mahe/vsearch-tests`), not in
+this tree:
+
+```bash
+git clone https://github.com/frederic-mahe/vsearch-tests
+export PATH=$PWD/bin:$PATH
+cd vsearch-tests
+bash ./run_all_tests.sh                 # whole suite
+bash ./scripts/cluster_fast.sh          # one command's tests (resolves vsearch via PATH)
+bash ./scripts/cluster_fast.sh /abs/path/to/vsearch   # or pass the binary as $1
+```
+
+- Each `scripts/<command>.sh` resolves the binary with `which vsearch` unless a
+  path is given as `$1`.
+- Every test script ends with a `valgrind --leak-check=full` block **gated by
+  `which valgrind`** — so installing valgrind turns the suite into a
+  leak/Memcheck check (this is exactly how `valgrind.yml` works; no wrapper).
+- API examples have their own harness: `cd api_examples && make test` (compares
+  output against ground-truth files in `api_examples/data/`).
+
+CI workflows (`.github/workflows/`): `build-and-test` (default gate),
+`sanitizers` (ASan/UBSan, non-gating inventory), `valgrind` (Memcheck, gating),
+`build-all` (cross-platform matrix, manual dispatch).
+
+## Architecture
+
+The README has a per-file table. The points below are the cross-file structure
+that isn't obvious from reading any single file.
+
+**CLI and option handling are a monolith.** `vsearch.cc` is ~6,300 lines; its
+`args_init` function alone is ~4,000. Each of ~248 CLI options is declared in
+**five parallel, manually-synchronized places** inside that file: the
+`option_*` enum, the `long_options[]` getopt table, the `switch
+(options_index)` handler, the `command_options[]` / `valid_options[][]`
+matrices, and the `cmd_help` help text. Adding or renaming an option means
+editing all five in lockstep.
+
+**Configuration lives in global state, mid-migration.** ~255 `opt_*` globals are
+declared in `vsearch.h`. A half-finished refactor introduced a `Parameters`
+struct that duplicates ~150 of them. Today the top-level command *dispatchers*
+read `parameters.opt_*` while the *core compute* paths (`searchcore.cc`,
+chimera scoring, etc.) read the bare `opt_*` globals. The library entry point
+`vsearch_init_defaults()` resets only the globals, not the struct. Treat config
+as global, single-threaded setup; be aware which copy a given code path reads.
+
+**One shared search engine underlies search, clustering, and chimera
+detection.** `db.cc` loads all sequences into one large buffer (`datap`) indexed
+by `seqindex`; `dbindex.cc` builds the k-mer index; `searchcore.cc` is the
+common engine those three commands call. The actual alignment is
+`align_simd.cc` — SIMD parallel global Needleman-Wunsch of **1 query against 8
+database sequences at once**, with `linmemalign.cc` for the linear-memory case.
+Nucleotides are 2-bit/4-bit encoded via `utils/maps.cpp` (index lookup tables
+through `to_uchar()` accessors).
+
+**SIMD is dispatched at runtime.** `cpu.cc` is compiled multiple times into
+`libcpu_sse2.a` / `libcpu_ssse3.a` (see `src/Makefile.am`); CPU features are
+detected at runtime to pick SSE2 vs SSSE3 on x86_64. AltiVec/VSX and Neon have
+native paths; `riscv64`/`mips64el` and other little-endian targets use the
+SIMDe fallback (`libsimde-dev`). Binary on-disk formats (UDB, SFF) assume a
+little-endian host.
+
+**I/O flow.** `fastx.cc` sniffs FASTA vs FASTQ and dispatches to `fasta.cc` /
+`fastq.cc`; `results.cc` formats all the output flavours (alnout, userout,
+blast6, uc, SAM). All textual output goes through `fprintf` to `FILE *`.
+
+**Error handling is process termination.** `fatal()` (`utils/fatal.cpp`) is
+`__attribute__((noreturn))` and calls `std::exit(EXIT_FAILURE)`. There is no
+recoverable error channel — important for the library API, where an error in a
+core routine terminates the caller's process.
+
+**The library API has a strict lifecycle.** `vsearch_api.h` documents a required
+sequence (`vsearch_init_defaults` → override `opt_*` → `apply_defaults_fixups`
+→ `db_init`/`db_add` → `dust_all` → `dbindex_prepare` → per-subsystem session
+init → per-thread state → per-query calls → teardown → `vsearch_session_end`).
+A global session mutex serializes sessions; skipping `vsearch_session_end()`
+deadlocks the next init. Per-command files also keep working state (file
+handles, counters, thread coordination) in file-`static` variables, so the
+commands are not reentrant.
+
+## Known issues
+
+`CODE_REVIEW.md` catalogues known bugs, security findings, and structural
+issues with file:line references, severity ratings, and a suggested fix
+sequence. Consult it before changing the option parser, the binary-format
+parsers (UDB/SFF), the search/cluster hit handling, or the library lifecycle.
