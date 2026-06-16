@@ -672,6 +672,85 @@ table is sized `char_max + 1` and leave as-is if so.
 
 ---
 
+## Library-API lifecycle correctness
+
+### C1. Stale configuration across sequential library sessions
+
+This is the state-*correctness* companion to **L1** (which covers the lifecycle
+*leaks/locks*: `fatal()`→`exit()`, the session-mutex deadlock, the re-init heap
+leak). The concern here is the half-finished `opt_*` → `Parameters` migration
+(E1) leaving global configuration that persists or goes stale between API calls.
+
+#### (a) `vsearch_init_defaults()` resets only 203 of 255 `opt_*` globals — *live*
+
+The header promises "`vsearch_init_defaults()` … set all ~200 `opt_*` globals"
+and "If you override any … sets ALL of them." In fact it assigns 203 distinct
+`opt_*` names (`vsearch.cc:801–1020`) out of 255 declared in `vsearch.h` — **52
+are never reset.** Most of the 52 are command-selector flags (`opt_usearch_global`,
+`opt_cluster_size`, `opt_derep_*`, …) that the library path does not use (it
+drives subsystems directly). But several are **behavioral and read on
+library-reachable paths**, so a second session silently inherits the first
+session's values:
+
+| Unreset global | Read in | Lifecycle step affected |
+|----------------|---------|-------------------------|
+| `opt_max_unmasked_pct` | `mask.cc` | `dust_all()` (documented step 6) |
+| `opt_min_unmasked_pct` | `mask.cc` | `dust_all()` (documented step 6) |
+| `opt_clusterout_id` | `cluster.cc` | clustering output |
+| `opt_clusterout_sort` | `cluster.cc` | clustering output |
+
+Because the documented re-initialization model is "repeat the full sequence for
+each session," a process that runs two sessions with different masking thresholds
+gets the **first** session's thresholds in the second — a silent wrong result,
+not an error. Contradicts the header's "sets ALL" guarantee.
+
+- **Fix:** add the missing behavioral globals to `vsearch_init_defaults()` (and
+  reconcile the "~200 / ALL" wording). Low effort, mechanical.
+- **Effort:** Low · **Impact:** Medium–High (silent wrong output for
+  multi-session library users) · **Criticality:** Medium · *verified (reset gap
+  and the four globals' read sites)*
+
+#### (b) The `opt_*` / `Parameters` split is a migration trap — *latent*
+
+The library compute path is currently **consistent**: the per-query engines read
+the bare globals — `searchcore.cc` reads `opt_minwordmatches`, `opt_iddef`,
+`opt_maxqsize`, … and the chimera scoring reads `opt_xn`, `opt_dn`, `opt_minh`,
+`opt_mindiv` (`chimera.cc:1374–1564`) — and those globals are what
+`init_defaults()` resets. The `parameters.opt_*` reads are on the **CLI** command
+dispatchers (`search.cc:848` in `usearch_global`, `chimera.cc:2359–2447` in
+`chimera(parameters)`), which the documented library lifecycle does not call.
+
+The trap: `init_defaults()` touches **only** the globals, never the `Parameters`
+struct (0 references to `parameters.`/`Parameters` in its body). So as the E1
+migration proceeds, the moment a *library-reachable* compute function is switched
+from `opt_x` to `parameters.opt_x`, it will silently read an unpopulated/stale
+`Parameters` field instead of the user's configuration. This is the lifecycle
+form of E1's "two copies that can drift," and it is why E1 should finish in one
+direction (everything reads `Parameters`, and `init_defaults` populates it)
+rather than leave the split half-applied.
+
+- **Effort:** (part of E1) · **Impact:** latent · **Criticality:** Low now,
+  rising as the migration advances · *verified (compute reads globals;
+  init_defaults does not touch Parameters)*
+
+#### (c) Database / k-mer-index re-init is safe — *no action*
+
+The "double-init / use-after-free across the session lifecycle" worry from the
+class note does **not** hold for the database: `db_init()` calls `db_free()`
+first (`db.cc:97`), and `db_free()` frees and then **nulls** `datap` / `seqindex`
+(`db.cc:428–436`), so repeated sessions neither double-free nor read freed
+memory, and re-init does not leak the previous buffers. `dbindex_free()` exists
+for the k-mer index. The real lifecycle defects are the lock/leak items in L1,
+not the db/index objects.
+
+- **Overall — Effort:** Low (for the live (a) part) · **Impact:** Medium–High ·
+  **Criticality:** Medium
+- **Status:** *verified (reset gap, config read sites, db re-init safety);
+  multi-session stale-config effect is by construction, wants a two-session
+  regression test (see `api_examples/example_reinit.cc`)*
+
+---
+
 ## Enhancements
 
 ### E1. Half-finished migration from global `opt_*` variables to the `Parameters` struct
@@ -848,6 +927,7 @@ and low risk; listed for completeness only.
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
 | N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium |
+| C1 | `init_defaults` misses 52 globals → stale config across library sessions | Library lifecycle | Low | Med–High | Medium |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
 | E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
@@ -885,7 +965,11 @@ and low risk; listed for completeness only.
    fixes (scope-guard the session unlock; free before re-init), but L1(a) — giving
    the core a recoverable error channel instead of `fatal()`→`exit()` — is the
    large library-API change that only becomes tractable once E4 removes the global
-   state it would have to unwind.
+   state it would have to unwind. **C1(a)** is a quick standalone fix (add the 52
+   missing globals — at least the behavioral ones — to `init_defaults`); **C1(b)**
+   is the reason to finish E1 in one direction rather than leave the
+   `opt_*`/`Parameters` split half-applied. Pair C1 with a two-session regression
+   test.
 5. **E3**, **E6**, **E7** — structural decomposition, largely unlocked by the above.
 
 > Note: several findings (S1–S4, S5, S6, S9) trace to file/CLI-derived values
