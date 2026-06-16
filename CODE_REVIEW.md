@@ -522,6 +522,98 @@ is the natural vehicle for (ii).
 
 ---
 
+## Numerical correctness
+
+### N1. Silent numerical-correctness issues (wrong results, no crash)
+
+The highest-stakes class for a scientific tool: a wrong identity percentage,
+abundance, or candidate ranking is worse than a crash because nothing signals
+it. A key meta-point first: **most of this class evades the sanitizer CI.**
+UBSan catches *signed* integer overflow and *integer* division-by-zero, but the
+issues below are *unsigned* wraparound (defined, silent) and *floating-point*
+division-by-zero (produces `inf`/`nan`, also defined). Neither trips ASan/UBSan
+or Valgrind — they need reference-output regression on a known dataset.
+
+#### (a) `count_t` (`unsigned short`) silently saturates k-mer match counts → wrong search/cluster ranking on long reads — *headline*
+
+The per-target shared-k-mer counter is `using count_t = unsigned short`
+(`searchcore.h:128`). In `searchcore.cc` it is incremented once per matching
+query k-mer sample with **no saturation guard** —
+`searchinfo->kmers[list[j]]++` (`searchcore.cc:309`) — and the result then
+drives candidate selection: `count = searchinfo->kmers[i]; if (count >=
+minmatches) { … novel.count = count; minheap_add(…); }`
+(`searchcore.cc:318–328`). The minheap keeps the top candidates **by
+`count`**.
+
+A query that shares more than 65 535 k-mer samples with one target overflows
+the `unsigned short` and wraps toward 0. The wrapped (small) count then either
+falls below `minmatches` and the target is **dropped from the candidate set
+entirely**, or it under-ranks in the minheap and is evicted when the heap
+fills. Result: a true best hit is silently missed or mis-ranked.
+
+- **Reachability:** real for **long-read data** (PacBio/Nanopore, 10⁴–10⁵ bp),
+  which vsearch supports. The query k-mer sample count scales with sequence
+  length, so a long query against a long, highly similar target exceeds 65 535
+  shared samples. Short-read data stays well under the limit.
+- **Not caught by tooling:** unsigned overflow is not UB, so UBSan stays silent
+  (this is why the class-1 note flagged regression testing, not sanitizers).
+- **Fix:** widen `count_t` to `uint32_t` (the matched `unsigned int count`
+  field at `searchcore.h:83` already implies the wider domain), or clamp on
+  increment. Widening costs memory in the per-target `kmers` array
+  (`indexed_count * sizeof(count_t)`), so measure.
+- **Effort:** Low–Medium · **Impact:** High · **Criticality:** Medium
+  (long-read workflows) · *verified (mechanism); needs-confirmation (a crafted
+  long-read regression case)*
+- Cross-ref: previously noted as a parenthetical under "Checked and found safe"
+  (memory-safety context, where it is correctly *not* a safety bug); this is its
+  correctness writeup.
+
+#### (b) Inconsistent division-by-zero guarding in output fields → `inf`/`nan` emitted silently
+
+The primary percent-identity fields are correctly guarded
+(`internal_alignmentlength > 0 ? 100.0 * matches / internal_alignmentlength :
+0.0`, `results.cc:359, 362, 747`). But several secondary/statistics fields
+divide by a length/count that is only guarded against a null pointer, not
+against zero:
+
+| Site | Expression | Zero denominator when… |
+|------|-----------|------------------------|
+| `results.cc:473` | `100.0 * (matches+mismatches) / qseqlen` (qcov) | empty/zero-length query |
+| `results.cc:477` | `… / tseqlen` (tcov) | zero-length target |
+| `results.cc:636` | `1.0 * level_match[j] / tophitcount` (LCA) | `tophitcount == 0` |
+| `eestats.cc:244` | `100.0 * reads / seq_count` | empty input (`seq_count == 0`) |
+| `eestats.cc:384` | `sum_ee_length_table[i] / reads` | a length bucket with no reads |
+| `mask.cc:408` | `100.0 * unmasked / len` | zero-length sequence |
+
+These produce `inf`/`nan` (defined behaviour, so no sanitizer signal) that flow
+straight into the output columns. Empty-input / zero-length handling is ad hoc
+(`fastq_stats.cc:142` early-returns on empty qualities, but there is no
+consistent guard), so the reachability of each is edge-case but real.
+
+- **Fix:** a single guarded-divide helper (`den > 0 ? num/den : 0.0`) applied to
+  the secondary fields, matching the pattern the %id fields already use.
+- **Effort:** Low · **Impact:** Medium · **Criticality:** Low–Medium · *verified
+  (unguarded sites); per-site reachability needs an empty/degenerate-input run*
+
+#### (c) Accumulator widths — mostly safe, recorded for completeness
+
+- **Abundance** is carried and summed as 64-bit (`db_getabundance` →
+  `uint64_t`, stored `int64_t size`, `db.cc:148, 212`), so abundance totals do
+  not overflow in practice.
+- **Statistics sums** (`sum_error_probabilities`, `sumee_length_table`,
+  `qsum`) are `double` (`fastq_stats.cc:302–304`): no integer overflow, but
+  floating-point summation drifts on very large inputs (a precision, not
+  correctness-cliff, concern; Kahan summation would remove it if it ever
+  matters).
+
+- **Overall — Effort:** Low–Medium · **Impact:** High (a) / Medium (b) ·
+  **Criticality:** Medium
+- **Status:** *verified (types, guards, overflow mechanism); the wrong-output
+  consequences are by construction and want a reference-output regression to pin
+  down exact thresholds*
+
+---
+
 ## Enhancements
 
 ### E1. Half-finished migration from global `opt_*` variables to the `Parameters` struct
@@ -696,6 +788,7 @@ and low risk; listed for completeness only.
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
+| N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
 | E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
@@ -714,6 +807,10 @@ and low risk; listed for completeness only.
    Confirm **S10** with an AddressSanitizer run. **S5–S9, S11** are
    hardening/latent and can follow.
 2. **B1** — isolated, low-risk correctness fix.
+2b. **N1(a)** — high value for the cost: widening `count_t` removes a silent
+   wrong-ranking bug on long-read data. Pair it with a long-read reference-output
+   regression case, since no sanitizer will catch a regression here. **N1(b)** is a
+   cheap guarded-divide cleanup alongside it.
 3. **E5**, **E8**, **E9** — quick, low-risk cleanups with immediate line-count payoff.
    Fold **I1**'s checked-close logic into the **E5** shared open/close helper so
    the write-error guard lands in one place rather than at ~110 call sites.
