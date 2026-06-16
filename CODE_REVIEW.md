@@ -282,6 +282,475 @@ absent.
 
 ---
 
+## I/O robustness
+
+### I1. Output write/flush/close return values are unchecked → silent truncated output
+
+vsearch writes **all** of its textual output (FASTA/FASTQ records, alignments,
+OTU tables, blast6/UC/SAM tabular results, the `--log` file, and everything
+sent to `stdout`) through `std::fprintf` to `FILE *` handles. Sequence bytes
+themselves are emitted via `fprintf(output_handle, "%.*s", len, seq)`
+(`fasta.cc:455`, `fprint_seq_label`). A sweep of `src/` found:
+
+| Call | Occurrences | Return value checked? |
+|------|-------------|-----------------------|
+| `fprintf` | 736 | none |
+| `fputs` | 1 | none |
+| `fclose` | 110 | none |
+| `fflush` | 0 | — (never called) |
+| `ferror` / `clearerr` | 0 on output | only a read-loop comment at `sha1.c:311` |
+
+No output stream is ever checked for error: not per write, not via `ferror`
+before close, and not with a final `fflush(stdout)` + error check before the
+process exits (`vsearch.cc` exits via `exit(EXIT_FAILURE)` / normal return with
+no flush-and-verify). `fclose` is especially significant here — it flushes the
+stdio buffer, so a deferred write error (disk full, quota exceeded, broken
+pipe) first becomes visible as an `fclose` return of `EOF`, which is discarded
+at all 110 sites.
+
+**Consequence.** On any write failure mid-run — a full disk, an over-quota
+filesystem, or a downstream pipe that closed early — vsearch silently produces
+a **truncated** output file and still exits with status `0`. For a tool that
+sits in scientific pipelines, a partial result that looks complete is worse
+than a crash: downstream steps consume corrupted data with no signal that
+anything went wrong.
+
+**The one place that does check.** `largewrite()` (`udb.cc:145–170`) writes the
+binary `.udb` database with the raw `write()` syscall and correctly fatals on a
+short write (`"Unable to write to UDB file"`, `udb.cc:165`). That pattern is the
+model for what the `FILE *` text path lacks, but it is fd-based and specific to
+the UDB writer; it is not used (or usable as-is) by the stdio output paths.
+
+**Why `-Wunused-result` will not catch this.** The build already enables
+`-Wall -Wextra -Wpedantic` (`src/Makefile.am:3`). But on glibc only `fwrite`
+and `fread` carry the `warn_unused_result` attribute; `fprintf`, `fputs`,
+`fflush`, and `fclose` do not. Since vsearch's output path uses `fprintf`
+(not `fwrite`), a `-Wunused-result` build flags essentially nothing here. The
+reliable detection is a runtime `ferror`/checked-close at end of stream, not a
+compile-time warning.
+
+- **Type:** Latent correctness bug (silent data loss on I/O failure)
+- **Reachability:** any write failure — full disk, quota, `ulimit -f`, broken
+  pipe (`vsearch … | head`), read-only remount mid-run. Not triggered by
+  well-formed runs on healthy filesystems, so the sanitizer/Valgrind CI does
+  not surface it.
+- **Fix direction:** a single checked-close helper (`fflush` + `ferror`, then
+  `fclose` with its own return checked → `fatal` on failure) applied at the
+  ~110 close sites, plus a final `fflush(stdout)` + `ferror(stdout)` guard on
+  the normal exit path. This localizes the check to one place per stream rather
+  than per write. Overlaps with **E5** (the open/close boilerplate is already a
+  dedup target — the checked-close logic should land in that shared helper).
+- **Effort:** Medium · **Impact:** Medium–High · **Criticality:** Low–Medium
+- **Status:** *verified (call-site counts and absence of checks); failure-mode
+  is by construction, not yet reproduced with a forced ENOSPC/`SIGPIPE` run*
+
+---
+
+## Portability / undefined behavior
+
+### P1. Portability / UB sweep — width narrowing and endianness assumptions
+
+A pass for the portability/UB class. Two existing findings are concrete
+instances of it: **S5** (64-bit length → `int` in the print path) and **S12**
+(signed-`int` left-shift overflow in DUST, CI-confirmed). The sweep below
+covers the broader class and, importantly, records the two sub-areas that turn
+out to be **already handled** so no effort is spent re-checking them.
+
+#### Active issues
+
+**(a) Integer width-narrowing is wholesale, not isolated.** A `-Wconversion
+-Wsign-conversion` syntax pass over three files alone reports many narrowings:
+
+| File | `-Wconversion`/`-Wsign-conversion` warnings |
+|------|---------------------------------------------|
+| `src/fasta.cc` | 19 |
+| `src/sff_convert.cc` | 9 |
+| `src/mask.cc` | 43 |
+
+The specific `uint64_t length → int → "%.*s"` pattern that S5 documented for the
+fasta/fastq print interface recurs well beyond those sites — e.g. chimera output
+casts header lengths to `int` for `%.*s` in at least eight places
+(`chimera.cc:983, 985, 990, 995, 1580, 1582, …`, `(int)db_getheaderlen(...)`).
+Most warnings are benign sign-conversions, but they are the same family that
+produced S5 and S12, and there is no width-narrowing guard in the build.
+
+- **Tooling:** `-Wconversion`/`-Wsign-conversion` flags the narrowing at compile
+  time (not currently enabled — the build uses `-Wall -Wextra -Wpedantic`,
+  `src/Makefile.am:3`); UBSan catches the signed-overflow subset at runtime
+  (already wired up, and it found S12).
+- **Effort:** Medium–High (wholesale) · **Impact:** Medium · **Criticality:** Low–Medium
+
+**(b) Endianness assumptions — the code is little-endian-only in two places.**
+
+- **SFF reader:** `bswap_16/32/64` are applied **unconditionally** to convert
+  big-endian SFF fields to host order, with the explicit assumption that the
+  host is little-endian (`sff_convert.cc:195–197`, "vsearch expects
+  little-endian"). There is no `BYTE_ORDER` guard, so on a big-endian host every
+  multi-byte SFF field is swapped the wrong way and parsing is silently wrong.
+- **UDB database:** no byteswapping anywhere (`udb.cc`). The binary `.udb`
+  format is read and written in **host** byte order, so a `.udb` is not portable
+  across endianness — and, combined with the `int`-typed `header_index`
+  (see S9), not portable across int width either.
+- `sha1.c:105` carries a self-flagged `FIXME` about doing the transform in an
+  endian-proof way.
+- **Not exercised in CI:** the `build-all.yml` target matrix (x86-64, aarch64,
+  ppc64le, mips64el, riscv64) is **entirely little-endian**, so the big-endian
+  paths above are never built or run.
+- **Effort:** Medium · **Impact:** Low (no big-endian target in practice) ·
+  **Criticality:** Low — but it is a real gap against the cross-platform
+  portability the build matrix advertises.
+
+**(c) `fread` directly into a struct (SFF) relies on ABI layout.**
+`read_sff_header` does `std::fread(&sff_header, 1, n_bytes_in_header, …)`
+(`sff_convert.cc:190`), reading the file image straight into
+`struct sff_header_s`. Field layout/padding is implementation-defined; a
+`static_assert(n_bytes_in_header == 32, …)` guards the total size (the struct is
+documented as 31 meaningful bytes + 1 padding byte) but not the internal padding
+offsets across compilers/ABIs. Deterministic in practice given the field
+ordering, but a latent ABI assumption. (The 31-vs-32 read — one byte past the
+fixed header into the struct padding — is worth verifying against the SFF flow
+section that follows, but is not confirmed as a bug here.)
+
+- **Effort:** Low · **Impact:** Low · **Criticality:** Low · *latent ABI assumption*
+
+#### Checked and found already handled (no action)
+
+- **char-signedness in table indexing.** The `chrmap_*` lookup tables are
+  `unsigned char` / `unsigned int` vectors (`utils/maps.cpp`) and are reached
+  through `to_uchar()` accessors. A sweep found no site indexing a `chrmap_*`
+  table with a possibly-signed `char`; the original concern (signed `char`
+  sequence byte used as a negative index) does not appear in the current tree.
+- **Strict aliasing in the SIMD code.** Even with strict aliasing on (the build
+  has no `-fno-strict-aliasing`), `align_simd.cc` does not type-pun: the
+  `(VECTOR_SHORT *)` casts are either on fresh `xmalloc` memory (legal — the
+  first store sets the effective type, e.g. `align_simd.cc:1131, 1238, 1245`) or
+  feed `_mm_load_si128` / `_mm_store_si128` intrinsics (the blessed pattern,
+  `align_simd.cc:186–187`); `memcpy` is used for the remaining copies. The
+  byteswap helpers (`utils/os_byteswap.*`) use builtins, no casts.
+
+- **Overall — Effort:** Medium–High · **Impact:** Medium · **Criticality:** Low–Medium
+- **Status:** *verified (warning counts, endianness handling, mitigations);
+  big-endian misbehavior is by construction, not reproduced (no BE target)*
+
+---
+
+## Resource & lifecycle management
+
+### L1. Error-path resource handling — benign on the CLI, real leaks in the library API
+
+The premise of this class needs correcting before the real issues show up.
+`fatal()` is `__attribute__((noreturn))` and unconditionally calls
+`std::exit(EXIT_FAILURE)` (`utils/fatal.cpp`) — there is **no** recoverable
+error channel anywhere (no return codes, `setjmp`/`longjmp`, exceptions, or
+`atexit` handlers). Two consequences:
+
+1. On the **CLI**, every `fatal()` ends the process, so the open file handles
+   and `xmalloc`'d memory abandoned at an error are reclaimed by the OS — these
+   are **not real leaks**. The Valgrind CI confirms the happy path is clean:
+   "in use at exit: 0 bytes" across all 48 representative command runs.
+2. The real resource problems are all in the **library API** (`vsearch_api.h`,
+   shipped as `libvsearch_core.a`), where the process is *not* expected to exit.
+
+#### (a) `fatal()` terminates the caller's process — the dominant library issue
+
+Every core error path (parsers, allocators, the UDB/SFF readers behind S1–S4,
+and the search/cluster/chimera engines) bottoms out in `fatal()` →
+`std::exit()`. A library user who passes malformed input — and S1–S4 show such
+inputs exist — has their **entire host process killed**, with no chance to
+clean up. This is not a leak so much as the root cause that makes "error-path
+cleanup" moot on the CLI and unacceptable in a library. Overlaps E4 (global
+state) but is a distinct, higher-severity concern for library consumers.
+
+- **Effort:** High (thread a recoverable error channel through the core) ·
+  **Impact:** High · **Criticality:** Medium (library API) · *verified*
+
+#### (b) Session-mutex deadlock when the lifecycle is not completed
+
+`vsearch_init_defaults()` locks a global `session_mutex` (`vsearch.cc:803`) that
+only `vsearch_session_end()` unlocks (`vsearch.cc:1023`). Nothing guarantees the
+unlock runs: there is no scope guard, and the ~13-step teardown is manual. If a
+caller's session is abandoned before `vsearch_session_end()` (an exception in
+the embedding code, an early return, or a partial-failure handler), the mutex
+stays locked and the **next `vsearch_init_defaults()` blocks forever**. The
+header documents exactly this ("Forgetting to call `vsearch_session_end()` will
+cause the next `vsearch_init_defaults()` call to block indefinitely"). It is a
+lock leak with a deadlock payload, released on no error path.
+
+- **Effort:** Low (RAII/scope-guard unlock, or a try-lock with diagnostic) ·
+  **Impact:** Medium · **Criticality:** Medium · *verified*
+
+#### (c) Acknowledged heap leak across re-initialization
+
+`vsearch_init_defaults()` `xmalloc`s `opt_ee_cutoffs_values`, and the code
+comment (`vsearch.cc:785–787`) states plainly that "calling
+`vsearch_init_defaults` again … leaks the old allocation." Yet the header
+advertises "Multiple sequential sessions in the same process are supported."
+So the documented multi-session path leaks one allocation per session by
+design — small, but real and self-contradictory.
+
+- **Effort:** Low (free before re-alloc) · **Impact:** Low · **Criticality:** Low · *verified*
+
+#### (d) Manual, ordering-dependent teardown
+
+Cleanup is a hand-ordered reverse sequence (per-thread teardown → per-subsystem
+cleanup → `dbindex_free()` + `db_free()` → `vsearch_session_end()`). Nothing
+enforces it; a caller that mis-orders or skips a step leaks subsystem/thread
+state or the session lock (b). This compounds with E4: much per-command working
+state lives in file-`static` globals that the next session overwrites without
+freeing.
+
+- **Effort:** Medium · **Impact:** Medium · **Criticality:** Low–Medium
+
+#### Already clean (no action)
+
+- **Happy-path CLI runs** — Valgrind CI reports 0 bytes in use at exit for every
+  representative command (the `Valgrind (Memcheck)` workflow).
+- **Worker-thread mutex/alloc balance** — e.g. the allpairs worker unlocks
+  `mutex_output` and frees per-hit alignment strings on the normal path and
+  unlocks `mutex_input` on the no-work branch (`allpairs.cc:526, 540`); no
+  `fatal()` sits between a lock and its unlock in that worker.
+
+**Tooling note.** LeakSanitizer / Valgrind on *normal* runs will not surface any
+of the above — normal runs are clean. Catching (a)–(d) needs (i) error-input
+runs under Valgrind and (ii) an API-lifecycle test that runs **two** sessions
+and checks the mutex and heap. The recently added `api_examples/example_reinit.cc`
+is the natural vehicle for (ii).
+
+- **Overall — Effort:** High (driven by (a)) · **Impact:** High · **Criticality:** Medium
+- **Status:** *verified (fatal()=exit, session-lock/leak code paths, happy-path
+  cleanliness); library mis-use leaks are by construction, not reproduced*
+
+---
+
+## Numerical correctness
+
+### N1. Silent numerical-correctness issues (wrong results, no crash)
+
+The highest-stakes class for a scientific tool: a wrong identity percentage,
+abundance, or candidate ranking is worse than a crash because nothing signals
+it. A key meta-point first: **most of this class evades the sanitizer CI.**
+UBSan catches *signed* integer overflow and *integer* division-by-zero, but the
+issues below are *unsigned* wraparound (defined, silent) and *floating-point*
+division-by-zero (produces `inf`/`nan`, also defined). Neither trips ASan/UBSan
+or Valgrind — they need reference-output regression on a known dataset.
+
+#### (a) `count_t` (`unsigned short`) silently saturates k-mer match counts → wrong search/cluster ranking on long reads — *headline*
+
+The per-target shared-k-mer counter is `using count_t = unsigned short`
+(`searchcore.h:128`). In `searchcore.cc` it is incremented once per matching
+query k-mer sample with **no saturation guard** —
+`searchinfo->kmers[list[j]]++` (`searchcore.cc:309`) — and the result then
+drives candidate selection: `count = searchinfo->kmers[i]; if (count >=
+minmatches) { … novel.count = count; minheap_add(…); }`
+(`searchcore.cc:318–328`). The minheap keeps the top candidates **by
+`count`**.
+
+A query that shares more than 65 535 k-mer samples with one target overflows
+the `unsigned short` and wraps toward 0. The wrapped (small) count then either
+falls below `minmatches` and the target is **dropped from the candidate set
+entirely**, or it under-ranks in the minheap and is evicted when the heap
+fills. Result: a true best hit is silently missed or mis-ranked.
+
+- **Reachability:** real for **long-read data** (PacBio/Nanopore, 10⁴–10⁵ bp),
+  which vsearch supports. The query k-mer sample count scales with sequence
+  length, so a long query against a long, highly similar target exceeds 65 535
+  shared samples. Short-read data stays well under the limit.
+- **Not caught by tooling:** unsigned overflow is not UB, so UBSan stays silent
+  (this is why the class-1 note flagged regression testing, not sanitizers).
+- **Fix:** widen `count_t` to `uint32_t` (the matched `unsigned int count`
+  field at `searchcore.h:83` already implies the wider domain), or clamp on
+  increment. Widening costs memory in the per-target `kmers` array
+  (`indexed_count * sizeof(count_t)`), so measure.
+- **Effort:** Low–Medium · **Impact:** High · **Criticality:** Medium
+  (long-read workflows) · *verified (mechanism); needs-confirmation (a crafted
+  long-read regression case)*
+- Cross-ref: previously noted as a parenthetical under "Checked and found safe"
+  (memory-safety context, where it is correctly *not* a safety bug); this is its
+  correctness writeup.
+
+#### (b) Inconsistent division-by-zero guarding in output fields → `inf`/`nan` emitted silently
+
+The primary percent-identity fields are correctly guarded
+(`internal_alignmentlength > 0 ? 100.0 * matches / internal_alignmentlength :
+0.0`, `results.cc:359, 362, 747`). But several secondary/statistics fields
+divide by a length/count that is only guarded against a null pointer, not
+against zero:
+
+| Site | Expression | Zero denominator when… |
+|------|-----------|------------------------|
+| `results.cc:473` | `100.0 * (matches+mismatches) / qseqlen` (qcov) | empty/zero-length query |
+| `results.cc:477` | `… / tseqlen` (tcov) | zero-length target |
+| `results.cc:636` | `1.0 * level_match[j] / tophitcount` (LCA) | `tophitcount == 0` |
+| `eestats.cc:244` | `100.0 * reads / seq_count` | empty input (`seq_count == 0`) |
+| `eestats.cc:384` | `sum_ee_length_table[i] / reads` | a length bucket with no reads |
+| `mask.cc:408` | `100.0 * unmasked / len` | zero-length sequence |
+
+These produce `inf`/`nan` (defined behaviour, so no sanitizer signal) that flow
+straight into the output columns. Empty-input / zero-length handling is ad hoc
+(`fastq_stats.cc:142` early-returns on empty qualities, but there is no
+consistent guard), so the reachability of each is edge-case but real.
+
+- **Fix:** a single guarded-divide helper (`den > 0 ? num/den : 0.0`) applied to
+  the secondary fields, matching the pattern the %id fields already use.
+- **Effort:** Low · **Impact:** Medium · **Criticality:** Low–Medium · *verified
+  (unguarded sites); per-site reachability needs an empty/degenerate-input run*
+
+#### (c) Accumulator widths — mostly safe, recorded for completeness
+
+- **Abundance** is carried and summed as 64-bit (`db_getabundance` →
+  `uint64_t`, stored `int64_t size`, `db.cc:148, 212`), so abundance totals do
+  not overflow in practice.
+- **Statistics sums** (`sum_error_probabilities`, `sumee_length_table`,
+  `qsum`) are `double` (`fastq_stats.cc:302–304`): no integer overflow, but
+  floating-point summation drifts on very large inputs (a precision, not
+  correctness-cliff, concern; Kahan summation would remove it if it ever
+  matters).
+
+- **Overall — Effort:** Low–Medium · **Impact:** High (a) / Medium (b) ·
+  **Criticality:** Medium
+- **Status:** *verified (types, guards, overflow mechanism); the wrong-output
+  consequences are by construction and want a reference-output regression to pin
+  down exact thresholds*
+
+---
+
+## Assertions / NDEBUG
+
+### A1. Input validation expressed as `assert()` is compiled out of every shipped build
+
+**The NDEBUG cliff is real and active.** The default build defines `NDEBUG`:
+`--enable-debug` defaults to `no` (`configure.ac:79–86`), so the `else` branch
+`AM_CFLAGS += -DNDEBUG` (`src/Makefile.am:44`) is selected. The generated
+Makefile confirms it — `am__append_6 = -DNDEBUG` is active and the `-UNDEBUG`
+debug profile is commented out. Therefore **all 137 `assert()` calls evaluate to
+nothing in every release/CI binary** (the `build-all.yml` release artifacts and
+`build-and-test.yml` both configure without `--enable-debug`). Even the
+sanitizer and Valgrind CI build without `--enable-debug`, so they do not
+exercise the asserts either.
+
+Most of the 137 are legitimate "can't happen" invariants and are fine as
+asserts — e.g. `assert(input_handle != nullptr)` in the fastx/fasta/fastq
+parsers (`fastx.cc:469`, `fasta.cc:175`, `fastq.cc:290`), the `log_handle !=
+nullptr` guards in `fastq_stats.cc` (×6), and `assert(a_string.back() == '\0')`
+(`sff_convert.cc:330, 349`). A null handle there is a program bug, not
+malformed input.
+
+**The problem is the subset that validates file-derived input.** These guard
+integer-overflow bounds on values read straight from an SFF file, and they are
+the *only* check on those values — so under NDEBUG a crafted SFF passes
+unchecked into the overflow the assert was meant to prevent:
+
+| Site | Asserted bound | Value source |
+|------|----------------|--------------|
+| `utils/round_up.hpp:117` | `input <= UINT16_MAX - stub` | the generic `round_up_to_8` overflow guard (the example the class note named) |
+| `sff_convert.cc:136` | `n_bytes <= UINT16_MAX - stub` | SFF flow/key region size |
+| `sff_convert.cc:258` | `flows_per_read <= UINT16_MAX - (header + key_length)` | `sff_header.flows_per_read`, read from file |
+| `sff_convert.cc:288` | `name_length <= UINT16_MAX - read_header_size` | `read_header.name_length`, read from file |
+| `sff_convert.cc:323` | `n_bytes_to_read < SIZE_MAX` | input-derived read length |
+
+The tell is that the **same parser already uses `fatal()` for the other
+malformed-input cases** — truncation and open failures (`sff_convert.cc:169,
+176, 180, 192, 217`). So the overflow bounds are the lone validations written as
+asserts; converting them to `fatal()` is consistent with the surrounding code
+and closes the hole in release builds. This compounds **S2** (the SFF
+`clip_start > clip_end` underflow): the SFF reader is the weakest input surface
+and several of its guards either vanish under NDEBUG (here) or are missing (S2).
+
+A borderline case worth a glance: `fastq_chars.cc:125–150` asserts a lookup
+index is in `[0, char_max]`. The index derives from an input byte but is bounded
+by `unsigned char` construction, so it is likely a true invariant — confirm the
+table is sized `char_max + 1` and leave as-is if so.
+
+- **Rule applied:** asserts are for "can't happen" invariants; a value read from
+  a file can happen, so it needs `fatal()` (or a recoverable error in the
+  library — see L1(a)), not `assert()`.
+- **Fix:** convert the five input-bound asserts above to `fatal()` with a clear
+  "invalid/corrupt SFF" message; leave the invariant asserts alone.
+- **Effort:** Low · **Impact:** Medium (closes release-build input-overflow
+  holes) · **Criticality:** Medium (crafted SFF; overlaps S2) · *verified
+  (NDEBUG default and the asserted input bounds)*
+
+---
+
+## Library-API lifecycle correctness
+
+### C1. Stale configuration across sequential library sessions
+
+This is the state-*correctness* companion to **L1** (which covers the lifecycle
+*leaks/locks*: `fatal()`→`exit()`, the session-mutex deadlock, the re-init heap
+leak). The concern here is the half-finished `opt_*` → `Parameters` migration
+(E1) leaving global configuration that persists or goes stale between API calls.
+
+#### (a) `vsearch_init_defaults()` resets only 203 of 255 `opt_*` globals — *live*
+
+The header promises "`vsearch_init_defaults()` … set all ~200 `opt_*` globals"
+and "If you override any … sets ALL of them." In fact it assigns 203 distinct
+`opt_*` names (`vsearch.cc:801–1020`) out of 255 declared in `vsearch.h` — **52
+are never reset.** Most of the 52 are command-selector flags (`opt_usearch_global`,
+`opt_cluster_size`, `opt_derep_*`, …) that the library path does not use (it
+drives subsystems directly). But several are **behavioral and read on
+library-reachable paths**, so a second session silently inherits the first
+session's values:
+
+| Unreset global | Read in | Lifecycle step affected |
+|----------------|---------|-------------------------|
+| `opt_max_unmasked_pct` | `mask.cc` | `dust_all()` (documented step 6) |
+| `opt_min_unmasked_pct` | `mask.cc` | `dust_all()` (documented step 6) |
+| `opt_clusterout_id` | `cluster.cc` | clustering output |
+| `opt_clusterout_sort` | `cluster.cc` | clustering output |
+
+Because the documented re-initialization model is "repeat the full sequence for
+each session," a process that runs two sessions with different masking thresholds
+gets the **first** session's thresholds in the second — a silent wrong result,
+not an error. Contradicts the header's "sets ALL" guarantee.
+
+- **Fix:** add the missing behavioral globals to `vsearch_init_defaults()` (and
+  reconcile the "~200 / ALL" wording). Low effort, mechanical.
+- **Effort:** Low · **Impact:** Medium–High (silent wrong output for
+  multi-session library users) · **Criticality:** Medium · *verified (reset gap
+  and the four globals' read sites)*
+
+#### (b) The `opt_*` / `Parameters` split is a migration trap — *latent*
+
+The library compute path is currently **consistent**: the per-query engines read
+the bare globals — `searchcore.cc` reads `opt_minwordmatches`, `opt_iddef`,
+`opt_maxqsize`, … and the chimera scoring reads `opt_xn`, `opt_dn`, `opt_minh`,
+`opt_mindiv` (`chimera.cc:1374–1564`) — and those globals are what
+`init_defaults()` resets. The `parameters.opt_*` reads are on the **CLI** command
+dispatchers (`search.cc:848` in `usearch_global`, `chimera.cc:2359–2447` in
+`chimera(parameters)`), which the documented library lifecycle does not call.
+
+The trap: `init_defaults()` touches **only** the globals, never the `Parameters`
+struct (0 references to `parameters.`/`Parameters` in its body). So as the E1
+migration proceeds, the moment a *library-reachable* compute function is switched
+from `opt_x` to `parameters.opt_x`, it will silently read an unpopulated/stale
+`Parameters` field instead of the user's configuration. This is the lifecycle
+form of E1's "two copies that can drift," and it is why E1 should finish in one
+direction (everything reads `Parameters`, and `init_defaults` populates it)
+rather than leave the split half-applied.
+
+- **Effort:** (part of E1) · **Impact:** latent · **Criticality:** Low now,
+  rising as the migration advances · *verified (compute reads globals;
+  init_defaults does not touch Parameters)*
+
+#### (c) Database / k-mer-index re-init is safe — *no action*
+
+The "double-init / use-after-free across the session lifecycle" worry from the
+class note does **not** hold for the database: `db_init()` calls `db_free()`
+first (`db.cc:97`), and `db_free()` frees and then **nulls** `datap` / `seqindex`
+(`db.cc:428–436`), so repeated sessions neither double-free nor read freed
+memory, and re-init does not leak the previous buffers. `dbindex_free()` exists
+for the k-mer index. The real lifecycle defects are the lock/leak items in L1,
+not the db/index objects.
+
+- **Overall — Effort:** Low (for the live (a) part) · **Impact:** Medium–High ·
+  **Criticality:** Medium
+- **Status:** *verified (reset gap, config read sites, db re-init safety);
+  multi-session stale-config effect is by construction, wants a two-session
+  regression test (see `api_examples/example_reinit.cc`)*
+
+---
+
 ## Enhancements
 
 ### E1. Half-finished migration from global `opt_*` variables to the `Parameters` struct
@@ -453,6 +922,12 @@ and low risk; listed for completeness only.
 | S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low |
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (×3) | Bug | Low | Low–Med | Medium |
+| I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
+| P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
+| L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
+| N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium |
+| A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium |
+| C1 | `init_defaults` misses 52 globals → stale config across library sessions | Library lifecycle | Low | Med–High | Medium |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
 | E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
@@ -469,12 +944,32 @@ and low risk; listed for completeness only.
 1. **Security first.** **S1** (critical OOB write from a crafted `.udb`), then
    **S2**, **S3**, **S4**, **S10** — all small, localized input/range checks.
    Confirm **S10** with an AddressSanitizer run. **S5–S9, S11** are
-   hardening/latent and can follow.
+   hardening/latent and can follow. Fix **A1** together with **S2** — both are
+   SFF-reader input checks (A1's overflow guards are asserts that vanish under
+   the default `-DNDEBUG`); convert them to `fatal()` in the same pass.
 2. **B1** — isolated, low-risk correctness fix.
+2b. **N1(a)** — high value for the cost: widening `count_t` removes a silent
+   wrong-ranking bug on long-read data. Pair it with a long-read reference-output
+   regression case, since no sanitizer will catch a regression here. **N1(b)** is a
+   cheap guarded-divide cleanup alongside it.
 3. **E5**, **E8**, **E9** — quick, low-risk cleanups with immediate line-count payoff.
+   Fold **I1**'s checked-close logic into the **E5** shared open/close helper so
+   the write-error guard lands in one place rather than at ~110 call sites.
+   For **P1**, the cheap first step is tooling: add a non-gating `-Wconversion`
+   `-Wsign-conversion` CI lane (mirroring the sanitizer inventory) to size the
+   width-narrowing backlog before touching code; the endianness items are low
+   priority while no big-endian target is supported.
 4. **E2 → E1 → E4** — the core architectural thread (single option table, finish
    the `Parameters` migration, then eliminate global state); E4 directly improves
-   library-API safety.
+   library-API safety. **L1** rides this thread: L1(b)/L1(c) are quick standalone
+   fixes (scope-guard the session unlock; free before re-init), but L1(a) — giving
+   the core a recoverable error channel instead of `fatal()`→`exit()` — is the
+   large library-API change that only becomes tractable once E4 removes the global
+   state it would have to unwind. **C1(a)** is a quick standalone fix (add the 52
+   missing globals — at least the behavioral ones — to `init_defaults`); **C1(b)**
+   is the reason to finish E1 in one direction rather than leave the
+   `opt_*`/`Parameters` split half-applied. Pair C1 with a two-session regression
+   test.
 5. **E3**, **E6**, **E7** — structural decomposition, largely unlocked by the above.
 
 > Note: several findings (S1–S4, S5, S6, S9) trace to file/CLI-derived values
