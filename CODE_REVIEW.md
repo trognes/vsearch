@@ -282,6 +282,70 @@ absent.
 
 ---
 
+## I/O robustness
+
+### I1. Output write/flush/close return values are unchecked → silent truncated output
+
+vsearch writes **all** of its textual output (FASTA/FASTQ records, alignments,
+OTU tables, blast6/UC/SAM tabular results, the `--log` file, and everything
+sent to `stdout`) through `std::fprintf` to `FILE *` handles. Sequence bytes
+themselves are emitted via `fprintf(output_handle, "%.*s", len, seq)`
+(`fasta.cc:455`, `fprint_seq_label`). A sweep of `src/` found:
+
+| Call | Occurrences | Return value checked? |
+|------|-------------|-----------------------|
+| `fprintf` | 736 | none |
+| `fputs` | 1 | none |
+| `fclose` | 110 | none |
+| `fflush` | 0 | — (never called) |
+| `ferror` / `clearerr` | 0 on output | only a read-loop comment at `sha1.c:311` |
+
+No output stream is ever checked for error: not per write, not via `ferror`
+before close, and not with a final `fflush(stdout)` + error check before the
+process exits (`vsearch.cc` exits via `exit(EXIT_FAILURE)` / normal return with
+no flush-and-verify). `fclose` is especially significant here — it flushes the
+stdio buffer, so a deferred write error (disk full, quota exceeded, broken
+pipe) first becomes visible as an `fclose` return of `EOF`, which is discarded
+at all 110 sites.
+
+**Consequence.** On any write failure mid-run — a full disk, an over-quota
+filesystem, or a downstream pipe that closed early — vsearch silently produces
+a **truncated** output file and still exits with status `0`. For a tool that
+sits in scientific pipelines, a partial result that looks complete is worse
+than a crash: downstream steps consume corrupted data with no signal that
+anything went wrong.
+
+**The one place that does check.** `largewrite()` (`udb.cc:145–170`) writes the
+binary `.udb` database with the raw `write()` syscall and correctly fatals on a
+short write (`"Unable to write to UDB file"`, `udb.cc:165`). That pattern is the
+model for what the `FILE *` text path lacks, but it is fd-based and specific to
+the UDB writer; it is not used (or usable as-is) by the stdio output paths.
+
+**Why `-Wunused-result` will not catch this.** The build already enables
+`-Wall -Wextra -Wpedantic` (`src/Makefile.am:3`). But on glibc only `fwrite`
+and `fread` carry the `warn_unused_result` attribute; `fprintf`, `fputs`,
+`fflush`, and `fclose` do not. Since vsearch's output path uses `fprintf`
+(not `fwrite`), a `-Wunused-result` build flags essentially nothing here. The
+reliable detection is a runtime `ferror`/checked-close at end of stream, not a
+compile-time warning.
+
+- **Type:** Latent correctness bug (silent data loss on I/O failure)
+- **Reachability:** any write failure — full disk, quota, `ulimit -f`, broken
+  pipe (`vsearch … | head`), read-only remount mid-run. Not triggered by
+  well-formed runs on healthy filesystems, so the sanitizer/Valgrind CI does
+  not surface it.
+- **Fix direction:** a single checked-close helper (`fflush` + `ferror`, then
+  `fclose` with its own return checked → `fatal` on failure) applied at the
+  ~110 close sites, plus a final `fflush(stdout)` + `ferror(stdout)` guard on
+  the normal exit path. This localizes the check to one place per stream rather
+  than per write. Overlaps with **E5** (the open/close boilerplate is already a
+  dedup target — the checked-close logic should land in that shared helper).
+- **Effort:** Medium · **Impact:** Medium–High · **Criticality:** Low–Medium
+- **Status:** *verified (call-site counts and absence of checks); failure-mode
+  is by construction, not yet reproduced with a forced ENOSPC/`SIGPIPE` run*
+
+---
+
 ## Enhancements
 
 ### E1. Half-finished migration from global `opt_*` variables to the `Parameters` struct
@@ -453,6 +517,7 @@ and low risk; listed for completeness only.
 | S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low |
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (×3) | Bug | Low | Low–Med | Medium |
+| I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
 | E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
@@ -472,6 +537,8 @@ and low risk; listed for completeness only.
    hardening/latent and can follow.
 2. **B1** — isolated, low-risk correctness fix.
 3. **E5**, **E8**, **E9** — quick, low-risk cleanups with immediate line-count payoff.
+   Fold **I1**'s checked-close logic into the **E5** shared open/close helper so
+   the write-error guard lands in one place rather than at ~110 call sites.
 4. **E2 → E1 → E4** — the core architectural thread (single option table, finish
    the `Parameters` migration, then eliminate global state); E4 directly improves
    library-API safety.
