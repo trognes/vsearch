@@ -51,13 +51,18 @@ jobs:
 
     - name: clang-tidy
       run: |
-        # Analyze only the project's own .cc/.c translation units.
-        files=$(grep -oE '"file": "[^"]+\.(cc|c)"' compile_commands.json \
-                | sed 's/"file": "//; s/"$//' | sort -u)
-        : > clang-tidy.txt
-        for f in $files; do
-          clang-tidy -p . "$f" 2>/dev/null >> clang-tidy.txt || true
-        done
+        # Analyze the project's own .cc/.c translation units, one clang-tidy
+        # process per core. clang-tidy's clang-analyzer-* checks are slow per
+        # file, so a sequential loop over ~132 units dominates the job; xargs
+        # -P fans them out. Each file writes its own log to avoid interleaved
+        # appends, then the logs are concatenated.
+        grep -oE '"file": "[^"]+\.(cc|c)"' compile_commands.json \
+          | sed 's/"file": "//; s/"$//' | sort -u > tidy-files.txt
+        echo "translation units: $(wc -l < tidy-files.txt)"
+        mkdir -p .tidy-out
+        xargs -a tidy-files.txt -P"$(nproc)" -I{} \
+          sh -c 'clang-tidy -p . "$1" 2>/dev/null > ".tidy-out/$(echo "$1" | tr "/" "_").log" || true' _ {}
+        cat .tidy-out/*.log > clang-tidy.txt
         echo "clang-tidy warning lines: $(grep -c 'warning:' clang-tidy.txt || true)"
 
     - name: Upload raw logs
