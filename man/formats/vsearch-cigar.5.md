@@ -13,8 +13,13 @@ CIGAR (Compact Idiosyncratic Gapped Alignment Report) is a text-based
 format that encodes a pairwise alignment as a sequence of run-length
 encoded operations. Each operation describes a column of the
 alignment, or a run of identical consecutive columns, as seen from the
-query viewpoint. vsearch emits CIGAR strings in several search,
-clustering, and pairwise alignment outputs (see SEE ALSO).
+query viewpoint. Hence, a cigar string encodes query modifications
+needed to equal the target. However, beware that cigar strings in the
+SAM format adopt the target viewpoint: they encode target
+modifications needed to equal the query (see
+[`vsearch-sam(5)`](./vsearch-sam.5.md)). vsearch emits CIGAR strings
+in several search, clustering, and pairwise alignment outputs (see SEE
+ALSO).
 
 A CIGAR string is an ASCII string consisting of one or more
 *operations*. Each operation is written as an optional non-negative
@@ -108,9 +113,10 @@ example `12M1`), or that contains any character other than the digits
 The following alignment of an 8-nt query against a 9-nt target
 
 ```text
-query:   ACGT--TACG
-target:  AC-TGGTACG
-cigar:   2M1I1M2D4M
+query:     ACGT--TACG
+target:    AC-TGGTTCG
+alignment: MMIMDDMMMM
+cigar:     2M1I1M2D4M
 ```
 
 contains, from left to right:
@@ -119,12 +125,12 @@ contains, from left to right:
 - 1 insertion in the target (`G` present only in the query),
 - 1 column with matching residues (`T` / `T`),
 - 2 deletions from the query (`GG` present only in the target),
-- 4 columns with matching residues (`TACG` / `TACG`).
+- 4 columns with matching residues (`TACG` / `TTCG`).
 
-The same alignment written without run-length compression would be
-`MMIMDDMMMM`. Note that `M` does not distinguish matches from
-mismatches; a mismatching column is encoded with the same operation
-letter.
+Without run-length encoding, the alignment reads `MMIMDDMMMM`, after
+encoding it reads `2M1I1M2D4M`. Note that `M` does not distinguish
+matches from mismatches; a mismatching column is encoded with the same
+operation letter.
 
 
 # SEE ALSO
@@ -136,6 +142,7 @@ letter.
 [`vsearch-cluster_unoise(1)`](../commands/vsearch-cluster_unoise.1.md),
 [`vsearch-search_exact(1)`](../commands/vsearch-search_exact.1.md),
 [`vsearch-usearch_global(1)`](../commands/vsearch-usearch_global.1.md),
+[`vsearch-sam(5)`](./vsearch-sam.5.md),
 [`vsearch-pairwise_alignment_parameters(7)`](../misc/vsearch-pairwise_alignment_parameters.7.md),
 [`vsearch-userfields(7)`](../misc/vsearch-userfields.7.md)
 
