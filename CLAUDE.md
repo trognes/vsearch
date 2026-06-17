@@ -150,36 +150,77 @@ This is a development fork; upstream is `torognes/vsearch`. The fork carries
 commits that must **never** go upstream — `CODE_REVIEW.md`, `CLAUDE.md`,
 `.clang-tidy`, and the fork-only CI workflows
 (`.github/workflows/{sanitizers,valgrind,static-analysis,codeql}.yml`). So you
-never merge a whole fork
-branch upstream; you lift the individual fix commit(s) onto a branch based on
-upstream's tip and open a PR with exactly that diff.
+never merge a whole fork branch upstream; you lift the individual fix commit(s)
+onto a branch based on upstream's tip and open a PR with exactly that diff.
 
 **The enabling habit: one fix = one atomic commit** touching only the real
 source files for that fix, with a message written as if addressing upstream.
 Keep edits to the review docs / CI workflows in *separate* commits. When fixes
 are isolated this way, sending one upstream is a single `git cherry-pick`.
 
-One-time setup:
+### Division of work (read this first)
+
+Claude (in the cloud session) is **scoped to `trognes/vsearch` only**. It cannot
+fetch from, push to, or open a PR against `torognes/vsearch`, and the cloud
+session's git remote reaches only `trognes/vsearch`. The upstream PR is opened by
+**you (the maintainer) on your own machine**, where both repositories are
+reachable. The split is:
+
+| Step | Who |
+|------|-----|
+| Make the fix as one atomic, source-only commit on the dev branch | **Claude** |
+| Push that commit to `trognes/vsearch` and report its SHA | **Claude** |
+| Cherry-pick the commit onto a clean branch based on `upstream/master` | **You** |
+| Build-check, push the clean branch to your fork, open the upstream PR | **You** |
+
+Why you (not Claude) must do the cherry-pick: `trognes/master` itself carries the
+fork-only files above, so any branch built on it would show them in a PR against
+`torognes/master`. A clean upstream diff requires re-basing the lone fix commit
+onto the *real* `upstream/master`, which is only reachable from your machine.
+
+### What Claude hands you
+
+When a fix is ready, Claude will give you: (1) the **fix commit SHA**, (2) the
+**dev branch** it's on in `trognes/vsearch`, and (3) a suggested `fix/<name>`
+branch name. Claude makes sure that commit touches only real source files so the
+cherry-pick is clean.
+
+### What you do to open the upstream PR (`torognes/vsearch`)
+
+One-time setup, in your local clone (`origin` = your fork `trognes/vsearch`):
 
 ```bash
 git remote add upstream https://github.com/torognes/vsearch.git
-git fetch upstream
 ```
 
-Per fix:
+Per fix (substitute the SHA / names Claude reported):
 
 ```bash
-git switch -c fix/short-name upstream/master   # branch off upstream, not the fork
-git cherry-pick <sha-of-fix>                    # lift just the fix commit(s)
-./autogen.sh && ./configure CFLAGS="-O2" CXXFLAGS="-O2" && make ARFLAGS="cr"
-git push -u origin fix/short-name
+git fetch upstream                                 # refresh upstream's tip
+git fetch origin <dev-branch>                      # get Claude's commit from the fork
+git switch -c fix/short-name upstream/master       # clean branch off upstream, not the fork
+git cherry-pick <sha-of-fix>                        # lift just the fix commit(s)
+./autogen.sh && ./configure CFLAGS="-O2" CXXFLAGS="-O2" && make ARFLAGS="cr"   # sanity build
+git push -u origin fix/short-name                   # push the clean branch to YOUR fork
 ```
 
-Then open the PR from `fix/short-name` targeting `torognes/vsearch:master`.
+Then open the cross-fork PR (`trognes/vsearch` is a GitHub fork of
+`torognes/vsearch`, so this works without a second fork) — either:
+
+- **Web UI:** after the push, `trognes/vsearch` shows a "Compare & pull request"
+  banner for `fix/short-name`. Click it, then set **base repository =
+  `torognes/vsearch`**, **base = `master`**, head = `trognes/vsearch:fix/short-name`,
+  and submit. (Double-check the base repo — GitHub sometimes defaults it to your
+  fork.)
+- **Direct compare URL:**
+  `https://github.com/torognes/vsearch/compare/master...trognes:vsearch:fix/short-name?expand=1`
+
 Because the branch is based on `upstream/master` and contains only the fix
 commit, the PR diff is exactly the fix — no review-doc or CI noise.
 
-If a fix is entangled with unrelated changes in one commit, isolate it before
-cherry-picking: `git cherry-pick -n <sha>` then unstage/keep only the relevant
-hunks, or `git format-patch -1 <sha>`, edit the patch, and `git am` it onto the
-clean branch.
+### If a fix is entangled with unrelated changes
+
+Isolate it before cherry-picking: `git cherry-pick -n <sha>` then unstage/keep
+only the relevant hunks, or `git format-patch -1 <sha>`, edit the patch, and
+`git am` it onto the clean branch.
+
