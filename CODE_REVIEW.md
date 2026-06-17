@@ -30,7 +30,7 @@ tier (one PR per tier). Status legend: **audited** = read in full against the
 |------|-------|--------|
 | **1 — input parsers & DB load** | `fastx`, `fasta`, `fastq`, `fasta2fastq`, `fastq_chars`, `sff_convert`, `udb`, `db`, `dbhash`, `dbindex`, `userfields` (+ headers) | **audited** (this pass → S13–S16, L2, plus folded sites in S5/N1/P1 and corrections to N1(c)/C1(c)) |
 | **2 — core compute engines** | `searchcore`, `search`, `search_exact`, `align_simd`, `linmemalign`, `cluster`, `chimera`, `allpairs`, `sintax`, `orient`, `mask`, `kmerhash`, `unique` | **audited** (this pass → S17–S19, N2; S10 reachability confirmed; S13 generalized; folded sites in S5/S7/N1/P1/L1/L2/E6/E9) |
-| 3 — dereplication & seq ops | `derep`, `derep_prefix`, `derep_smallmem`, `rereplicate`, `shuffle`, `subsample`, `sortbylength`, `sortbysize`, `cut`, `getseq` | *pending* |
+| **3 — dereplication & seq ops** | `derep`, `derep_prefix`, `derep_smallmem`, `rereplicate`, `shuffle`, `subsample`, `sortbylength`, `sortbysize`, `cut`, `getseq` | **audited** (this pass → S20–S22; folded sites in S4/S5/B1/N1/L2/E7/E9) |
 | 4 — output, formatting & stats | `results`, `otutable`, `msa`, `showalign`, `fastq_stats`, `eestats`, `fastqops`, `fastq_join`, `filter`, `tax` | *pending* |
 | 5 — CLI/dispatch & infra | `vsearch.cc`, `util`, `arch`, `cpu`, `attributes`, `dynlibs`, `bitmap`, `minheap`, `city`, `md5`, `sha1` | *pending* |
 | 6 — headers & `utils/` | all `*.h`, `src/utils/*.hpp` | *pending* |
@@ -66,6 +66,10 @@ copy-paste slip. An exhaustive sweep originally found three occurrences:
   a shared quality-check helper (see E8) would collapse this to one point of
   correctness. The upstream fix patched two sites independently rather than
   introducing such a helper, so the duplication (and the third site) persists.
+- **Related slip (Tier-3 audit):** `rereplicate.cc:133` writes a WARNING to
+  `stderr` from inside the `if (fp_log != nullptr)` log branch — the same
+  `stderr`-instead-of-`fp_log` copy-paste pattern as B1 (the message is then
+  missing from the log and duplicated on `stderr`). One-token fix, same class.
 
 ---
 
@@ -150,6 +154,11 @@ quality pointer in the FASTQ path.
   sequence; trivially hit in a file with mixed-length sequences.
 - **Fix:** skip/clamp when `start > seqlen` (emit empty or skip the record).
 - **Effort:** Low · **Impact:** Medium · **Criticality:** Medium · *verified*
+- **Fix scope (Tier-3 audit):** the quality-pointer twin is at `getseq.cc:493`
+  (`fastx_get_quality(h1) + start - 1`) and is reached whenever `--fastqout` is
+  set, *independently* of `--fastaout`. The guard must be applied once, **before**
+  computing `length` and offsetting *both* the sequence and quality pointers — not
+  just the FASTA path.
 
 #### S10. Hit-list allocation vs. index-bound mismatch in clustering/search (High)
 
@@ -214,6 +223,13 @@ itself is correct; only the print interface narrows.
   `query_head` realloc decision so a `strcpy` can overflow the buffer. Library
   API only, gated on a >2 GB header — defense-in-depth, but unlike the read-only
   print-path sites this one can corrupt the heap.
+- **Additional sites (Tier-3 audit):** `getseq.cc` `test_label_match` narrows
+  several `size_t` lengths to `int` (`:179, 186, 190, 194, 237, 279, 284`) and
+  computes `int field_buffer_size = field_len + 2 + longest_label` (`:187–196`)
+  in `int` — a >2 GB header/label or pathological `--label_field` makes these
+  negative and feeds a negative/overflowed `resize()` then `strcpy`/`std::copy`
+  into `field_buffer` (write-overflow twist again). Gated on >2 GB; same fix
+  (carry as `size_t`/`int64_t`).
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
@@ -448,6 +464,65 @@ bytes beyond 'U'.
 - **Fix:** clamp `nth_parent` to `parents_found - 1` before indexing/incrementing.
 - **Effort:** Low · **Impact:** Medium–High · **Criticality:** Medium ·
   *needs-confirmation (reachability); logic verified* · related S17.
+
+#### S20. `random_subsampling` reads one element past `seqindex` (reachable OOB read, ASan-detectable)
+
+`random_subsampling` (`subsample.cc:256–277`) advances the amplicon cursor at the
+*bottom* of the loop: after the mass bookkeeping, `if (accumulated_mass >=
+amplicon_mass) { ++amplicon_number; amplicon_mass = sizein_requested ?
+db_getabundance(amplicon_number) : 1; … }`. On the iteration that consumes the
+last unit of the final amplicon's mass, `++amplicon_number` makes
+`amplicon_number == db_getsequencecount()`, and `db_getabundance(amplicon_number)`
+reads `seqindex[dbsequencecount].size` — **one struct past the array** — before
+the `while (n_reads_left > 0)` test exits. Unlike most Tier-2/3 findings this is a
+genuinely reachable out-of-bounds heap read (the value is discarded, but ASan /
+Valgrind will flag it).
+
+- **Reachability:** with `--sizein` (so the `db_getabundance` branch is taken)
+  whenever the final selected read is the last read of the last amplicon —
+  *always* when sampling the whole dataset (`--sample_size` = total mass /
+  `--sample_pct 100`), and otherwise whenever the RNG selects that last unit.
+  Without `--sizein` the constant `1` branch is taken, so no OOB.
+- **Fix:** only fetch the next amplicon's mass when the loop will continue
+  (`amplicon_number < dbsequencecount`), e.g. advance the cursor at the top of
+  the next iteration rather than the bottom of the current one.
+- **Effort:** Low · **Impact:** Low–Medium · **Criticality:** Medium · *verified
+  (reachable; one-struct over-read, value unused)*.
+
+#### S21. `derep_prefix` hash mask declared `int` while the table size is `int64_t` → OOB at extreme scale (latent)
+
+`derep_prefix` grows `int64_t hashtablesize` by `<<= 1` until `3*dbsequencecount
+<= 2*hashtablesize` (`derep_prefix.cc:198–202`), then truncates it into `int const
+hash_mask = hashtablesize - 1` (`derep_prefix.cc:203`). Once the table reaches
+2³¹ buckets (input ≈ 1.43 billion sequences), `hashtablesize - 1` overflows `int`
+to negative; sign-extended in `hashtable[hash & hash_mask]` (`:265, :304`) it no
+longer confines the index → out-of-bounds `std::vector::operator[]` (no bounds
+check under `-DNDEBUG`). The full-length `derep.cc` uses a wider mask, so this is
+prefix-only.
+
+- **Reachability:** ~1.4e9 sequences in one `--derep_prefix` run — not reachable
+  in practice today, but a real latent index-overflow.
+- **Fix:** declare `hash_mask` as `uint64_t`/`int64_t` to match `hashtablesize`.
+- **Effort:** Low · **Impact:** High · **Criticality:** Low (extreme-scale only) ·
+  *verified (overflow path); latent (trigger)* · narrowing family, distinct from N1(c).
+
+#### S22. Non-finite CLI floats (NaN) bypass range validation → NaN→`uint64_t` cast UB (Low)
+
+`args_getdouble` uses `sscanf("%lf")` (`vsearch.cc:763`), which accepts `nan`/`inf`.
+Range checks of the form `if ((x < lo) or (x > hi))` are **false for NaN** (every
+NaN comparison is false), so a NaN passes validation. Concrete instance:
+`--sample_pct nan` survives the `<0 || >100` check (`vsearch.cc:4949`) and reaches
+`std::floor(mass_total * nan / 100.0)` = NaN in `number_of_reads_to_sample`
+(`subsample.cc:228`); casting NaN to `uint64_t` is undefined behavior (typically 0
+or implementation-defined). `inf` is caught by the `> hi` branch; only NaN slips
+through, and only for options whose validation is a pure range test.
+
+- **Reachability:** any float option validated solely by a range comparison, e.g.
+  `--fastx_subsample --sample_pct nan`.
+- **Fix:** reject non-finite values in `args_getdouble` (a single `std::isfinite`
+  check covers every such option at once).
+- **Effort:** Low · **Impact:** Low · **Criticality:** Low · *verified* · I1-class
+  input-validation gap.
 
 ### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
 
@@ -824,6 +899,23 @@ and the correction to C1(c).
   Fix: re-derive (or store-and-assert) `seqcount`/`tophits` per session; add
   `tophits` to the chimera save/restore set. *verified; latent on the
   single-session CLI.*
+- **(e) `derep_session_init` does not free before re-init (Tier-3).**
+  `derep_session_init` (`derep.cc:985`) resizes `hashtable` and resets `clusters`
+  but does **not** free the `seq`/`header` strings `derep_add_sequence`
+  `xstrdup`'d (`derep.cc:1056–1057`). A library client that reuses a session
+  (`init → add* → get_results → init …`) leaks every prior string and drops the
+  old buckets; the symmetric `init`/`cleanup` naming invites exactly this loop.
+  Fix: have `derep_session_init` call `derep_session_cleanup` first (idempotent),
+  or document that cleanup is mandatory before re-init. Also `derep_get_results`
+  (`derep.cc:1069`) doesn't null-check `results` when `max_results > 0` (null +
+  populated session → null-pointer write). *verified; library-reuse path.*
+- **(f) `subsample` uses raw `fopen`/`fclose` instead of the RAII handle
+  (Tier-3).** `subsample()` (`subsample.cc:367–414`) opens outputs with
+  `fopen_output` and closes them at the end, so a `fatal()` in between (e.g. the
+  `abort_if_fastq_out_of_fasta` or `n_reads > mass_total` checks) leaks the
+  `FILE*` on the library path — inconsistent with the `open_output_file` RAII used
+  by its four sibling commands. Fix: use the RAII wrapper, or run the checks
+  before opening outputs. *verified; benign on the CLI (exit reclaims).*
 
 ## Numerical correctness
 
@@ -899,6 +991,7 @@ against zero:
 | `allpairs.cc:479–480`, `cluster.cc:818–820` | `nwid = 100.0 * … / nwalignmentlength` | zero-length alignment (`--minseqlength 0` + empty record) |
 | `chimera.cc:973, 1547` | `divfrac = 100.0 * divdiff / QT` (`QT` = a percent-identity) | query matches neither parent over the alignment (edge) |
 | `chimera.cc:1716, 1718` | `100.0 * best_left_y / sumL`, `… / sumR` (alnout) | guarded only implicitly by the `left_y > left_n` selection invariant — defensive |
+| `derep.cc:722`, `derep_prefix.cc:378` | `average = 1.0 * sumsize / clusters` | `clusters == 0` (empty input) |
 
 These produce `inf`/`nan` (defined behaviour, so no sanitizer signal) that flow
 straight into the output columns. Empty-input / zero-length handling is ad hoc
@@ -956,6 +1049,18 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
   raised above it truncates `seqlen`, which then feeds k-mer indexing,
   alignment, and `%.*s` output — same class as **S5**, distinct site (the DB
   index struct + the unbounded option). Gated on >4 GB input. *verified.*
+- **Abundance narrowed *below* the 32-bit storage (Tier-3 audit).** Two sites
+  narrow the `int64_t` abundance even further, to `int`, before use — diverging
+  from their siblings: `derep_smallmem.cc:390` (`int const abundance =
+  fastx_get_abundance(h)`, then widened to `int64_t ab` — the full-length
+  `derep.cc:527` and `derep_prefix.cc:235` keep `int64_t` directly), and
+  `subsample.cc:199` where the per-amplicon deck is `std::vector<int>` so an
+  abundance in `(INT_MAX, UINT_MAX]` becomes negative and corrupts the `uint64_t
+  mass_total` accumulate (`subsample.cc:383`). `rereplicate.cc:110` likewise casts
+  the cumulative `int64_t n_reads` to `int` for the output ordinal → wraps past
+  2³¹ on very large re-replications. Reachable with `;size=` annotations above
+  the relevant bound (the regime N1(c) already concerns). Fix: keep these
+  `int64_t`/`uint64_t`.
 - **Statistics sums** (`sum_error_probabilities`, `sumee_length_table`,
   `qsum`) are `double` (`fastq_stats.cc:302–304`): no integer overflow, but
   floating-point summation drifts on very large inputs (a precision, not
@@ -1333,6 +1438,17 @@ decomposed:
   `compare_bylength_shortest_first`, `compare_byabundance` (~451–568) share the
   same abundance/header/pointer tiebreak tail verbatim; only the primary key and
   direction differ. Factor the shared tiebreak; parameterize the key.
+- **`shuffle.cc` / `sortbylength.cc` / `sortbysize.cc`** (Tier-3) carry ~4 copies
+  of the same deck-build → sort → median → truncate → output scaffold, differing
+  only in the sort key: `truncate_deck` is triplicated (`shuffle.cc:103`,
+  `sortbylength.cc:178`, `sortbysize.cc:191`), `find_median_length` /
+  `find_median_abundance` are byte-for-byte duplicates bar the field name, and the
+  three `output_*` bodies match. Two of them already carry a `// refactoring:
+  extract as a template` breadcrumb. A `<Key>`-templated deck pipeline would
+  collapse `sortbylength`/`sortbysize` to a comparator + projection each. (The
+  `find_median_*` even-case `a + (b - a)*0.5` is correct only because the sort
+  direction guarantees `b >= a` on the unsigned subtraction — fragile, undocumented
+  coupling worth a comment.)
 
 - **Effort:** Medium · **Impact:** Medium · **Criticality:** Low
 
@@ -1375,6 +1491,29 @@ and prevent recurrence.
 - `src/cluster.cc` — `allpairs.cc:708` carries a `// refactoring: issue with
   parenthesis?` breadcrumb; the expression is actually correct (the `/2` applies
   to the `std::max(0, n*(n-1))` result) — remove the breadcrumb.
+- `src/derep_smallmem.cc` — the comment at ~352–356 still claims sequences are
+  compared "exactly identical … With 64-bit hashes", but the code matches on
+  the 128-bit hash *only* (no `seqcmp`, unlike `derep.cc`/`derep_prefix.cc`); a
+  128-bit CityHash collision would silently merge two distinct sequences. By
+  design (memory tradeoff), but the comment misrepresents it — update it
+  (Tier-3).
+- `src/sortbysize.cc` — dead commented-out `trim_deck`/`erase_high_abundances`
+  blocks (~173–188, 213–222) (Tier-3).
+- `src/cut.cc` — `locate_*_restriction_site`/`remove_restriction_sites`
+  (~360–379) pass `pattern.find('^'|'_')` straight to `erase`/`static_cast<int>`
+  with no `npos` check; safe only because `cut()` validates presence first
+  (`:461–462`) — fragile against reordering/reuse (`npos`→`int` would be `-1`)
+  (Tier-3).
+- `src/shuffle.cc` — uses its own `std::mt19937_64` seeded locally
+  (`std::random_device` when `--randseed 0`), diverging from the global
+  `random()`/`arch_srandom` engine every other randomized command uses; a given
+  `--randseed` yields a different permutation than the shared path, and the seed
+  is truncated `int64_t`→`unsigned int` (same silent >32-bit drop as
+  `arch_srandom`). Reproducibility/consistency, not a bug (Tier-3).
+- `src/derep.cc` — `convert_probability_to_quality_symbol` (~180–187) can
+  `log10(0.0)`→`-inf` then `static_cast<int64_t>(+inf)` (float→int UB) if a
+  probability underflows to exactly 0.0; not reachable with single-byte FASTQ
+  quality (q would need ≳3500), but the cast is unguarded (Tier-3, latent).
 
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low
 
@@ -1410,6 +1549,9 @@ and low risk; listed for completeness only.
 | S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium |
 | S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium |
 | S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium |
+| S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Security | Low | Low–Med | Medium |
+| S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low |
+| S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (2/3 fixed upstream; `fastq_mergepairs.cc` open) | Bug | Low | Low–Med | Medium |
