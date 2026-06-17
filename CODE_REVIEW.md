@@ -19,6 +19,24 @@ Effort / Impact / Criticality are rated **Low / Medium / High**:
 
 ---
 
+## Review coverage matrix
+
+A systematic file-by-file deep audit is in progress, processed by subsystem
+tier (one PR per tier). Status legend: **audited** = read in full against the
+8-lens checklist this pass; *prior* = covered by earlier targeted reviews;
+*pending* = not yet swept.
+
+| Tier | Files | Status |
+|------|-------|--------|
+| **1 — input parsers & DB load** | `fastx`, `fasta`, `fastq`, `fasta2fastq`, `fastq_chars`, `sff_convert`, `udb`, `db`, `dbhash`, `dbindex`, `userfields` (+ headers) | **audited** (this pass → S13–S16, L2, plus folded sites in S5/N1/P1 and corrections to N1(c)/C1(c)) |
+| **2 — core compute engines** | `searchcore`, `search`, `search_exact`, `align_simd`, `linmemalign`, `cluster`, `chimera`, `allpairs`, `sintax`, `orient`, `mask`, `kmerhash`, `unique` | **audited** (this pass → S17–S19, N2; S10 reachability confirmed; S13 generalized; folded sites in S5/S7/N1/P1/L1/L2/E6/E9) |
+| 3 — dereplication & seq ops | `derep`, `derep_prefix`, `derep_smallmem`, `rereplicate`, `shuffle`, `subsample`, `sortbylength`, `sortbysize`, `cut`, `getseq` | *pending* |
+| 4 — output, formatting & stats | `results`, `otutable`, `msa`, `showalign`, `fastq_stats`, `eestats`, `fastqops`, `fastq_join`, `filter`, `tax` | *pending* |
+| 5 — CLI/dispatch & infra | `vsearch.cc`, `util`, `arch`, `cpu`, `attributes`, `dynlibs`, `bitmap`, `minheap`, `city`, `md5`, `sha1` | *pending* |
+| 6 — headers & `utils/` | all `*.h`, `src/utils/*.hpp` | *pending* |
+
+---
+
 ## Bugs
 
 ### B1. `--log` quality-error messages written to `stderr` instead of the log file
@@ -154,7 +172,20 @@ hits) needs runtime confirmation. The same `tophits` clamp pattern is used in
   `--maxaccepts` / `--maxrejects` whose sum exceeds `seqcount`.
 - **Fix:** size the buffer by the same `opt_maxaccepts + opt_maxrejects(+MAXDELAYED)`
   bound used for indexing, or clamp the index bound to `tophits`.
-- **Effort:** Low · **Impact:** High · **Criticality:** Medium · *verified (arithmetic); needs-confirmation (reachability) — suggest an ASan run*
+- **Effort:** Low · **Impact:** High · **Criticality:** Medium · *verified (arithmetic **and reachability**)*
+- **Reachability confirmed (Tier-2 audit).** The over-write is a real ordering,
+  not just arithmetic: OOB requires `opt_maxaccepts + opt_maxrejects - 1 ≥
+  tophits`, i.e. `seqcount < opt_maxaccepts + opt_maxrejects - 1` so that
+  `seqcount` is the binding `min` in `tophits = min(sum+MAXDELAYED, seqcount)`.
+  `evaluate_extra_hits` then drives `hit_count` up to `opt_maxaccepts +
+  opt_maxrejects - 1` (the trash block pins it there), past the `seqcount`-sized
+  buffer. The CI suite misses it only because its default `--maxaccepts 1
+  --maxrejects 32` against >33 sequences makes the *sum* the binding clamp.
+  Suggested ASan repro: ~5 sequences with `--maxaccepts 100 --maxrejects 100`
+  under `--cluster_size`/`--cluster_fast` with several no-hit rounds feeding
+  `extra_list` → `hit_count` ~199 against a `tophits = 5` buffer. The 64-bit→`int`
+  width of `tophits`/the index bound (`opt_max*` are `int64_t`) compounds it and
+  is the canonical fix point (clamp the index bound to `tophits`).
 
 ### Hardening / latent issues (defense-in-depth)
 
@@ -171,6 +202,18 @@ itself is correct; only the print interface narrows.
 - **Reachability:** requires a >2 GB single sequence/header.
 - **Fix:** carry these lengths as `int64_t`/`size_t` through the print interfaces.
 - **Effort:** Medium · **Impact:** Medium · **Criticality:** Low · *verified (truncation); gated on >2 GB input*
+- **Additional sites (Tier-1 audit):** `fasta.cc:417, 426, 452–456, 459–472`,
+  `fastq.cc:659–675, 764–765`, `fasta2fastq.cc:110–114`. The same narrowing also
+  occurs on the *storage* side in the DB index struct — see the N1(c) note on
+  `seqinfo_s.seqlen`/`headerlen` being `unsigned int` with an unbounded
+  `opt_maxseqlength`.
+- **Additional sites (Tier-2 audit) — with a write-overflow twist:** the library
+  search entry points narrow `std::strlen(query_head)` to `int head_len`
+  (`search.cc:1081` `search_session_single`, `search.cc:1244`
+  `search_batch_worker_fn`); a negative `head_len` then mis-drives the
+  `query_head` realloc decision so a `strcpy` can overflow the buffer. Library
+  API only, gated on a >2 GB header — defense-in-depth, but unlike the read-only
+  print-path sites this one can corrupt the heap.
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
@@ -195,6 +238,12 @@ with `int qlen`). Currently bounded in practice by the SIMD
 no safety net.
 
 - **Effort:** Low (add overflow-checked helper) · **Impact:** Medium · **Criticality:** Low · *needs-confirmation per caller*
+- **Additional caller (Tier-2):** `chimera_detect_batch` does
+  `ctx.ci_array = xmalloc(nthreads * sizeof(ptr))` with `nthreads = max(1,
+  opt_threads)` (`chimera.cc:2975`); on the library path `opt_threads` is
+  caller-supplied, so a pathological value makes the multiply wrap and the
+  following per-thread init loop write out of bounds. Bound `opt_threads` /
+  use the overflow-checked helper.
 
 #### S8. `md5.c` `body()` unsigned-underflow loop if called with `size == 0` (Low)
 
@@ -239,6 +288,166 @@ already masked, so downstream indexing is unaffected. This is the same
 *class* as S5 (signed-overflow / width issues) but a distinct, concrete site.
 
 - **Effort:** Low · **Impact:** Low (UB; benign in practice as the value is masked) · **Criticality:** Low · *verified by CI ASan/UBSan run*
+
+#### S13. `opt_wordlength` range-validated only on the CLI; library path → shift UB and undersized k-mer index (Medium)
+
+`dbindex_prepare` computes `kmerhashsize = 1U << (2 * opt_wordlength)`
+(`dbindex.cc:179`) and sizes `kmercount`/`kmerbitmap`/`kmerhash`/`kmerindex`
+from it. `opt_wordlength` is range-checked to `[3,15]` on **both CLI paths**
+(`vsearch.cc:1683` and `:4908`), so `1U << 30` is the CLI maximum and safe. But
+the library entry point `vsearch_apply_defaults_fixups()` (`vsearch.cc:1081–1087`)
+only maps the `0` sentinel to a default — it does **not** enforce `[3,15]`. A
+library caller (the documented "override `opt_*` → call fixups → `dbindex_prepare`"
+sequence) that sets `opt_wordlength` ≥ 16 makes the shift count ≥ 32 on a 32-bit
+`unsigned` (undefined behavior), and ≥ 32 makes it ≥ 64. Worse, `unique_count`
+masks k-mer values to the *true* `2*wordlength` width, so the k-mer value can
+exceed an undersized `kmerhashsize`, giving out-of-bounds writes to
+`kmercount[kmer]` / `kmerbitmap[kmer]` (`dbindex.cc:148–153`).
+
+- **Reachability:** library API only (not CLI); a `libvsearch_core.a` consumer
+  setting `opt_wordlength` outside `[3,15]`. `LIBRARY_API.md` documents it as a
+  user-set knob.
+- **Fix:** move the `[3,15]` validation into `vsearch_apply_defaults_fixups()`
+  (fatal on out-of-range) so CLI and library share one bound; compute the shift
+  in 64-bit (`1ULL`).
+- **Effort:** Low · **Impact:** High · **Criticality:** Medium · *verified
+  (mechanism + missing guard); library-reachable, not CLI* · related L1/C1.
+- **This is a class, not a one-off.** The same "CLI-only validation, library
+  fixup doesn't re-check" root cause recurs at several sites the Tier-2 audit
+  found; the single fix is to validate all such knobs in
+  `vsearch_apply_defaults_fixups()`:
+  - **`opt_chimeras_parents_max`** → OOB *write* in `find_best_parents_long`
+    (its own finding **S17**, High).
+  - **`opt_wordlength`** in `orient.cc` `rc_kmer` (the `rev <<= 2U` accumulator,
+    guarded only by an NDEBUG-stripped `assert(opt_wordlength*2 <= 32)` at
+    `orient.cc:91`) → silent wrong reverse-complement / strand counts for
+    `opt_wordlength ≥ 16`.
+  - **`opt_wordlength`** in `unique_count_hash` (`unique.cc:293`), where the
+    k-mer mask is computed as `(1ULL << 2*wordlength) - 1` then **narrowed to a
+    32-bit `unsigned int`** — exact for `wordlength ≤ 15`, silently undersized
+    (hash collisions) at `≥ 16`. The bitmap variant (`unique.cc:206`) uses a
+    64-bit mask, so the two diverge exactly at the boundary the CLI bound
+    protects.
+  - **`opt_threads`** in `chimera_detect_batch` (`chimera.cc:2975`) →
+    `nthreads * sizeof(ptr)` is an unchecked multiply (S7 class) on a
+    library-supplied thread count.
+
+#### S14. UDB header/length tables stored as `std::vector<int>` for unsigned 32-bit file values (Medium)
+
+`udb_read` reads the per-sequence header offsets and lengths straight from the
+file into **signed** containers: `std::vector<int> header_index(seqcount + 1)`
+(`udb.cc:405`, filled by `largeread`) and `std::vector<int>
+sequence_lengths(seqcount)` (`udb.cc:440`). A file value with the top bit set is
+a negative `int`; `header_index[i+1] - current_index - 1` (`udb.cc:420`) then
+mixes signed elements in the `headerlen` computation, and `header_index[seqcount]
+= udb_headerchars` narrows a `uint64_t` into an `int` slot (`udb.cc:409`). This
+is the type-level root cause underneath **S3** (headerlen underflow) and **S9**
+(`seqcount+1` wrap): the storage type itself is wrong.
+
+- **Reachability:** crafted `.udb` with offsets/lengths ≥ `0x80000000`.
+- **Fix:** use `std::vector<uint32_t>`; validate each value against the
+  header/nucleotide region before use (closes S3/S9 at the source).
+- **Effort:** Low · **Impact:** Medium · **Criticality:** Medium · *verified
+  (types)* · underlies S3, S9.
+
+#### S15. SFF flowgram-skip uses the wrong short-read threshold → silent offset desync (Medium)
+
+In `sff_convert` the flowgram section is skipped with
+`if (fskip(fp_sff.get(), 2UL * flows_per_read) < flows_per_read) fatal(...)`
+(`sff_convert.cc:512`). It requests `2 * flows_per_read` bytes but only fatals if
+**fewer than `flows_per_read`** (half) were skipped. On a file truncated so that
+between `flows_per_read` and `2*flows_per_read − 1` bytes remain, `fskip` returns
+the partial count, the check passes, and `filepos` is advanced by the full
+`2*flows_per_read` (`sff_convert.cc:516`) — desynchronizing every subsequent
+offset test (including the `index_offset == filepos` branch) and parsing
+garbage. The very next line uses `skip_sff_section`, which compares against the
+full requested length, so this open-coded site is provably inconsistent with the
+file's own helper.
+
+- **Reachability:** truncated/crafted SFF with a partially present flowgram section.
+- **Fix:** compare against `2UL * flows_per_read` (or route through `skip_sff_section`).
+- **Effort:** Low · **Impact:** Low–Medium · **Criticality:** Low–Medium · *verified*.
+
+#### S16. UDB `kmerindexsize` summed from unchecked file counts with no consistency check (Low–Medium)
+
+`udb_read` reads `kmercount[]` verbatim (`udb.cc:362`) and accumulates
+`kmerindexsize += kmercount[i]` over `kmerhashsize` entries (`udb.cc:365–369`)
+with no bound on the individual counts or the running sum; the total then sizes
+`kmerindex = xmalloc(kmerindexsize * 4)` and the read of it (`udb.cc:382–384`),
+and each `kmercount[i]` is later used as a loop bound in bitmap construction
+(`udb.cc:517`). `largeread` fatals if the file is too short for `4*kmerindexsize`
+(gating the over-read), but an attacker can pad the file, and nothing checks the
+counts against the actual on-disk word-list section. Complements S1 (entries
+unchecked `< seqcount`) and S6 (the additive `datap` allocation).
+
+- **Reachability:** crafted `.udb` whose `kmercount[]` sum mismatches the word list.
+- **Fix:** validate `kmerindexsize` against the remaining file size; bound the
+  running sum; pairs with the S1 per-entry check.
+- **Effort:** Low · **Impact:** Medium · **Criticality:** Low–Medium ·
+  *needs-confirmation* · related S1, S6, S7.
+
+#### S17. `opt_chimeras_parents_max` validated only on the CLI; library path → OOB writes in `find_best_parents_long` (High)
+
+`find_best_parents_long` (`chimera.cc:445`) loops `for (int f = 0; f <
+opt_chimeras_parents_max; ++f)` and writes `best_parents[f]` into a local
+`std::vector<parents_info_s> best_parents(maxparents)` (size `maxparents` = 20,
+`chimera.cc:454`), then copies into the per-query `std::array<int, maxparents>
+best_parents/best_start/best_len` (`chimera.cc:176–178`). `opt_chimeras_parents_max`
+is range-checked `[2, maxparents]` **only in `args_init`** (`vsearch.cc:5067`);
+`vsearch_init_defaults` sets it to 3 and `vsearch_apply_defaults_fixups` does not
+re-validate. A library caller that overrides `opt_chimeras_parents_max > 20`
+therefore drives `f` past the 20-element containers — an out-of-bounds **write**.
+This is the chimera sibling of **S13** (`opt_wordlength`): the same "CLI-only
+bound, library path unguarded" root cause, but here it is a write, not just a
+shift.
+
+- **Reachability:** library API (`chimeras_denovo` path) with
+  `opt_chimeras_parents_max` set above `maxparents`; not CLI.
+- **Fix:** enforce `[2, maxparents]` in `vsearch_apply_defaults_fixups()` (the
+  S13 fix generalizes to all such knobs); convert the `assert(parents_found <=
+  20)` at `chimera.cc:1028` to a hard clamp/`fatal()`.
+- **Effort:** Low · **Impact:** High · **Criticality:** Medium · *verified
+  (loop bound, array sizes, CLI-only validation)* · sibling of S13.
+
+#### S18. `chimera_detect_single` trusts the caller's `query_len` → heap overflow via `strcpy` (High)
+
+The library entry `chimera_detect_single` (`chimera.cc:2801`) does
+`ci->query_len = query_len;` straight from the caller, sizes all per-query
+buffers from it via `realloc_arrays(ci)`, then `std::strcpy(ci->query_seq.data(),
+query_seq)` copies the **actual** C-string (`chimera.cc:2818`). If the caller
+passes `query_len < strlen(query_seq)`, `query_seq` (sized `query_len+1`)
+overflows on the heap; if `query_len` is larger, downstream loops read past the
+real sequence. The asymmetry is conspicuous: `query_head_len` two lines above is
+correctly derived with `strlen(query_head)`. There is no `query_len ==
+strlen(query_seq)` or `query_len > 0` check. (The function also always `return
+0` — see the L1(a) note — so a malformed call cannot even be reported back.)
+
+- **Reachability:** library API only; a consumer passing an inconsistent
+  `query_len` (the header documents it only as "length of query sequence").
+- **Fix:** validate `query_len == (int)strlen(query_seq)` and `query_len > 0`
+  (fatal / non-zero return), or measure internally and stop trusting the param.
+- **Effort:** Low · **Impact:** High (heap overflow) · **Criticality:** Medium ·
+  *verified* · same family as S4/S5 (length used without a consistency check), L1(a).
+
+#### S19. Chimera denovo model-string fill can over-increment `nth_parent` past `parents_found` (Medium, needs-confirmation)
+
+`fill_in_model_string_for_query` (`chimera.cc:837`, `eval_parents_long` /
+`chimeras_denovo`) advances `nth_parent` whenever `qpos >= best_start[nth_parent]
++ best_len[nth_parent]`, trusting the parent segments to tile the query exactly.
+The default-initialized tail slots have `best_start = best_len = 0`, so once
+`nth_parent` reaches `parents_found` the guard `qpos >= 0` fires on every
+remaining position and keeps incrementing — reading `best_start[]/best_len[]`
+past `parents_found` and, for a query tail longer than the array, past the
+20-element `std::array` itself (OOB read), while writing `'A' + nth_parent` model
+bytes beyond 'U'.
+
+- **Reachability:** `chimeras_denovo` query whose best-parent tiling leaves a
+  tail after the last segment; `pos_remaining == 0` (full coverage) makes a pure
+  tail unlikely but overlapping segments can still leave a gap. Needs a crafted
+  repro to confirm the tail is reachable.
+- **Fix:** clamp `nth_parent` to `parents_found - 1` before indexing/incrementing.
+- **Effort:** Low · **Impact:** Medium–High · **Criticality:** Medium ·
+  *needs-confirmation (reachability); logic verified* · related S17.
 
 ### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
 
@@ -384,6 +593,14 @@ produced S5 and S12, and there is no width-narrowing guard in the build.
   time (not currently enabled — the build uses `-Wall -Wextra -Wpedantic`,
   `src/Makefile.am:3`); UBSan catches the signed-overflow subset at runtime
   (already wired up, and it found S12).
+- **`"%ldI"` with an `int64_t` argument is non-portable on LLP64 (Tier-2).**
+  `align_simd.cc:1324` (`search16`, the `qlen == 0` path) does
+  `xsprintf(&cigar, "%ldI", length)` with `int64_t length`. `%ld` consumes a
+  `long`; on LP64 (Linux/macOS) `long == int64_t` and it is fine, but on LLP64
+  (64-bit Windows / MinGW) `long` is 32-bit → format/argument width mismatch
+  (UB). The sibling `linmemalign.cc:228,230` already does it correctly with
+  `PRId64`. The `build-all` matrix makes this a reachable target. Fix: `"%"
+  PRId64 "I"`.
 - **Effort:** Medium–High (wholesale) · **Impact:** Medium · **Criticality:** Low–Medium
 
 **(b) Endianness assumptions — the code is little-endian-only in two places.**
@@ -399,6 +616,13 @@ produced S5 and S12, and there is no width-narrowing guard in the build.
   (see S9), not portable across int width either.
 - `sha1.c:105` carries a self-flagged `FIXME` about doing the transform in an
   endian-proof way.
+- **k-mer hashing reads raw int bytes (Tier-2).** `unique.cc:328, 396` and
+  `kmerhash.cc:91, 183, 259` hash a prefix of the in-memory bytes of an
+  `unsigned int kmer` via `CityHash64((char*)&kmer, (wordlength+3)/4)`. Reading
+  only the low `n < 4` bytes is little-endian-dependent: on a big-endian host the
+  hashed bytes are the high-order (often zero) bytes, collapsing the hash
+  distribution to near-linear probing. Correctness is preserved (same value
+  hashes consistently within a run); only performance degrades, and only on BE.
 - **Not exercised in CI:** the `build-all.yml` target matrix (x86-64, aarch64,
   ppc64le, mips64el, riscv64) is **entirely little-endian**, so the big-endian
   paths above are never built or run.
@@ -426,6 +650,19 @@ section that follows, but is not confirmed as a bug here.)
   through `to_uchar()` accessors. A sweep found no site indexing a `chrmap_*`
   table with a possibly-signed `char`; the original concern (signed `char`
   sequence byte used as a negative index) does not appear in the current tree.
+  **However**, the Tier-1 audit found two char-signedness sites the `chrmap_*`
+  sweep did not cover, both in the SFF path (active, low criticality): (i)
+  `std::tolower`/`std::toupper` are called on a plain `std::vector<char>` element
+  (`sff_convert.cc:550, 554`) — passing a negative value (a base byte ≥ 0x80,
+  which is not alphabet-validated) to these functions is UB; cast to `unsigned
+  char` first. (ii) `convert_quality_scores` (`sff_convert.cc:334–350`) clamps
+  and offsets quality in **signed** `char`, so an SFF quality byte ≥ 128 is
+  negative and the `std::max(.., qmin)` clamp corrupts it (wrong output), plus a
+  latent signed-`char` add overflow; do the clamp/offset in `unsigned char`/`int`.
+  The **Tier-2 audit found two more** of the same `<cctype>`-on-`char` sites in
+  the masker: `toupper(seq[i])` (`mask.cc:157`, `dust_core`) and `isupper(seq[j])`
+  (`mask.cc:402`, `fastx_mask`). Same fix (cast to `unsigned char`); gated by
+  upstream alphabet validation, so latent.
 - **Strict aliasing in the SIMD code.** Even with strict aliasing on (the build
   has no `-fno-strict-aliasing`), `align_simd.cc` does not type-pun: the
   `(VECTOR_SHORT *)` casts are either on fresh `xmalloc` memory (legal — the
@@ -469,6 +706,16 @@ state) but is a distinct, higher-severity concern for library consumers.
 
 - **Effort:** High (thread a recoverable error channel through the core) ·
   **Impact:** High · **Criticality:** Medium (library API) · *verified*
+- **Concrete instance (Tier-2):** `chimera_detect_single` returns `int` and its
+  header says "Returns 0 on success" — but it **always** returns 0
+  (`chimera.cc:2848`); every internal error is `fatal()`. The documented error
+  channel is dead, so a malformed call (see S18) can neither be reported nor
+  recovered. Also a `-fno-exceptions` hazard nearby: `cluster.cc:1901, 2072` use
+  `std::map::at()`, which *throws* `std::out_of_range`; under the project's
+  `-fno-exceptions` build a missing key becomes `terminate()`/abort rather than a
+  graceful `fatal()`. By construction only centroids are looked up so it should
+  not fire today, but it is an unchecked invariant enforced by a throwing call in
+  a no-exceptions build — replace with `find()` + `fatal()`.
 
 #### (b) Session-mutex deadlock when the lifecycle is not completed
 
@@ -526,7 +773,57 @@ is the natural vehicle for (ii).
 - **Status:** *verified (fatal()=exit, session-lock/leak code paths, happy-path
   cleanliness); library mis-use leaks are by construction, not reproduced*
 
----
+### L2. Index-side subsystems lack the free-then-null re-init discipline that `db.cc` has
+
+`db.cc` is the model: `db_init()` self-frees and `db_free()` nulls. Three other
+subsystems on the library-reachable path do not follow it, so a second session
+(or a teardown-ordering slip) double-frees, dereferences stale state, or leaks.
+This is the concrete, verified content behind the L1(d) "manual teardown" theme
+and the correction to C1(c).
+
+- **(a) `dbindex_free()` / `dbindex_prepare()`** (`dbindex.cc:267–283`,
+  `:177+`). `dbindex_free()` frees `kmerhash`/`kmerindex`/`kmercount`/
+  `dbindex_map`/`kmerbitmap` but **nulls none of them**, and the cleanup loop
+  unconditionally dereferences `kmerbitmap[kmer]`. `dbindex_prepare()` does **not**
+  call `dbindex_free()` first (unlike `db_init`→`db_free`). So: calling
+  `dbindex_free()` twice double-frees; calling it without a prior successful
+  prepare derefs a stale `kmerbitmap` using a stale `kmerhashsize`; and a second
+  `dbindex_prepare()` without an intervening free leaks all five buffers.
+  *verified · Impact Medium · Criticality Low–Medium.*
+- **(b) `dbhash_close()`** (`dbhash.cc:97–101`) frees/nulls only `dbhash_bitmap`;
+  it never clears the file-static `dbhash_table` vector or resets
+  `dbhash_size`/`dbhash_shift`/`dbhash_mask`, so contents and size globals
+  persist between sessions (stale state, not a malloc leak — the vector reclaims
+  at exit). *verified · Low.*
+- **(c) `parse_userfields_arg()`** (`userfields.cc:130`) `xmalloc`s
+  `userfields_requested` with no `xfree` of a prior allocation, so a duplicate
+  `--userfields` or a second library session leaks the previous array
+  (the global is never reset by `vsearch_init_defaults`). It also rejects empty
+  tokens only incidentally (the zero-length `strncmp` falls through to the
+  end-of-table return) rather than with an explicit check — worth making
+  explicit. *verified · Low.* (Refines the "userfields rejects empty tokens"
+  entry in the checked-safe list.)
+
+- **Fix:** null the globals after `xfree` (and guard the `kmerbitmap` loop) in
+  `dbindex_free`; have `dbindex_prepare` self-free first; clear the `dbhash`
+  table/size globals in `dbhash_close`; free-before-realloc and reset in
+  `parse_userfields_arg`. All small and local.
+- **Effort:** Low · **Impact:** Medium (library multi-session) · **Criticality:**
+  Low–Medium (CLI frees once before exit, so benign there) · *verified* ·
+  cross-ref C1(c), L1(d).
+- **(d) Shared file-static `tophits`/`seqcount` not re-derived or restored
+  (Tier-2).** Two more sites of the same class: (i) `cluster_assign_batch`
+  (`cluster.cc:1939`) sizes its per-query buffers from the file-static
+  `seqcount`/`tophits` that only `cluster_session_init` sets — a second session
+  with a larger DB, or interleaving with the CLI `cluster()` path that shares
+  those statics, leaves the buffers undersized while indexing proceeds. (ii)
+  `chimera_detect_batch` saves/restores seven globals around a session but
+  **omits `tophits`** (`chimera.cc:2954–2960, 3022–3028`), so after a chimera
+  batch the shared `tophits` is left at the chimera value and silently corrupts
+  a subsequent unrelated search/cluster session that reads the same global.
+  Fix: re-derive (or store-and-assert) `seqcount`/`tophits` per session; add
+  `tophits` to the chimera save/restore set. *verified; latent on the
+  single-session CLI.*
 
 ## Numerical correctness
 
@@ -573,6 +870,13 @@ fills. Result: a true best hit is silently missed or mis-ranked.
 - Cross-ref: previously noted as a parenthetical under "Checked and found safe"
   (memory-safety context, where it is correctly *not* a safety bug); this is its
   correctness writeup.
+- **Scope (Tier-2 audit):** the consequence lands concretely at the *read* site
+  `searchcore.cc:318` (`count >= minmatches` and the copy into `novel.count`
+  the minheap ranks on), so the wrap can drop a true hit below `minmatches`, not
+  just mis-rank it. **sintax is immune**: each bootstrap subsamples exactly 32
+  k-mers (`sintax.cc:410`), so a target's counter is incremented ≤ 32 times per
+  call — nowhere near 65 535. So N1(a) is specific to the `searchcore` engine
+  (search/cluster/chimera), not the sintax path.
 
 #### (b) Inconsistent division-by-zero guarding in output fields → `inf`/`nan` emitted silently
 
@@ -590,22 +894,68 @@ against zero:
 | `eestats.cc:244` | `100.0 * reads / seq_count` | empty input (`seq_count == 0`) |
 | `eestats.cc:384` | `sum_ee_length_table[i] / reads` | a length bucket with no reads |
 | `mask.cc:408` | `100.0 * unmasked / len` | zero-length sequence |
+| `fastq_chars.cc:218` | `100.0 / total_chars` frequency factor | `seq_count > 0` but all reads zero-length (`total_chars == 0`) |
+| `searchcore.cc:702` | `100.0 * (nwalignmentlength - nwdiff) / nwalignmentlength` (`nwid`, `align_delayed`) | zero-length alignment (the `id0..id4` fields below it *are* guarded) |
+| `allpairs.cc:479–480`, `cluster.cc:818–820` | `nwid = 100.0 * … / nwalignmentlength` | zero-length alignment (`--minseqlength 0` + empty record) |
+| `chimera.cc:973, 1547` | `divfrac = 100.0 * divdiff / QT` (`QT` = a percent-identity) | query matches neither parent over the alignment (edge) |
+| `chimera.cc:1716, 1718` | `100.0 * best_left_y / sumL`, `… / sumR` (alnout) | guarded only implicitly by the `left_y > left_n` selection invariant — defensive |
 
 These produce `inf`/`nan` (defined behaviour, so no sanitizer signal) that flow
 straight into the output columns. Empty-input / zero-length handling is ad hoc
 (`fastq_stats.cc:142` early-returns on empty qualities, but there is no
-consistent guard), so the reachability of each is edge-case but real.
+consistent guard), so the reachability of each is edge-case but real. (The
+aligner-side `nwid`/`divfrac` rows were added by the Tier-2 audit; they are the
+same pattern at algorithm sites the original list didn't enumerate.)
 
 - **Fix:** a single guarded-divide helper (`den > 0 ? num/den : 0.0`) applied to
   the secondary fields, matching the pattern the %id fields already use.
 - **Effort:** Low · **Impact:** Medium · **Criticality:** Low–Medium · *verified
   (unguarded sites); per-site reachability needs an empty/degenerate-input run*
 
+#### (b2) Alignment counters are `unsigned short` — wrap on long alignment paths (N2)
+
+Distinct from (a)'s `count_t`: the per-alignment counters `aligned`, `matches`,
+`mismatches`, `gaps` in `backtrack16` (`align_simd.cc:995–998`) are
+`unsigned short`, the `search16` output parameters are `unsigned short *`
+(`align_simd.h:95–98`), and the delayed-result lists in `searchcore.cc:601–604`
+are `std::array<unsigned short, MAXDELAYED>`. The alignment **path length** can
+reach `qlen + dlen`, which the `maxseqlenproduct = 25,000,000` cap does **not**
+bound (it bounds the *product*): e.g. `qlen = 1`, `dlen = 25,000,000` passes
+`1 * 25e6 ≤ 25e6` and is aligned, then `backtrack16` increments `aligned` ~25e6
+times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates an
+`int64_t` length into the same `unsigned short` explicitly (`align_simd.cc:1303,
+1306`). Result: wrong reported alignment length / match / mismatch / gap counts
+(data-integrity, not memory-unsafety).
+
+- **Reachability:** a very short query (1–few nt) vs a long target (path length
+  > 65 535) under the product cap — `usearch_global`/`allpairs_global` with a
+  1-mer query, or a pathological cluster input. Latent (degenerate lengths).
+- **Fix:** widen the counters, the `search16` `p*` output params, and the
+  `searchcore` lists to `uint32_t`/`int64_t` (an API-surface change, ~5 sites),
+  or saturate at 65535 with downstream awareness.
+- **Effort:** Medium · **Impact:** Medium (wrong stats, no crash) · **Criticality:**
+  Low–Medium · *verified (16-bit end-to-end); trigger latent* · distinct from N1(a).
+
 #### (c) Accumulator widths — mostly safe, recorded for completeness
 
-- **Abundance** is carried and summed as 64-bit (`db_getabundance` →
-  `uint64_t`, stored `int64_t size`, `db.cc:148, 212`), so abundance totals do
-  not overflow in practice.
+- **Abundance — correction.** An earlier draft of this note said abundance is
+  "stored `int64_t size`." That is wrong: the per-sequence field is
+  `unsigned int size` in `seqinfo_s` (`db.h:74`). `db_add` assigns an `int64_t
+  abundance` into it (`db.cc:212`) and `db_getabundance` widens the already-
+  truncated 32-bit value back to `uint64_t` (`db.h:92`). So a **per-sequence**
+  abundance above `UINT_MAX` (~4.29e9) silently wraps, and a negative value
+  becomes large-positive; the sort comparators compare the 32-bit field.
+  Reachable only with a `;size=` (or summed) abundance above ~4.29 billion on a
+  single sequence — realistic only on very large pooled datasets. Fix: widen
+  `seqinfo_s.size` to `uint64_t` (matches the return type and the `int64_t`
+  source). *verified.*
+- **Per-record lengths** `seqinfo_s.seqlen` / `headerlen` are likewise
+  `unsigned int` (`db.h:72–73`); `db_add` stores `size_t` lengths into them, and
+  `opt_maxseqlength` has **no upper bound** (only `< 1` is rejected,
+  `vsearch.cc:5092`). A single record > `UINT_MAX` (~4 GB) with `--maxseqlength`
+  raised above it truncates `seqlen`, which then feeds k-mer indexing,
+  alignment, and `%.*s` output — same class as **S5**, distinct site (the DB
+  index struct + the unbounded option). Gated on >4 GB input. *verified.*
 - **Statistics sums** (`sum_error_probabilities`, `sumee_length_table`,
   `qsum`) are `double` (`fastq_stats.cc:302–304`): no integer overflow, but
   floating-point summation drifts on very large inputs (a precision, not
@@ -739,15 +1089,18 @@ rather than leave the split half-applied.
   rising as the migration advances · *verified (compute reads globals;
   init_defaults does not touch Parameters)*
 
-#### (c) Database / k-mer-index re-init is safe — *no action*
+#### (c) Database re-init is safe, but the k-mer **index** re-init is **not** — *correction; see L2*
 
-The "double-init / use-after-free across the session lifecycle" worry from the
-class note does **not** hold for the database: `db_init()` calls `db_free()`
-first (`db.cc:97`), and `db_free()` frees and then **nulls** `datap` / `seqindex`
-(`db.cc:428–436`), so repeated sessions neither double-free nor read freed
-memory, and re-init does not leak the previous buffers. `dbindex_free()` exists
-for the k-mer index. The real lifecycle defects are the lock/leak items in L1,
-not the db/index objects.
+The `db.cc` objects are safe across sessions: `db_init()` calls `db_free()` first
+(`db.cc:97`), and `db_free()` frees and then **nulls** `datap` / `seqindex`
+(`db.cc:428–436`), so repeated sessions neither double-free nor read freed memory
+and do not leak the previous buffers. **However**, the Tier-1 file audit showed
+the *index* half does **not** share this safety: `dbindex_free()` frees its five
+globals but never nulls them and unconditionally dereferences `kmerbitmap`, and
+`dbindex_prepare()` does not call `dbindex_free()` first — so a double free, a
+free-before-prepare deref, or a re-prepare-without-free five-buffer leak are all
+reachable. That is finding **L2** below; the earlier blanket "db/k-mer-index
+re-init is safe" claim is corrected to apply to `db.cc` only.
 
 - **Overall — Effort:** Low (for the live (a) part) · **Impact:** Medium–High ·
   **Criticality:** Medium
@@ -879,6 +1232,12 @@ integer matrix). This is the main source of the file's bulk.
 - **Effort:** High · **Impact:** High · **Criticality:** Medium
 - **Direction:** single declarative option table (name, arg type, target field,
   owning commands, help string) consumed by parser, validator, and help printer.
+- **Related (Tier-1):** `userfields.cc` has the same parallel-table hazard at
+  smaller scale — `userfields_names[]` is indexed by *positional* integers
+  (`nth_valid_userfield = valid_userfield - userfields_names`, ~:164) that
+  consumers in `results.cc` hard-code; reordering/inserting a name silently
+  renumbers every downstream field. Back it with a named enum or `{name,id}`
+  table shared with the consumer.
 
 ### E3. `vsearch.cc` monolith dominated by one ~4,000-line function
 
@@ -951,8 +1310,13 @@ decomposed:
 | `src/search.cc` | `search_output_results` | ~121–322 | ~202 (10+ format dispatch) |
 | `src/fastq_mergepairs.cc` | `print_stats` | ~1429–1532 | ~199 (15+ repeated if-blocks) |
 | `src/fastq_mergepairs.cc` | `optimize` | ~159 | ~159 |
+| `src/sintax.cc` | `sintax_analyse` | ~121–269 | ~148 (5-deep nesting; duplicated per-level output block) |
 
 - **Effort:** Medium–High (per function) · **Impact:** Medium · **Criticality:** Low
+- **Note (Tier-2):** `sintax_analyse` also hardwires magic constants — the
+  `(bootstrap_count+1)/2` "at least half" threshold, the 32-k-mer subsample, and
+  the 100 bootstraps are compile-time constants with no option, fixing SINTAX
+  confidence granularity at 1%.
 
 ### E7. Near-identical code paths that should be merged
 
@@ -965,6 +1329,10 @@ decomposed:
 - **`fastq_mergepairs.cc`** — forward/reverse read handling is copy-pasted in
   `process` (truncation + N-counting, ~946–1026) and `discard` (output blocks,
   ~578–634).
+- **`db.cc`** — the three `qsort` comparators `compare_bylength`,
+  `compare_bylength_shortest_first`, `compare_byabundance` (~451–568) share the
+  same abundance/header/pointer tiebreak tail verbatim; only the primary key and
+  direction differ. Factor the shared tiebreak; parameterize the key.
 
 - **Effort:** Medium · **Impact:** Medium · **Criticality:** Low
 
@@ -988,6 +1356,25 @@ and prevent recurrence.
 - `src/cluster.cc` — always-true `#if 1` blocks (~961, ~1114), leftover debug toggles.
 - Assorted refactoring-breadcrumb comments in `chimera.cc` / `cluster.cc`
   (e.g. "refactoring: …", "this is a test").
+- `src/fastq.cc` — `fastq_fatal` (~196–216) does `fatal(string); xfree(string);`;
+  `fatal()` is `noreturn`, so the `xfree` is unreachable dead code (and a benign
+  CLI / library-only leak — part of L1(a)).
+- **Defensive (not dead, but fragile):** `fasta.cc:139–161`
+  (`report_illegal_symbol_and_exit` / `report_unprintable_symbol_and_exit`) pass
+  an assembled message as `fatal()`'s **format** string (`fatal(msg.data())`).
+  Not injectable today (the only `%`-source byte maps to a stripped action before
+  these fire), but the safe form is `fatal("%s", msg.data())`.
+- `src/kmerhash.cc` — `kh_find_best_diagonal` (~156–227, declared `kmerhash.h:68`)
+  is defined but never called anywhere in the tree; delete it and its declaration
+  (Tier-2).
+- `src/unique.cc` — `unique_compare` (~152–166) is both **dead** (no source
+  caller) and **wrong**: it casts to `unsigned int *` and then compares the
+  *pointers* (`lhs < rhs`), not the values (`*lhs`/`*rhs`), so as a `qsort`
+  comparator it would sort by address. Delete it, or fix to dereference if a
+  sorted order is ever needed (Tier-2).
+- `src/cluster.cc` — `allpairs.cc:708` carries a `// refactoring: issue with
+  parenthesis?` breadcrumb; the expression is actually correct (the `/2` applies
+  to the `std::max(0, n*(n-1))` result) — remove the breadcrumb.
 
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low
 
@@ -1016,13 +1403,22 @@ and low risk; listed for completeness only.
 | S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low |
 | S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low |
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low |
+| S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium |
+| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium |
+| S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med |
+| S16 | UDB `kmerindexsize` summed from unchecked file counts, no consistency check | Security | Low | Medium | Low–Med |
+| S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium |
+| S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium |
+| S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (2/3 fixed upstream; `fastq_mergepairs.cc` open) | Bug | Low | Low–Med | Medium |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
+| L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med |
 | N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium |
+| N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths | Numerical | Medium | Medium | Low–Med |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium |
 | C1 | `init_defaults` misses 52 globals → stale config across library sessions | Library lifecycle | Low | Med–High | Medium |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
