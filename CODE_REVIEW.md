@@ -41,10 +41,12 @@ tier (one PR per tier). Status legend: **audited** = read in full against the
 
 ### B1. `--log` quality-error messages written to `stderr` instead of the log file
 
-**Status: partially fixed upstream (2 of 3 sites).** The `eestats.cc` and
-`filter.cc` sites were corrected in `trognes/master` (commit `310e7de`,
-"fix: write to logfile instead of stderr"). The `fastq_mergepairs.cc` site
-remains.
+**Status: FIXED (all 3 sites).** The `eestats.cc` and `filter.cc` sites were
+corrected in commit `310e7de`; the remaining `fastq_mergepairs.cc` `get_qual()`
+site was fixed in commit `6dbba98` ("Write to logfile instead of stderr in
+fastq_mergepairs.cc"). All three qmin branches now write to `fp_log`. Retained
+here for the record and the E8 dedup note; **no open work** (but see the
+`rereplicate.cc:133` sibling slip below, still open).
 
 The "FASTQ quality value below qmin" fatal-error branch re-emits to `stderr`
 from inside an `if (fp_log != nullptr)` guard, instead of writing to `fp_log`.
@@ -55,12 +57,11 @@ copy-paste slip. An exhaustive sweep originally found three occurrences:
 
 | File | Line | Function / context | State |
 |------|------|--------------------|-------|
-| `src/fastq_mergepairs.cc` | ~278 | `get_qual()`, qmin branch | **open** |
+| `src/fastq_mergepairs.cc` | ~278 | `get_qual()`, qmin branch | fixed (`6dbba98`) |
 | `src/eestats.cc` | ~87 | quality check, qmin branch | fixed (`310e7de`) |
 | `src/filter.cc` | ~85 | quality check, qmin branch (note `std::fprintf`) | fixed (`310e7de`) |
 
-- **Type:** Bug (incorrect output destination)
-- **Remaining fix:** one-token change at `fastq_mergepairs.cc:278`, `stderr` → `fp_log`.
+- **Type:** Bug (incorrect output destination) — **resolved**
 - **Effort:** Low · **Impact:** Low–Medium · **Criticality:** Medium
 - **Note:** The three blocks are near-identical and likely share an ancestor;
   a shared quality-check helper (see E8) would collapse this to one point of
@@ -1672,7 +1673,7 @@ and low risk; listed for completeness only.
 | S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
-| B1 | `--log` qmin message → `stderr` not `fp_log` (2/3 fixed upstream; `fastq_mergepairs.cc` open) | Bug | Low | Low–Med | Medium |
+| B1 | `--log` qmin message → `stderr` not `fp_log` (**FIXED** — all 3 sites, `310e7de`+`6dbba98`) | Bug | Low | Low–Med | Medium |
 | B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`) | Bug | Low | Low | Low |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
