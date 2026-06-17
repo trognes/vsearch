@@ -32,8 +32,10 @@ tier (one PR per tier). Status legend: **audited** = read in full against the
 | **2 — core compute engines** | `searchcore`, `search`, `search_exact`, `align_simd`, `linmemalign`, `cluster`, `chimera`, `allpairs`, `sintax`, `orient`, `mask`, `kmerhash`, `unique` | **audited** (this pass → S17–S19, N2; S10 reachability confirmed; S13 generalized; folded sites in S5/S7/N1/P1/L1/L2/E6/E9) |
 | **3 — dereplication & seq ops** | `derep`, `derep_prefix`, `derep_smallmem`, `rereplicate`, `shuffle`, `subsample`, `sortbylength`, `sortbysize`, `cut`, `getseq` | **audited** (this pass → S20–S22; folded sites in S4/S5/B1/N1/L2/E7/E9) |
 | **4 — output, formatting & stats** | `results`, `otutable`, `msa`, `showalign`, `fastq_stats`, `eestats`, `fastqops`, `fastq_join`, `filter`, `tax` | **audited** (this pass → S23–S25, B2; folded sites in S5/I1/N1/E2/E9) |
-| 5 — CLI/dispatch & infra | `vsearch.cc`, `util`, `arch`, `cpu`, `attributes`, `dynlibs`, `bitmap`, `minheap`, `city`, `md5`, `sha1` | *pending* |
-| 6 — headers & `utils/` | all `*.h`, `src/utils/*.hpp` | *pending* |
+| **5 — CLI/dispatch & infra** | `vsearch.cc`, `util`, `arch`, `cpu`, `attributes`, `dynlibs`, `bitmap`, `minheap`, `city`, `md5`, `sha1` | **audited** (this pass → S26, N3, C1(d)/(e); folded into S7/S8/A1/I1/P1/E1/E2/E9; F-C1 ruled safe) |
+| **6 — headers & `utils/`** | all `*.h`, `src/utils/*.hpp` | **audited** (this pass → corrected A1's round_up cite; U5→I1, U4/U7→P1, cigar/span asserts→A1, H1→E1; output structs verified bounded) |
+
+**The file-by-file sweep is complete — all six tiers audited.**
 
 ---
 
@@ -287,12 +289,21 @@ no safety net.
   caller-supplied, so a pathological value makes the multiply wrap and the
   following per-thread init loop write out of bounds. Bound `opt_threads` /
   use the overflow-checked helper.
+- **Additional caller (Tier-5):** `minheap_init` (`minheap.cc:149–153`) takes a
+  signed `int size` (from `tophits = opt_maxrejects + opt_maxaccepts + MAXDELAYED`,
+  built from the 64-bit `--maxaccepts/--maxrejects`); a value overflowing `int` to
+  negative makes `size * sizeof(elem_t)` (size_t, sign-extended) an enormous
+  allocation. Take `size` as `size_t`, range-check, reject non-positive.
 
 #### S8. `md5.c` `body()` unsigned-underflow loop if called with `size == 0` (Low)
 
 `body()` ends with `} while (size -= 64);` (`md5.c:200`); a `size` of 0 would
 underflow to ~`ULONG_MAX` and read far out of bounds. All current callers pass
 a non-zero multiple of 64, so it is **not currently reachable** — latent only.
+The same loop also under-runs on **any** non-multiple-of-64 `size` (Tier-5): it
+decrements by 64 and tests the result, so a caller passing e.g. 100 wraps `size`.
+`MD5_Update` always feeds multiples of 64, so latent — but the routine has no
+internal guard on its contract.
 
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low · *latent, not reachable*
 
@@ -612,6 +623,31 @@ corrupted (e.g. a stale `nwalignment`, or mismatched lengths from a crafted DB).
 - **Effort:** Medium · **Impact:** Medium · **Criticality:** Medium ·
   *latent; verified (no bound)* · same family as S4/S5 (length used without a check).
 
+#### S26. SHA-1/MD5 transform: write-through-`const` and unaligned type-punning (UB)
+
+`SHA1_Transform` (`sha1.c:137`) is compiled with `SHA1HANDSOFF` **undefined**
+(it is commented out, `sha1.c:87`), so the `#else` path runs `block =
+(CHAR64LONG16 *) buffer;` (`sha1.c:155`) — casting the `const uint8_t buffer[64]`
+parameter to a non-`const` struct and, on little-endian, `blk0` **writes**
+byte-swapped words back into it. `SHA1_Update` calls
+`SHA1_Transform(context->state, data + i)` (`sha1.c:232`) where `data` is a
+`const uint8_t *` parameter — so this writes through a pointer derived from a
+`const` argument (UB) and mutates the **caller's input buffer**; today's callers
+discard the buffer afterward, so no corruption is observed, but it is live UB on
+every SHA-1 hash. The cast is also over an unaligned `uint8_t *` reinterpreted as
+`uint32_t[16]` (misaligned access / strict-aliasing UB). `md5.c:78–79` has the
+analogous misaligned `*(MD5_u32plus *)&ptr[n*4]` fast path on x86. `city.cc` is
+clean by contrast — it uses `memcpy` (`Fetch32`/`Fetch64`).
+
+- **Reachability:** every SHA-1 hash (`--derep_id`/hashing); observable
+  corruption would need a caller that reuses its input buffer (none today). UBSan
+  (`alignment`) would flag the misaligned loads.
+- **Fix:** define `SHA1HANDSOFF` (copy into an aligned local workspace) for SHA-1;
+  use `memcpy` into a `uint32_t`/`MD5_u32plus` (the city.cc pattern) for MD5.
+- **Effort:** Low · **Impact:** Medium · **Criticality:** Medium · *verified
+  (SHA1HANDSOFF off; const-cast write-through; unaligned cast)* · related P1 (the
+  endianness FIXME on the same line is a different aspect).
+
 ### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
 
 The `Sanitizers (ASan/UBSan)` CI workflow builds vsearch with
@@ -726,6 +762,13 @@ compile-time warning.
   `fastqops.cc` — all unchecked. The `fastq_eestats`/`fastq_eestats2` commands
   additionally do no domain validation of their `opt_fastq_*` parameters (unlike
   `filter.cc`, which routes through `check_parameters`).
+- **The named helper (Tier-6) — this is where the fix should land.** The
+  `CloseFileHandle` `unique_ptr` deleter (`utils/open_file.hpp:76–80`) does
+  `static_cast<void>(std::fclose(file_handle))` — discarding the `fclose` return
+  for **every** `FileHandle`-managed output stream. Since `fclose` flushes stdio,
+  a deferred write error first surfaces here. Adding `fflush`+`ferror`+checked
+  `fclose`→`fatal()` to this one deleter covers all RAII-owned output at a single
+  point (the I1 remedy, concretely sited).
 
 ---
 
@@ -810,6 +853,24 @@ fixed header into the struct padding — is worth verifying against the SFF flow
 section that follows, but is not confirmed as a bug here.)
 
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low · *latent ABI assumption*
+
+**(d) More portability gaps (Tier-5/6).**
+- **`open_output_file` opens `"w"`, not `"wb"`** (`utils/open_file.cpp:144`),
+  while input uses `"rb"` (the comment even questions it). On Windows/MinGW text
+  mode does LF→CRLF translation, corrupting FASTA/FASTQ/tabular byte streams.
+  No-op on POSIX, so CI never sees it. Fix: `"wb"`.
+- **`os_byteswap` has no portable fallback** (`utils/os_byteswap.{hpp,cpp}`): the
+  final `#else` `#include <byteswap.h>` and an empty `.cpp` else — a non-BSD/Apple/
+  Windows host lacking glibc's `<byteswap.h>` (musl/uClibc/exotic) fails to build.
+- **`xrealloc` doesn't preserve `xmalloc`'s 16-byte alignment** on POSIX
+  (`arch.cc:241–255` calls plain `realloc`; `_WIN32` uses `_aligned_realloc`). If
+  any SIMD buffer (`counters`/alignment arrays) is ever `xrealloc`'d, an aligned
+  load/store (`align_simd.cc`, `cpu.cc`'s `__m128i` store) could fault on a
+  platform whose `realloc` returns 8-byte alignment. Couples with the `cpu.cc`
+  `(__m128i*)counters` aligned-store assumption. *needs audit of whether SIMD
+  buffers pass through `xrealloc`.*
+- **Effort:** Low–Medium · **Impact:** Low–Medium · **Criticality:** Low · *latent
+  (no Windows / non-glibc / mis-aligned-realloc target in CI)*
 
 #### Checked and found already handled (no action)
 
@@ -1166,6 +1227,38 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
   consequences are by construction and want a reference-output regression to pin
   down exact thresholds*
 
+### N3. RNG quality, reproducibility, and reentrancy (Tier-5)
+
+The shared random-number path has several correctness/quality issues, none a
+memory bug:
+- **(a) `random_ulong` builds 64 bits from four overlapping 31-bit draws.**
+  `(arch_random()<<48) ^ (arch_random()<<32) ^ (arch_random()<<16) ^
+  arch_random()` (`util.cc:268–288`): `arch_random()`/`random()` yields ≤31 bits,
+  so the shifted terms **overlap** and are XORed — the result is not a uniform
+  64-bit value, weakening any consumer needing uniform 64-bit randomness (large
+  shuffles). Fix: take non-overlapping low-16-bit slices, or use a real 64-bit PRNG.
+- **(b) `--randseed` is truncated to 32 bits on the shared path.** Stored
+  `int64_t` (`vsearch.cc:1976`, no range check) but narrowed to `unsigned int` in
+  `arch_srandom` (`arch.cc:177`), so `--randseed 4294967297` ≡ `--randseed 1` —
+  two documented seeds silently collide. (Extends the E9 `shuffle.cc`-RNG note to
+  the main `arch_srandom` path; `shuffle` additionally uses a *separate*
+  `mt19937_64` engine, so the two RNG paths aren't comparable.)
+- **(c) `random_int` re-derives the generator range from `RAND_MAX`** in `util.cc`
+  while `arch_random` independently wraps `random()`/`rand()` — they agree only by
+  coincidence of the platform `RAND_MAX`, a portability/coupling hazard.
+- **(d) Global RNG state is not reentrant/thread-safe.** `srandom`/`random`
+  operate on one process-global state; threaded use (search/cluster) gives
+  non-deterministic results and breaks `--randseed` reproducibility under threads.
+- **(e) `arch_srandom` accepts a short read of `/dev/urandom`** — only checks
+  `read(...) < 0`, so a partial read leaves the seed partly at its `0` init.
+- **(f) `random_int`/`random_ulong` guard `upper_limit != 0` only with an
+  NDEBUG-stripped `assert`** (`util.cc:256, 274`) → `% 0` if a zero ever reaches
+  them; current callers pass non-zero, so latent (A1 class).
+
+- **Effort:** Low–Medium · **Impact:** Low–Medium (statistical quality /
+  reproducibility) · **Criticality:** Low · *verified (logic); (d)/(b) reachable,
+  others latent*
+
 ---
 
 ## Assertions / NDEBUG
@@ -1196,11 +1289,36 @@ unchecked into the overflow the assert was meant to prevent:
 
 | Site | Asserted bound | Value source |
 |------|----------------|--------------|
-| `utils/round_up.hpp:117` | `input <= UINT16_MAX - stub` | the generic `round_up_to_8` overflow guard (the example the class note named) |
-| `sff_convert.cc:136` | `n_bytes <= UINT16_MAX - stub` | SFF flow/key region size |
+| `sff_convert.cc:136` | `n_bytes <= UINT16_MAX - stub` | SFF flow/key region size — the **live** `round_up_to_8(uint16_t)` (see correction below) |
 | `sff_convert.cc:258` | `flows_per_read <= UINT16_MAX - (header + key_length)` | `sff_header.flows_per_read`, read from file |
 | `sff_convert.cc:288` | `name_length <= UINT16_MAX - read_header_size` | `read_header.name_length`, read from file |
 | `sff_convert.cc:323` | `n_bytes_to_read < SIZE_MAX` | input-derived read length |
+
+> **Correction (Tier-6 audit):** an earlier draft cited `utils/round_up.hpp:117`
+> as "the SFF overflow guard." That header is **dead code** — its templated
+> `round_up_to_8<>` is referenced only by its own `static_assert` block, included
+> by no source file. The SFF path uses a **separate, non-template
+> `round_up_to_8(uint16_t)`** at `sff_convert.cc:131` (guard at `:136`). The sum
+> `n_bytes_in_header + flows_per_read + key_length` is computed in `size_t` then
+> **narrowed to the `uint16_t` parameter** (a crafted `flows_per_read` near
+> `0xFFFF` wraps it), with only the NDEBUG-stripped asserts protecting it. Fix in
+> `sff_convert.cc`, and either delete `round_up.hpp` or make the SFF path use it.
+
+**More assert-as-validation sites (Tier-5/6).** Beyond the SFF set above, the
+default-`NDEBUG` build also strips these (all latent today — the inputs are
+internally produced — but they are validation written as `assert`):
+- **`utils/cigar.cpp:92–101`** (`convert_to_operation`): an unrecognized CIGAR op
+  char hits only `assert(op == 'M'|'I'|'D')`, then **falls through to
+  `return Operation::match`** — invalid ops silently become matches. (The
+  *missing*-op case at `:157` correctly `fatal()`s.) Reusable parser; would bite a
+  future SAM-import / external-CIGAR caller. Related to S25.
+- **`utils/cigar.cpp:124–140`** (run-length): `strtoll` parses up to `LLONG_MAX`,
+  guarded only by `assert(<= INT_MAX)`; `print_uncompressed_cigar` then loops that
+  many times → unbounded output (DoS) on a crafted CIGAR.
+- **`utils/span.hpp`** bounds (`operator[]`/`front`/`back`/`subspan`/`first`/`last`)
+  and **`city.cc:140` `Rotate`** (`assert(shift != 64)`) are assert-only; both are
+  safe in practice (callers supply in-range args; all `Rotate` shifts are compile-
+  time constants 18–53), recorded for the NDEBUG caveat.
 
 The tell is that the **same parser already uses `fatal()` for the other
 malformed-input cases** — truncation and open failures (`sff_convert.cc:169,
@@ -1252,6 +1370,15 @@ session's values:
 | `opt_min_unmasked_pct` | `mask.cc` | `dust_all()` (documented step 6) |
 | `opt_clusterout_id` | `cluster.cc` | clustering output |
 | `opt_clusterout_sort` | `cluster.cc` | clustering output |
+| `opt_notmatchedfq` | `search.cc` etc. | unmatched-reads FASTQ output — **never reset (confirmed bug)** |
+
+**Smoking gun (Tier-5 audit):** `vsearch_init_defaults()` writes
+`opt_notmatched = nullptr;` **twice** (`vsearch.cc:957–958`); line 958 was plainly
+meant to be `opt_notmatchedfq = nullptr;`. `opt_notmatchedfq` is declared
+(`vsearch.h:190`) and set by `--notmatchedfq` (`vsearch.cc:2661`) but assigned
+nowhere in `init_defaults` — so a second library session that omits
+`--notmatchedfq` silently inherits the first session's path and writes an
+unmatched-reads FASTQ the caller never requested. One-line fix (change line 958).
 
 Because the documented re-initialization model is "repeat the full sequence for
 each session," a process that runs two sessions with different masking thresholds
@@ -1300,11 +1427,40 @@ free-before-prepare deref, or a re-prepare-without-free five-buffer leak are all
 reachable. That is finding **L2** below; the earlier blanket "db/k-mer-index
 re-init is safe" claim is corrected to apply to `db.cc` only.
 
+#### (d) `vsearch_apply_defaults_fixups()` is not idempotent — double-call corrupts gap penalties (Tier-5)
+
+The fixups function unconditionally does `opt_gap_open_* -= opt_gap_extension_*`
+(`vsearch.cc:1089–1098`), with a comment claiming it is "safe to call repeatedly"
+— but that holds **only if `vsearch_init_defaults()` runs between every pair of
+fixups calls** (it re-reads the resets). The documented "override `opt_*` → call
+fixups" lifecycle invites a caller to set a gap option, call fixups, adjust
+another option, and call fixups **again without re-init** — which double-subtracts
+the extension penalty from every gap-open penalty → silently wrong alignment
+scores. Nothing guards a second invocation (no "already applied" flag), and
+`vsearch_api.h:115` even advertises that fixups "re-applies gap penalty"
+adjustments. Fix: make the adjustment idempotent (guard flag, or compute adjusted
+penalties into separate fields) or document that fixups must follow init.
+*verified; library-reachable; Medium.*
+
+#### (e) The CLI-only validation gap is a class, not two sites (Tier-5; generalizes S13/S17)
+
+A full enumeration of the `args_init` validation block (`vsearch.cc:4833–5095`)
+vs. `vsearch_apply_defaults_fixups` confirms the S13/S17 root cause applies to
+**every** check there — the library path runs none of them. The memory-relevant
+ones to move into the shared fixup: `opt_wordlength` (S13), `opt_chimeras_parents_max`
+(S17), **`opt_threads`** (no upper bound → the `chimera.cc:2975` `nthreads*sizeof`
+multiply, S7), and **`opt_maxaccepts`/`opt_maxrejects`** (non-negative → feed the
+S10 `tophits` sizing). Others are silent-wrong-config only (`opt_iddef [0,4]`
+selects an undefined identity definition; `opt_chimeras_parts`/`chimeras_length_min`
+are re-clamped or used only as thresholds — verified safe). Single fix: validate
+bounds in `vsearch_apply_defaults_fixups()`.
+
 - **Overall — Effort:** Low (for the live (a) part) · **Impact:** Medium–High ·
   **Criticality:** Medium
-- **Status:** *verified (reset gap, config read sites, db re-init safety);
-  multi-session stale-config effect is by construction, wants a two-session
-  regression test (see `api_examples/example_reinit.cc`)*
+- **Status:** *verified (reset gap incl. opt_notmatchedfq, config read sites, db
+  re-init safety, non-idempotent fixups, validation-gap enumeration); multi-session
+  effects are by construction, want a two-session regression test (see
+  `api_examples/example_reinit.cc`)*
 
 ---
 
@@ -1414,6 +1570,16 @@ bug source. Breadcrumbs in the struct confirm the in-progress state
 - **Effort:** High · **Impact:** High · **Criticality:** Medium
 - **Direction:** finish in one direction — everything reads from `Parameters`,
   remove the globals.
+- **Concrete drift hazard (Tier-2/6):** `Parameters::opt_strand` is a **`bool`**
+  (`vsearch.h:561`) while the global `opt_strand` is `int64_t` with **tri-state**
+  semantics (`1`=plus, `2`=both, tested as `opt_strand > 1` in `searchcore.cc`,
+  `search.cc`, `cluster.cc`). The struct mirror cannot represent "both strands".
+  Not live today (the core engines read the `int64_t` global; `args_init` sets
+  both in lockstep; the only struct readers — `derep*` — use it as a boolean), but
+  the moment a strand-sensitive dispatcher is migrated to `parameters.opt_strand`
+  it silently loses minus-strand search with no compile error. Also seen as the
+  allocate-vs-iterate skew in `search_exact.cc` (allocation keyed on the bool,
+  loops on the int). Fix: make the struct field `int64_t`.
 
 ### E2. Parallel option-metadata tables (five places to edit per option)
 
@@ -1441,6 +1607,13 @@ integer matrix). This is the main source of the file's bulk.
   **no `default`**, so the case numbers must stay in lockstep with the order of
   `userfields_names[]`; nothing asserts the coupling, and an out-of-range index
   would silently print nothing. Add `default: fatal(...)` as an interim guard.
+- **Latent OOB from the matrix itself (Tier-5):** the `valid_options[k][]` scan
+  loops (`vsearch.cc:4785–4793, 4817–4821`) do `while (valid_options[k][j] >= 0)
+  ++j;` with **no index ceiling**, trusting each row of the
+  `std::array<std::array<int,100>,50>` to contain a `-1` sentinel before slot 100.
+  A future edit filling a row to exactly 100 valid options (no room for `-1`) reads
+  past the inner array. Not triggered today (longest row is well under 100). Bound
+  the loop with `j < max_number_of_options_per_command`.
 
 ### E3. `vsearch.cc` monolith dominated by one ~4,000-line function
 
@@ -1630,6 +1803,34 @@ and prevent recurrence.
   (Tier-4).
 - `src/fastq_join.cc` — dead `reserve()` blocks (~249–257) before the strings are
   reassigned via `operator+` (Tier-4).
+- `src/utils/round_up.hpp` — **dead code**: the templated `round_up_to_8<>` is
+  referenced only by its own `static_assert` block, included by no source file
+  (the SFF path uses the separate `sff_convert.cc:131` copy). Delete it, or make
+  the SFF path use it (collapsing the two). (Tier-6; see the A1 correction.)
+- `src/dynlibs.{h,cc}` — `gzgetc_p`/`gzrewind_p`/`gzungetc_p`/`gzerror_p` are
+  `extern`-declared (`dynlibs.h:72–75`) but never defined, resolved, or called —
+  dead declarations. Also: `dynlibs_open` is silent when a library is absent
+  (`dlopen`→null skips resolution, returns success; failure surfaces later as a
+  null `*_p` call) and leaks the handle if called twice without `dynlibs_close`
+  (library re-init). (Tier-5, latent.)
+- `src/util.cc` — `xsprintf` has a dead `if (buffer == nullptr)` branch (xmalloc
+  never returns null) and doesn't check the **second** `vsnprintf` return; `len +
+  1` overflows if a formatted string ever reached `INT_MAX` (not realistic).
+  `fatal(format, …)` overloads (`utils/fatal.cpp:81–114`) forward a runtime format
+  string with no `__attribute__((format(printf,…)))`, so `-Wformat` can't police
+  call sites (fragility; no bad caller today). (Tier-5/6.)
+- `src/bitmap.cc` — `bitmap_init(0)` → `xmalloc(0)` then a `bitmap[0]` access is a
+  1-byte OOB (no caller passes 0 today); `bitmap_free` dereferences `a_bitmap`
+  without a null check (xmalloc guarantees non-null, so dead-defensive). (Tier-5.)
+- `src/arch.cc` — `getrusage`/`sysconf` returns unchecked in `arch_get_memused`/
+  `arch_get_user_system_time` (garbage on failure), and `arch_get_cores` can
+  return `sysconf(...) == -1`, which flows into thread-pool sizing — clamp to ≥1.
+  (Tier-5, latent.)
+- `src/attributes.cc` — `header_get_size` (`;size=`) accepts any value up to
+  `LLONG_MAX` with no sane upper bound, so one crafted header can inject a huge
+  abundance into sum-of-sizes accumulators elsewhere (overflow lives in the
+  accumulators). `src/sortbysize.cc`-style dead blocks not applicable here.
+  (Tier-5, latent.)
 
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low
 
@@ -1671,6 +1872,7 @@ and low risk; listed for completeness only.
 | S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Security | Low | High | High |
 | S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Security | Low–Med | High | High |
 | S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium |
+| S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (**FIXED** — all 3 sites, `310e7de`+`6dbba98`) | Bug | Low | Low–Med | Medium |
@@ -1681,8 +1883,9 @@ and low risk; listed for completeness only.
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med |
 | N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths | Numerical | Medium | Medium | Low–Med |
+| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium |
-| C1 | `init_defaults` misses 52 globals → stale config across library sessions | Library lifecycle | Low | Med–High | Medium |
+| C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
 | E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
