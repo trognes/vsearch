@@ -31,7 +31,7 @@ tier (one PR per tier). Status legend: **audited** = read in full against the
 | **1 — input parsers & DB load** | `fastx`, `fasta`, `fastq`, `fasta2fastq`, `fastq_chars`, `sff_convert`, `udb`, `db`, `dbhash`, `dbindex`, `userfields` (+ headers) | **audited** (this pass → S13–S16, L2, plus folded sites in S5/N1/P1 and corrections to N1(c)/C1(c)) |
 | **2 — core compute engines** | `searchcore`, `search`, `search_exact`, `align_simd`, `linmemalign`, `cluster`, `chimera`, `allpairs`, `sintax`, `orient`, `mask`, `kmerhash`, `unique` | **audited** (this pass → S17–S19, N2; S10 reachability confirmed; S13 generalized; folded sites in S5/S7/N1/P1/L1/L2/E6/E9) |
 | **3 — dereplication & seq ops** | `derep`, `derep_prefix`, `derep_smallmem`, `rereplicate`, `shuffle`, `subsample`, `sortbylength`, `sortbysize`, `cut`, `getseq` | **audited** (this pass → S20–S22; folded sites in S4/S5/B1/N1/L2/E7/E9) |
-| 4 — output, formatting & stats | `results`, `otutable`, `msa`, `showalign`, `fastq_stats`, `eestats`, `fastqops`, `fastq_join`, `filter`, `tax` | *pending* |
+| **4 — output, formatting & stats** | `results`, `otutable`, `msa`, `showalign`, `fastq_stats`, `eestats`, `fastqops`, `fastq_join`, `filter`, `tax` | **audited** (this pass → S23–S25, B2; folded sites in S5/I1/N1/E2/E9) |
 | 5 — CLI/dispatch & infra | `vsearch.cc`, `util`, `arch`, `cpu`, `attributes`, `dynlibs`, `bitmap`, `minheap`, `city`, `md5`, `sha1` | *pending* |
 | 6 — headers & `utils/` | all `*.h`, `src/utils/*.hpp` | *pending* |
 
@@ -70,6 +70,23 @@ copy-paste slip. An exhaustive sweep originally found three occurrences:
   `stderr` from inside the `if (fp_log != nullptr)` log branch — the same
   `stderr`-instead-of-`fp_log` copy-paste pattern as B1 (the message is then
   missing from the log and duplicated on `stderr`). One-token fix, same class.
+
+### B2. MSA consensus `;length=` reported one too large (off-by-one)
+
+`compute_and_print_consensus` (`msa.cc`) sizes `cons_v.resize(conslen + 1)` (the
+last slot is the `'\0'`), but `print_consensus_sequence` (`msa.cc:493`) passes
+`static_cast<int>(cons_v.size())` — i.e. `conslen + 1` — as the **sequence
+length** argument to `fasta_print_general`. Every other caller passes the true
+residue count (e.g. `alignment_length`, `db_getsequencelen`). The sequence body
+is unaffected (it is printed via `"%.*s"`, which stops at the embedded NUL), so
+the only visible effect is the `;length=` field: with `--cluster_* --consout
+--lengthout`, each cluster's consensus length is reported one too high.
+
+- **Type:** Bug (incorrect output value)
+- **Reachability:** `--consout --lengthout` — every cluster.
+- **Fix:** pass `cons_v.size() - 1` (or carry `conslen`), matching the convention
+  used everywhere else.
+- **Effort:** Low · **Impact:** Low · **Criticality:** Low · *verified*
 
 ---
 
@@ -230,6 +247,15 @@ itself is correct; only the print interface narrows.
   negative and feeds a negative/overflowed `resize()` then `strcpy`/`std::copy`
   into `field_buffer` (write-overflow twist again). Gated on >2 GB; same fix
   (carry as `size_t`/`int64_t`).
+- **Additional sites (Tier-4 audit):** with `--rowlen 0`, `int const rowlen =
+  qseqlen + dseqlen` (`results.cc:722`) sums two `int64_t` lengths into an `int`
+  that then sizes the `showalign` line buffers (`q_line.resize(width+1)`) while
+  `putop` walks the full alignment — a narrowing with a real **size-vs-walk
+  mismatch** (`align_show` already stores `int64_t width`; only the computation
+  and the `int alignwidth` parameter narrow). Also `otutable_add`
+  (`otutable.cc:181–262`) narrows `regoff_t`/`size_t` match lengths to `int`
+  before `vector.resize(len+1)` — a >2 GB header yields a negative/overflowed
+  resize. Both gated on >2 GB; carry as `size_t`/`int64_t`.
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
@@ -524,6 +550,67 @@ through, and only for options whose validation is a pure range test.
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low · *verified* · I1-class
   input-validation gap.
 
+#### S23. `fastq_eestats` `ee_start()` overflows 32-bit `int` for reads > ~2074 bp → heap OOB (High, reachable)
+
+`ee_start(int pos, int resolution)` returns `pos * ((resolution * (pos + 1)) + 2)
+/ 2` (`eestats.cc:127–130`). Every operand is `int`, so the whole product is
+computed in 32-bit `int` and only *then* widened to the `int64_t` return type.
+With the typical `resolution` (~1000) the value grows ~`500·pos²` and exceeds
+`INT_MAX` once `pos ≳ 2074`. That overflowed (signed-UB, often negative) value is
+used **both** to size the table — `ee_size = ee_start(len_alloc, resolution)` →
+`ee_length_table(ee_size)` (`:163, 167, 187–196`) — **and** to index it:
+`++ee_length_table[ee_start(i, resolution) + e_int]` (`:227`) and the read at
+`:354`. Once it overflows, allocation size and indices disagree → out-of-bounds
+heap writes and reads.
+
+- **Reachability:** `vsearch --fastq_eestats f.fastq --output o` on **any dataset
+  with reads longer than ~2074 nt** — routine for PacBio/Nanopore and merged
+  amplicons. No special options. (The sanitizer CI misses it because the suite
+  uses short reads.)
+- **Fix:** do the arithmetic in 64-bit (`static_cast<int64_t>(pos) * …` inside
+  `ee_start`). Note the table also grows ~quadratically with read length — a
+  separate memory concern, but the overflow is the bug.
+- **Effort:** Low · **Impact:** High (heap corruption) · **Criticality:** High ·
+  *verified (int arithmetic; sizes + indexes the table)*.
+
+#### S24. `fastq_eestats` writes past the per-position quality row when `--fastq_qmin ≥ 2` → heap OOB write (High, reachable)
+
+Each per-position row of `qual_length_table` has width `max_quality + 1` where
+`max_quality = opt_fastq_qmax - opt_fastq_qmin + 1` (`eestats.cc:161, 166, 190`),
+so valid in-row indices are `0 … qmax-qmin+1`. But the write index uses the **raw**
+quality value: `++qual_length_table[((max_quality + 1) * i) + qual]` (`:213`),
+where `qual ∈ [opt_fastq_qmin, opt_fastq_qmax]` (range-checked, fatal outside,
+`:79–94`). When `qmin > 1`, a high-quality base (`qual` near `qmax`) indexes up to
+`qmin - 1` slots past the row — corrupting the next position's row and, at the
+last position, writing past the whole allocation. The default `qmin = 0` masks it
+(then `qual ∈ [0,qmax]`, row width `qmax+2`, in-bounds); the reader loops (`:257,
+303`) iterate `0..max_quality`, so only the write at `:213` is out of bounds.
+
+- **Reachability:** `vsearch --fastq_eestats f.fastq --output o --fastq_qmin 10`
+  (any `qmin ≥ 2`) on data containing a near-`qmax` score. (CI uses default
+  `qmin`, so misses it.)
+- **Fix:** index by the offset from `qmin` (`qual - opt_fastq_qmin`) and translate
+  back in the reader loops, or size rows to `qmax + 2`.
+- **Effort:** Low–Medium · **Impact:** High (heap OOB write) · **Criticality:**
+  High · *verified (row width vs raw-`qual` index)*.
+
+#### S25. `build_sam_strings` walks the CIGAR into the sequences with no length bound (latent)
+
+`build_sam_strings` (`results.cc:753–852`) parses a hit's CIGAR (`12M3I…`) and,
+per op, advances `qpos`/`tpos` and reads `queryseq[qpos]` / `targetseq[tpos]`
+with **no check that the positions stay within the sequence lengths** —
+correctness rests entirely on the CIGAR's run-lengths summing to exactly the
+sequence lengths. The `sscanf(p, "%d%n", …)` return is also unchecked. Safe today
+because the CIGAR is produced by the in-tree aligner consistently with the
+sequences; becomes an over-read only if a CIGAR/sequence pairing is ever
+corrupted (e.g. a stale `nwalignment`, or mismatched lengths from a crafted DB).
+
+- **Reachability:** latent (no user-triggered overflow on well-formed input today).
+- **Fix:** pass query/target lengths and clamp/`fatal()` on `qpos`/`tpos` overrun;
+  check the `sscanf` return.
+- **Effort:** Medium · **Impact:** Medium · **Criticality:** Medium ·
+  *latent; verified (no bound)* · same family as S4/S5 (length used without a check).
+
 ### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
 
 The `Sanitizers (ASan/UBSan)` CI workflow builds vsearch with
@@ -633,6 +720,11 @@ compile-time warning.
 - **Effort:** Medium · **Impact:** Medium–High · **Criticality:** Low–Medium
 - **Status:** *verified (call-site counts and absence of checks); failure-mode
   is by construction, not yet reproduced with a forced ENOSPC/`SIGPIPE` run*
+- **Tier-4 sites:** `otutable.cc` (~40 `fprintf` + the `strftime` at `:408`),
+  `eestats.cc` (the whole table dump), `msa.cc`, `showalign.cc`, `fastq_join.cc`,
+  `fastqops.cc` — all unchecked. The `fastq_eestats`/`fastq_eestats2` commands
+  additionally do no domain validation of their `opt_fastq_*` parameters (unlike
+  `filter.cc`, which routes through `check_parameters`).
 
 ---
 
@@ -1343,6 +1435,11 @@ integer matrix). This is the main source of the file's bulk.
   consumers in `results.cc` hard-code; reordering/inserting a name silently
   renumbers every downstream field. Back it with a named enum or `{name,id}`
   table shared with the consumer.
+- **Confirmed consumer (Tier-4):** `results_show_userout_one` (`results.cc:344–509`)
+  is exactly that consumer — a `switch` on the field index with cases 0–42 and
+  **no `default`**, so the case numbers must stay in lockstep with the order of
+  `userfields_names[]`; nothing asserts the coupling, and an out-of-range index
+  would silently print nothing. Add `default: fatal(...)` as an interim guard.
 
 ### E3. `vsearch.cc` monolith dominated by one ~4,000-line function
 
@@ -1514,6 +1611,24 @@ and prevent recurrence.
   `log10(0.0)`→`-inf` then `static_cast<int64_t>(+inf)` (float→int UB) if a
   probability underflows to exactly 0.0; not reachable with single-byte FASTQ
   quality (q would need ≳3500), but the cast is unguarded (Tier-3, latent).
+- `src/otutable.cc` — `otutable_print_biomout` captures
+  `static const time_t time_now = time(nullptr)` once, so every biom file after
+  the first in a long-running/library process carries the **first** call's
+  timestamp; also `localtime()` returns a shared static (not thread-safe). Drop
+  `static`; use `localtime_r` (Tier-4).
+- `src/otutable.cc` — `otutable_print_otutabout`/`mothur` (~314–392) build the
+  dense table by advancing a single `std::map` iterator in lockstep with nested
+  `std::set` loops; correct only because the `pair`-keyed map orders identically
+  to the set loops — a desync would silently shift every count. A per-cell
+  `map::find` is clearer/robust (Tier-4, latent).
+- `src/showalign.cc` — `--rowlen 0` combined with a zero-width alignment would
+  overrun the `width+1` line buffers (`putop` resets only on `==width`); not
+  reachable (no zero-length alignment reaches `align_show`), latent (Tier-4).
+- `src/fastq_stats.cc` — `compute_distributions` stores `NaN` in the unreachable
+  top bucket (`x/0.0`); harmless today (no consumer reads it), latent N1(b)-class
+  (Tier-4).
+- `src/fastq_join.cc` — dead `reserve()` blocks (~249–257) before the strings are
+  reassigned via `operator+` (Tier-4).
 
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low
 
@@ -1552,9 +1667,13 @@ and low risk; listed for completeness only.
 | S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Security | Low | Low–Med | Medium |
 | S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low |
 | S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low |
+| S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Security | Low | High | High |
+| S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Security | Low–Med | High | High |
+| S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (2/3 fixed upstream; `fastq_mergepairs.cc` open) | Bug | Low | Low–Med | Medium |
+| B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`) | Bug | Low | Low | Low |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
