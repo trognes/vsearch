@@ -23,25 +23,31 @@ Effort / Impact / Criticality are rated **Low / Medium / High**:
 
 ### B1. `--log` quality-error messages written to `stderr` instead of the log file
 
+**Status: partially fixed upstream (2 of 3 sites).** The `eestats.cc` and
+`filter.cc` sites were corrected in `trognes/master` (commit `310e7de`,
+"fix: write to logfile instead of stderr"). The `fastq_mergepairs.cc` site
+remains.
+
 The "FASTQ quality value below qmin" fatal-error branch re-emits to `stderr`
 from inside an `if (fp_log != nullptr)` guard, instead of writing to `fp_log`.
 When a `--log` file is given, the qmin message is printed to `stderr` twice and
 never reaches the log. The qmax branch immediately below each occurrence is
 written correctly (`fprintf(fp_log, …)`), which confirms the qmin branch is a
-copy-paste slip. An exhaustive sweep found exactly three occurrences:
+copy-paste slip. An exhaustive sweep originally found three occurrences:
 
-| File | Line | Function / context |
-|------|------|--------------------|
-| `src/fastq_mergepairs.cc` | ~278 | `get_qual()`, qmin branch |
-| `src/eestats.cc` | ~87 | quality check, qmin branch |
-| `src/filter.cc` | ~85 | quality check, qmin branch (note `std::fprintf`) |
+| File | Line | Function / context | State |
+|------|------|--------------------|-------|
+| `src/fastq_mergepairs.cc` | ~278 | `get_qual()`, qmin branch | **open** |
+| `src/eestats.cc` | ~87 | quality check, qmin branch | fixed (`310e7de`) |
+| `src/filter.cc` | ~85 | quality check, qmin branch (note `std::fprintf`) | fixed (`310e7de`) |
 
 - **Type:** Bug (incorrect output destination)
-- **Fix:** one-token change per site, `stderr` → `fp_log` (keep `std::` prefix in filter.cc).
+- **Remaining fix:** one-token change at `fastq_mergepairs.cc:278`, `stderr` → `fp_log`.
 - **Effort:** Low · **Impact:** Low–Medium · **Criticality:** Medium
 - **Note:** The three blocks are near-identical and likely share an ancestor;
   a shared quality-check helper (see E8) would collapse this to one point of
-  correctness.
+  correctness. The upstream fix patched two sites independently rather than
+  introducing such a helper, so the duplication (and the third site) persists.
 
 ---
 
@@ -1012,7 +1018,7 @@ and low risk; listed for completeness only.
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
-| B1 | `--log` qmin message → `stderr` not `fp_log` (×3) | Bug | Low | Low–Med | Medium |
+| B1 | `--log` qmin message → `stderr` not `fp_log` (2/3 fixed upstream; `fastq_mergepairs.cc` open) | Bug | Low | Low–Med | Medium |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
