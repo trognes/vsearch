@@ -104,6 +104,16 @@ recurring root cause is **a value taken from a file (or from a CLI offset)
 used as a length or index without a range/ordering check**. Items marked
 *verified* were confirmed by reading the surrounding code.
 
+> **Not all of these need a crafted file.** Six items below are reachable on
+> ordinary, non-malicious input or a normal option choice — `S4` (`--subseq_start`
+> on a mixed-length file), `S10` (large `--maxaccepts`/`--maxrejects` on a small
+> dataset), `S12` (DUST on any masking run), `S20` (`--sizein` subsampling), and
+> `S23`/`S24` (`fastq_eestats` on long reads / `--fastq_qmin ≥ 2`). They are plain
+> bugs, **typed `Bug` in the summary table** and prioritized in Bands 1–2 of the
+> sequencing; they keep their `S` ids only because this pass is where they were
+> found. The remaining `S` items are gated on a crafted/corrupt `.udb`/`.sff` and
+> are the genuine "security" subset (Band 4).
+
 > Scope: input parsers, binary/DB format readers, allocation/low-level code,
 > output formatting, and the core algorithm files (`search.cc`, `searchcore.cc`,
 > `search_exact.cc`, `cluster.cc`, `chimera.cc`, `fastq_mergepairs.cc`,
@@ -1940,15 +1950,15 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S1 | UDB `kmerindex` seqno → OOB heap write (`bitmap_set`) | Security | Low | High | High | Pending |
 | S2 | SFF clip-offset underflow → OOB read (`--sff_clip`) | Security | Low | Med–High | Med–High | Pending |
 | S3 | UDB header-length underflow → ~4 GB `headerlen` | Security | Low | Medium | Medium | Pending |
-| S4 | `--subseq_start` unbounded → OOB read | Security | Low | Medium | Medium | Pending |
-| S10 | Hit-list alloc vs. index-bound mismatch (cluster/search) | Security | Low | High | Medium | Pending |
+| S4 | `--subseq_start` unbounded → OOB read | Bug | Low | Medium | Medium | Pending |
+| S10 | Hit-list alloc vs. index-bound mismatch (cluster/search) | Bug | Low | High | Medium | Pending |
 | S5 | 64-bit length → `int` truncation in print path | Security | Medium | Medium | Low | Latent |
 | S6 | UDB additive allocation size unchecked | Security | Low | Medium | Low | Needs-confirm |
 | S7 | `xmalloc`/`xrealloc` no overflow check; `count*size` callers | Security | Low | Medium | Low | Needs-confirm |
 | S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low | Latent |
 | S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low | Needs-confirm |
 | S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low | Latent |
-| S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low | Pending |
+| S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Bug | Low | Low | Low | Pending |
 | S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium | Pending |
 | S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Pending |
 | S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med | Pending |
@@ -1956,11 +1966,11 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium | Pending |
 | S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium | Pending |
 | S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium | Needs-confirm |
-| S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Security | Low | Low–Med | Medium | Pending |
+| S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Bug | Low | Low–Med | Medium | Pending |
 | S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Latent |
 | S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Pending |
-| S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Security | Low | High | High | Pending |
-| S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Security | Low–Med | High | High | Pending |
+| S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Bug | Low | High | High | Pending |
+| S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Pending |
 | S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium | Latent |
 | S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Pending |
 | S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
@@ -1995,11 +2005,13 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 is *"can this produce a wrong result or a crash on reasonable real input?"* — not
 *"can a crafted file exploit it?"*. So the order leads with **silent
 scientific-correctness errors** and **plain bugs on realistic data/options**, and
-pushes **crafted-/malicious-input hardening down**. (Note: several findings filed
-under **Type = Security** are really *plain bugs on non-malicious input* — S23, S24,
-S20, S12, S4, S10 — which is why they rank high here despite the label. The "OOB
-from a crafted `.udb`/`.sff`" findings are the ones that drop.) **B1** is already
-**Fixed**. Each band groups findings that share a fix site or one regression test
+pushes **crafted-/malicious-input hardening down**. (Note: six findings that turned
+up in the security pass are really *plain bugs reachable on non-malicious input* and
+have been **re-typed `Bug`** in the summary table accordingly — **S23, S24, S20, S12,
+S4, S10** — which is why they rank high here; they still carry an `S` id and live in
+the Security-findings section because that pass found them. The items left as
+`Type = Security` are the ones gated on a crafted/corrupt `.udb`/`.sff`, which drop
+to Band 4.) **B1** is already **Fixed**. Each band groups findings that share a fix site or one regression test
 so each lands as a single atomic commit.
 
 ### Band 1 — Silent wrong scientific results on realistic data (highest)
