@@ -1920,59 +1920,74 @@ and low risk; listed for completeness only.
 
 ## Summary table
 
-| ID | Title | Type | Effort | Impact | Criticality |
-|----|-------|------|--------|--------|-------------|
-| S1 | UDB `kmerindex` seqno → OOB heap write (`bitmap_set`) | Security | Low | High | High |
-| S2 | SFF clip-offset underflow → OOB read (`--sff_clip`) | Security | Low | Med–High | Med–High |
-| S3 | UDB header-length underflow → ~4 GB `headerlen` | Security | Low | Medium | Medium |
-| S4 | `--subseq_start` unbounded → OOB read | Security | Low | Medium | Medium |
-| S10 | Hit-list alloc vs. index-bound mismatch (cluster/search) | Security | Low | High | Medium |
-| S5 | 64-bit length → `int` truncation in print path | Security | Medium | Medium | Low |
-| S6 | UDB additive allocation size unchecked | Security | Low | Medium | Low |
-| S7 | `xmalloc`/`xrealloc` no overflow check; `count*size` callers | Security | Low | Medium | Low |
-| S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low |
-| S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low |
-| S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low |
-| S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low |
-| S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium |
-| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium |
-| S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med |
-| S16 | UDB `kmerindexsize` summed from unchecked file counts, no consistency check | Security | Low | Medium | Low–Med |
-| S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium |
-| S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium |
-| S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium |
-| S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Security | Low | Low–Med | Medium |
-| S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low |
-| S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low |
-| S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Security | Low | High | High |
-| S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Security | Low–Med | High | High |
-| S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium |
-| S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium |
-| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low |
-| ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
-| ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
-| B1 | `--log` qmin message → `stderr` not `fp_log` (**FIXED** — all 3 sites, `310e7de`+`6dbba98`) | Bug | Low | Low–Med | Medium |
-| B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`) | Bug | Low | Low | Low |
-| I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med |
-| P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
-| L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
-| L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med |
-| CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium |
-| N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium |
-| N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths | Numerical | Medium | Medium | Low–Med |
-| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low |
-| A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium |
-| C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium |
-| E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium |
-| E2 | Single source of truth for option metadata | Enhancement | High | High | Medium |
-| E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med |
-| E4 | Remove module-scope global state (reentrancy) | Enhancement | High | High | Med–High |
-| E5 | Deduplicate output-file open/close boilerplate | Enhancement | Low–Med | Medium | Low |
-| E6 | Decompose oversized functions | Enhancement | Med–High | Medium | Low |
-| E7 | Merge near-identical code paths | Enhancement | Medium | Medium | Low |
-| E8 | Shared `struct Scoring` initializer | Enhancement | Low | Low–Med | Low |
-| E9 | Remove dead/debug code | Enhancement | Low | Low | Low |
-| E10 | Deduplicate license headers | Enhancement | Low | Low | Low |
+**Status legend** (workflow state, not severity — severity is in the other columns):
+
+- **Fixed** — corrected in the codebase (commit referenced in the finding).
+- **Pending** — verified by reading the source *and* reachable on supported
+  inputs/platforms; fix recommended, not yet made. The actionable backlog.
+- **Latent** — mechanism verified, but not reachable on today's inputs/config/
+  platforms (e.g. gated on >2 GB input, a big-endian host, or library-only
+  misuse); the fix is hardening/portability rather than a live-bug repair.
+- **Needs-confirm** — detected by reading; reachability not yet proven. Wants a
+  crafted repro or a runtime (ASan/TSan/fuzz) check before it is fixed.
+
+No item is marked "Ignored" — nothing has been triaged as won't-fix; the
+"recorded for completeness, no action" observations live in the per-section
+*Checked and found safe* lists, not here.
+
+| ID | Title | Type | Effort | Impact | Criticality | Status |
+|----|-------|------|--------|--------|-------------|--------|
+| S1 | UDB `kmerindex` seqno → OOB heap write (`bitmap_set`) | Security | Low | High | High | Pending |
+| S2 | SFF clip-offset underflow → OOB read (`--sff_clip`) | Security | Low | Med–High | Med–High | Pending |
+| S3 | UDB header-length underflow → ~4 GB `headerlen` | Security | Low | Medium | Medium | Pending |
+| S4 | `--subseq_start` unbounded → OOB read | Security | Low | Medium | Medium | Pending |
+| S10 | Hit-list alloc vs. index-bound mismatch (cluster/search) | Security | Low | High | Medium | Pending |
+| S5 | 64-bit length → `int` truncation in print path | Security | Medium | Medium | Low | Latent |
+| S6 | UDB additive allocation size unchecked | Security | Low | Medium | Low | Needs-confirm |
+| S7 | `xmalloc`/`xrealloc` no overflow check; `count*size` callers | Security | Low | Medium | Low | Needs-confirm |
+| S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low | Latent |
+| S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low | Needs-confirm |
+| S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low | Latent |
+| S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Security | Low | Low | Low | Pending |
+| S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium | Pending |
+| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Pending |
+| S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med | Pending |
+| S16 | UDB `kmerindexsize` summed from unchecked file counts, no consistency check | Security | Low | Medium | Low–Med | Needs-confirm |
+| S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium | Pending |
+| S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium | Pending |
+| S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium | Needs-confirm |
+| S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Security | Low | Low–Med | Medium | Pending |
+| S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Latent |
+| S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Pending |
+| S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Security | Low | High | High | Pending |
+| S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Security | Low–Med | High | High | Pending |
+| S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium | Latent |
+| S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Pending |
+| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
+| ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
+| ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low | Latent |
+| B1 | `--log` qmin message → `stderr` not `fp_log` (all 3 sites, `310e7de`+`6dbba98`) | Bug | Low | Low–Med | Medium | Fixed |
+| B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`) | Bug | Low | Low | Low | Pending |
+| I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med | Pending |
+| P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med | Latent |
+| L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium | Pending |
+| L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
+| CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
+| N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium | Pending |
+| N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths | Numerical | Medium | Medium | Low–Med | Latent |
+| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
+| A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
+| C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
+| E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium | Pending |
+| E2 | Single source of truth for option metadata | Enhancement | High | High | Medium | Pending |
+| E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med | Pending |
+| E4 | Remove module-scope global state (reentrancy) | Enhancement | High | High | Med–High | Pending |
+| E5 | Deduplicate output-file open/close boilerplate | Enhancement | Low–Med | Medium | Low | Pending |
+| E6 | Decompose oversized functions | Enhancement | Med–High | Medium | Low | Pending |
+| E7 | Merge near-identical code paths | Enhancement | Medium | Medium | Low | Pending |
+| E8 | Shared `struct Scoring` initializer | Enhancement | Low | Low–Med | Low | Pending |
+| E9 | Remove dead/debug code | Enhancement | Low | Low | Low | Pending |
+| E10 | Deduplicate license headers | Enhancement | Low | Low | Low | Pending |
 
 ## Suggested sequencing
 
