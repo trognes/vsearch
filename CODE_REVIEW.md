@@ -35,7 +35,10 @@ tier (one PR per tier). Status legend: **audited** = read in full against the
 | **5 — CLI/dispatch & infra** | `vsearch.cc`, `util`, `arch`, `cpu`, `attributes`, `dynlibs`, `bitmap`, `minheap`, `city`, `md5`, `sha1` | **audited** (this pass → S26, N3, C1(d)/(e); folded into S7/S8/A1/I1/P1/E1/E2/E9; F-C1 ruled safe) |
 | **6 — headers & `utils/`** | all `*.h`, `src/utils/*.hpp` | **audited** (this pass → corrected A1's round_up cite; U5→I1, U4/U7→P1, cigar/span asserts→A1, H1→E1; output structs verified bounded) |
 
-**The file-by-file sweep is complete — all six tiers audited.**
+**The file-by-file sweep is complete — all six tiers audited.** What remains is
+not unreviewed code but a few analysis *methods* a source read cannot substitute
+for (ThreadSanitizer for the data-race surface CC1, parser fuzzing, a big-endian
+build) — see **"Analysis methods not yet applied"** at the end of this document.
 
 ---
 
@@ -648,6 +651,38 @@ clean by contrast — it uses `memcpy` (`Fetch32`/`Fetch64`).
   (SHA1HANDSOFF off; const-cast write-through; unaligned cast)* · related P1 (the
   endianness FIXME on the same line is a different aspect).
 
+#### S27. zlib/bzip2 loaded by bare soname at runtime — library-search-path trust (Low; Windows DLL-planting)
+
+`.gz`/`.bz2` support is provided by `dlopen`/`LoadLibrary` of the compression
+libraries at runtime, by **bare name**: on Linux `dlopen("libz.so.1", …)` /
+`dlopen("libbz2.so.1", …)` (`dynlibs.cc:113, 134`), on Windows
+`LoadLibraryA("zlib1.dll")` / `LoadLibraryA("libbz2.dll")` (`dynlibs.cc:111, 132`).
+A bare name is resolved through the platform loader's search path, so whichever
+matching library appears first on that path is loaded and its `gzread`/`BZ2_bzRead`
+symbols are called on user input.
+
+- **POSIX:** low risk — `dlopen` of a plain soname honours `LD_LIBRARY_PATH`,
+  `RPATH`/`RUNPATH`, then the default trusted dirs; it does **not** include the
+  current working directory. Hijacking requires an attacker who can already set the
+  victim's environment or write a trusted library dir (i.e. already-privileged).
+- **Windows:** higher risk — `LoadLibraryA` with an unqualified DLL name uses the
+  Windows DLL search order, which (depending on `SafeDllSearchMode` / the app's
+  config) can include the **current working directory** and the directory of the
+  executable. Running `vsearch` from a directory an attacker can drop a
+  `zlib1.dll` / `libbz2.dll` into enables classic **DLL planting** → arbitrary code
+  in the vsearch process. The first `--gzip_decompress`/auto-sniffed `.gz` input
+  triggers the load.
+- **Fix direction:** on Windows, load with an absolute path (resolve next to the
+  executable) and/or call `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 |
+  …)` / pass `LOAD_LIBRARY_SEARCH_*` flags to `LoadLibraryEx`; on POSIX the bare
+  soname is acceptable. (Cross-ref the E9 `dynlibs` entry, which covers the dead
+  `gz*_p` declarations, the silent-when-absent behaviour, and the double-open
+  handle leak — distinct, non-security aspects of the same file.)
+- **Type:** Security (untrusted library load) · **Effort:** Low ·
+  **Impact:** Low (POSIX) / Medium (Windows) · **Criticality:** Low ·
+  *verified (bare-name load); Windows search-order risk by construction, no Windows
+  CI target* · cross-ref E9.
+
 ### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
 
 The `Sanitizers (ASan/UBSan)` CI workflow builds vsearch with
@@ -1070,6 +1105,46 @@ and the correction to C1(c).
   `FILE*` on the library path — inconsistent with the `open_output_file` RAII used
   by its four sibling commands. Fix: use the RAII wrapper, or run the checks
   before opening outputs. *verified; benign on the CLI (exit reclaims).*
+
+---
+
+## Concurrency / data races
+
+### CC1. Multi-threaded commands have an unaudited data-race surface (no ThreadSanitizer coverage)
+
+The findings above (E4, L1, C1) address **reentrancy** — single-threaded
+reasoning about file-`static` state surviving between sessions. They do **not**
+cover *data races* inside a single run: `search`, `cluster`, `chimera`, `sintax`,
+`allpairs`, and `orient` all spin up a pthread worker pool (`--threads`) whose
+workers concurrently read the shared database (`datap`/`seqindex` from `db.cc`,
+the k-mer index from `dbindex.cc`) and update shared output/counters under
+hand-placed mutexes. A code read can show the lock *placement* but cannot reliably
+prove the *absence* of a torn read, a missing-mutex counter update, or a memory
+ordering bug — that requires runtime race detection.
+
+Specific spots a read flags as worth a race check (none confirmed as races, all
+candidates for ThreadSanitizer):
+
+- **`scorematrix` written by `search16_init` unsynchronized** (`align_simd.cc:111`,
+  already noted under E4) — if any worker can observe it mid-write, that is a race.
+- **Partly-guarded global counters** in `search.cc`/`chimera.cc` (the E4 table
+  notes several counters live "on both sides of a pthread wall",
+  `chimera.cc:110`) — confirm every cross-thread counter update is either
+  thread-local-then-reduced or mutex-protected.
+- **The save/overwrite/restore of `si_plus`/`si_minus` and `tophits`** in
+  `cluster_assign_batch` / `chimera_detect_batch` (L2(d), E4) is safe only if no
+  two sessions/threads touch those file-statics concurrently — a single-thread
+  assumption that the batch/library entry points do not enforce.
+
+- **Why no current signal:** the project's sanitizer CI builds **ASan+UBSan**, not
+  **TSan** (ASan and TSan are mutually exclusive — a separate build/run), and
+  Valgrind CI uses Memcheck, not Helgrind/DRD. So the entire data-race class is
+  outside today's automated coverage. The vsearch-tests suite *does* exercise
+  multi-threaded runs, so a TSan lane would get real coverage immediately.
+- **Type:** Concurrency (latent; unaudited) · **Effort:** Medium (stand up a TSan
+  lane + triage) · **Impact:** Medium–High (silent wrong results / rare crashes
+  under threading) · **Criticality:** Medium · *not yet analysed — flagged as a
+  method gap, see "Analysis methods not yet applied"* · cross-ref E4, L1, L2(d).
 
 ## Numerical correctness
 
@@ -1873,6 +1948,7 @@ and low risk; listed for completeness only.
 | S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Security | Low–Med | High | High |
 | S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium |
 | S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium |
+| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (**FIXED** — all 3 sites, `310e7de`+`6dbba98`) | Bug | Low | Low–Med | Medium |
@@ -1881,6 +1957,7 @@ and low risk; listed for completeness only.
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium |
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med |
+| CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium |
 | N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths | Numerical | Medium | Medium | Low–Med |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low |
@@ -1934,3 +2011,52 @@ and low risk; listed for completeness only.
 > used as lengths or indices without validation. A small set of shared
 > "validate-on-load" helpers for the binary parsers would address several at
 > once and prevent recurrence.
+
+---
+
+## Analysis methods not yet applied (recommended next)
+
+The findings above come from a **complete file-by-file source read** of `src/`
+(all six tiers — see the coverage matrix) cross-checked against ASan/UBSan,
+Valgrind/Memcheck, cppcheck, and CodeQL. That reading sweep has saturated: the
+last tiers turned up mostly low-severity items, the usual signal that hand-reading
+has reached diminishing returns. The remaining high-value work is not *more
+reading* but a small number of **different techniques** a read cannot substitute
+for. Each is scoped as separate, tool-driven effort, not part of this review.
+
+1. **ThreadSanitizer on the threaded commands.** The single biggest coverage gap.
+   Our concurrency reasoning (E4, L1, C1) is single-threaded; the actual data-race
+   surface (**CC1**) — workers in `search`/`cluster`/`chimera`/`sintax`/`allpairs`/
+   `orient` sharing `datap`/`seqindex`/the k-mer index and updating global counters
+   — is entirely outside today's CI (ASan/UBSan + Memcheck, none of which detect
+   races). Stand up a TSan build (mutually exclusive with ASan, so a separate lane)
+   and run the multi-threaded parts of the vsearch-tests suite under it. Highest
+   expected value of the three.
+
+2. **Coverage-guided fuzzing of the parsers.** We found the crafted-input bugs
+   (S1 UDB, S2/S15 SFF, S20 subsample, S18 chimera) by hand; the binary/text format
+   readers — **UDB, SFF, FASTQ, BIOM, FASTA** — are exactly where a fuzzer
+   (libFuzzer/AFL++ on a small harness per format) systematically beats reading.
+   Two properties make vsearch unusually fuzz-friendly: `-fno-exceptions` plus
+   `fatal()`→`std::exit()` means every malformed-input path is either a clean exit
+   or a memory bug (no exception noise), and ASan instrumentation turns the
+   latent/needs-confirmation S-items (S3, S6, S9, S16, S19, S25) into crashing
+   repros or clears them. The sanitizer CI runs only **well-formed** inputs (its
+   own caveat), so this is the natural way to reach the S1–S4/S14–S19 crafted-input
+   class.
+
+3. **Big-endian / non-glibc build-and-run matrix.** P1(b) documents the
+   little-endian-only assumptions in the UDB and SFF readers (and the BE hash-
+   distribution degradation), and P1(d) the non-glibc `os_byteswap` build break and
+   the Windows `"w"`-vs-`"wb"` text-mode corruption — but **nobody has built or run
+   on a big-endian or musl/uClibc target.** The dormant `build-all.yml` matrix is
+   entirely little-endian, so these paths are never exercised. Add a big-endian
+   target (e.g. s390x under QEMU) and a musl build to the matrix to turn the P1
+   "by construction" items into pass/fail evidence. Lowest priority while no
+   big-endian platform is actually supported, but it is the only way to validate
+   the portability the build matrix advertises.
+
+These are **method gaps, not unreviewed code** — the source itself has been read
+in full. Treat them as the next tier of effort (separate PRs / CI lanes), to be
+scheduled when the static backlog above is being worked, not as an extension of
+this reading audit.
