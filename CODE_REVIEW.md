@@ -1991,40 +1991,102 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 
 ## Suggested sequencing
 
-1. **Security first.** **S1** (critical OOB write from a crafted `.udb`), then
-   **S2**, **S3**, **S4**, **S10** — all small, localized input/range checks.
-   Confirm **S10** with an AddressSanitizer run. **S5–S9, S11** are
-   hardening/latent and can follow. Fix **A1** together with **S2** — both are
-   SFF-reader input checks (A1's overflow guards are asserts that vanish under
-   the default `-DNDEBUG`); convert them to `fatal()` in the same pass.
-2. **B1** — isolated, low-risk correctness fix.
-2b. **N1(a)** — high value for the cost: widening `count_t` removes a silent
-   wrong-ranking bug on long-read data. Pair it with a long-read reference-output
-   regression case, since no sanitizer will catch a regression here. **N1(b)** is a
-   cheap guarded-divide cleanup alongside it.
-3. **E5**, **E8**, **E9** — quick, low-risk cleanups with immediate line-count payoff.
-   Fold **I1**'s checked-close logic into the **E5** shared open/close helper so
-   the write-error guard lands in one place rather than at ~110 call sites.
-   For **P1**, the cheap first step is tooling: add a non-gating `-Wconversion`
-   `-Wsign-conversion` CI lane (mirroring the sanitizer inventory) to size the
-   width-narrowing backlog before touching code; the endianness items are low
-   priority while no big-endian target is supported.
-4. **E2 → E1 → E4** — the core architectural thread (single option table, finish
-   the `Parameters` migration, then eliminate global state); E4 directly improves
-   library-API safety. **L1** rides this thread: L1(b)/L1(c) are quick standalone
-   fixes (scope-guard the session unlock; free before re-init), but L1(a) — giving
-   the core a recoverable error channel instead of `fatal()`→`exit()` — is the
-   large library-API change that only becomes tractable once E4 removes the global
-   state it would have to unwind. **C1(a)** is a quick standalone fix (add the 52
-   missing globals — at least the behavioral ones — to `init_defaults`); **C1(b)**
-   is the reason to finish E1 in one direction rather than leave the
-   `opt_*`/`Parameters` split half-applied. Pair C1 with a two-session regression
-   test.
-5. **E3**, **E6**, **E7** — structural decomposition, largely unlocked by the above.
+Ordered by value-for-effort, security-reachable first. (**B1** is already
+**Fixed** — `310e7de`+`6dbba98` — so it is no longer a step; its `rereplicate.cc:133`
+sibling slip rides step 5.) Each step groups findings that share a fix site or a
+single regression test, so they land as one atomic, cherry-pickable commit.
 
-> Note: several findings (S1–S4, S5, S6, S9) trace to file/CLI-derived values
-> used as lengths or indices without validation. A small set of shared
-> "validate-on-load" helpers for the binary parsers would address several at
+1. **Reachable heap-corruption on ordinary input — do these first.** These bite
+   well-formed data with no crafted file, so they outrank the parser bugs:
+   - **S23** + **S24** — `fastq_eestats` heap OOB: 32-bit overflow in `ee_start()`
+     for reads > ~2074 bp (S23), and the per-position quality-row over-write when
+     `--fastq_qmin ≥ 2` (S24). Both Low effort (64-bit arithmetic; index by
+     `qual - qmin`), both routine inputs (long reads / non-default qmin). One pass
+     over `eestats.cc`.
+   - **S20** — `random_subsampling` one-past-end read on `--sizein`; advance the
+     amplicon cursor only when the loop continues. ASan-detectable, Low effort.
+   - **S12** — DUST `int` left-shift UB (UBSan-confirmed in CI): make the
+     accumulator `unsigned`. Trivial.
+
+2. **Crafted-input parser hardening (UDB + SFF).** Localized validate-on-load checks:
+   - **UDB:** **S1** (critical — per-`kmerindex`-entry `< seqcount` check, closes the
+     OOB *write*), bundled with **S3**/**S9**/**S14**/**S16** — switch the header/length
+     tables to `uint32_t` and validate each offset/length/count against the file
+     regions (S14 is the type root cause under S3/S9; S16 bounds the `kmerindexsize`
+     sum), plus **S6** (overflow-check the additive `datap` allocation).
+   - **SFF:** **S2** (reject `clip_start > clip_end`), **S15** (compare the flowgram
+     skip against the full `2*flows_per_read`), and **A1** (convert the four
+     NDEBUG-stripped overflow `assert()`s in `sff_convert.cc` to `fatal()`) in **one
+     SFF-reader pass** — they are the same input surface and A1's guards vanish in
+     every release build. Also fold the SFF char-signedness fixes (P1 "checked-safe"
+     (i)/(ii)) here.
+   - **S4** (`--subseq_start` bound, both the seq *and* quality pointer) and **S10**
+     (size the hit-list buffer by the same `maxaccepts+maxrejects(+MAXDELAYED)` bound
+     used for indexing) — confirm **S10** with the suggested small-seqcount /
+     large-`maxaccepts` ASan repro.
+
+3. **Library-API validation class — one shared fix.** Move every `args_init` bound
+   check into `vsearch_apply_defaults_fixups()` so CLI and library share one
+   validation path (**C1(e)** enumerates them): **S13** (`opt_wordlength` `[3,15]`,
+   compute the shift in 64-bit), **S17** (`opt_chimeras_parents_max` `[2,20]`),
+   `opt_threads` (the **S7** `chimera.cc:2975` multiply), and
+   `opt_maxaccepts`/`opt_maxrejects` (feed S10). Alongside it: **S18** (validate
+   `query_len == strlen(query_seq)` in `chimera_detect_single`), **C1(a)** (the
+   confirmed `opt_notmatchedfq`-never-reset bug at `vsearch.cc:958` + the other
+   behavioral missing globals), and **C1(d)** (make `apply_defaults_fixups`
+   idempotent). Pair with a two-session API regression test
+   (`api_examples/example_reinit.cc`). **S19** (chimera model-string tail) is the
+   needs-confirm sibling — clamp `nth_parent` here, confirm with a crafted repro.
+
+4. **Silent numerical-correctness (no crash, no sanitizer signal — needs reference
+   regression).** **N1(a)** — widen `count_t` to `uint32_t` to stop long-read
+   k-mer-count saturation mis-ranking hits (highest value; pair with a long-read
+   reference-output case). **N1(b)** — the cheap guarded-divide helper for the
+   secondary `inf`/`nan` output fields, alongside. **N2** — widen the `unsigned
+   short` SIMD alignment counters (latent, degenerate lengths). **N3** — RNG
+   quality/reproducibility (the reachable parts: 32-bit `--randseed` truncation,
+   thread non-determinism).
+
+5. **Quick, low-risk cleanups with immediate payoff.** **E5** (dedup the open/close
+   boilerplate) — and fold **I1**'s checked-close logic into that one shared helper
+   (`utils/open_file.hpp` `CloseFileHandle` deleter) so the write-error guard lands
+   in one place, not at ~110 sites. **E8** (shared `Scoring` initializer), **E9**
+   (dead code — incl. the B1 `rereplicate.cc:133` sibling, the dead `kh_find_best_diagonal`
+   /`unique_compare`, `round_up.hpp`, and the `dynlibs` dead decls). **ST1** (drop the
+   `memset` on `searchinfo_s` — it has `std::vector` members). **S26** (define
+   `SHA1HANDSOFF` / `memcpy` the MD5 fast path — kill the const-write-through UB).
+   **S22** (one `std::isfinite` check in `args_getdouble` rejects every NaN-bypass at
+   once). **S27** (on Windows, load zlib/bzip2 by absolute path / `LOAD_LIBRARY_SEARCH_*`).
+   **B2** (the `;length=` off-by-one). **S5**/**S11**/**S21**/**S25** are latent
+   hardening and can trail. For **P1**, the cheap first step is *tooling*: a
+   non-gating `-Wconversion`/`-Wsign-conversion` CI lane (mirroring the sanitizer
+   inventory) to size the width-narrowing backlog before touching code; **ST2** is the
+   format/signedness subset of the same.
+
+6. **Resource/lifecycle quick wins.** **L1(b)** (scope-guard the session-mutex
+   unlock), **L1(c)** (free `opt_ee_cutoffs_values` before re-alloc), and **L2**
+   (null-after-free + self-free-on-reinit in `dbindex`/`dbhash`/`userfields`/`derep`,
+   the `tophits` save/restore in `chimera_detect_batch`) — all small, all improve
+   library multi-session safety. They are independent of the architecture thread.
+
+7. **Architecture thread.** **E2 → E1 → E4** (single option table, finish the
+   `opt_*`→`Parameters` migration in one direction — closing the **C1(b)** drift
+   trap — then eliminate global state); E4 directly improves library reentrancy and
+   underlies **CC1**. **L1(a)** rides this: giving the core a recoverable error
+   channel instead of `fatal()`→`exit()` only becomes tractable once E4 removes the
+   global state it would unwind. Then **E3**, **E6**, **E7** — structural
+   decomposition, largely unlocked by the above.
+
+8. **Different methods, not more reading** (see "Analysis methods not yet applied"):
+   a **ThreadSanitizer** lane for **CC1**, **fuzzing** the UDB/SFF/FASTQ/BIOM parsers
+   to turn the needs-confirm items (S6, S7, S9, S16, S19) into repros-or-clears, and
+   a **big-endian/non-glibc build** to validate the P1 portability items.
+
+> Note: a large share of the security findings (S1–S4, S6, S9, S14, S16, S18, and
+> the S13/S17 library class) trace to one root cause — a file- or caller-derived
+> value used as a length or index without a range/ordering check. A small set of
+> shared "validate-on-load" helpers for the binary parsers, plus the single
+> `apply_defaults_fixups` validation gate (step 3), would address most of them at
 > once and prevent recurrence.
 
 ---
