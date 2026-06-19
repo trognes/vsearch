@@ -1178,6 +1178,34 @@ or Valgrind — they need reference-output regression on a known dataset.
 
 #### (a) `count_t` (`unsigned short`) silently saturates k-mer match counts → wrong search/cluster ranking on long reads — *headline*
 
+**Status: FIXED (`441ffff`).** The scalar increment in `search_topscores` now
+saturates at `INT16_MAX` (32767) instead of wrapping —
+`count_t & counter = searchinfo->kmers[list[j]]; if (counter < INT16_MAX) { ++counter; }`
+(`searchcore.cc`). Merged via the `bugfixes` branch. Two refinements to the
+original analysis below informed the fix:
+
+- **The fix is the "clamp on increment" option, not the `uint32_t` widening.**
+  The SIMD bitmap path (`increment_counters_from_bitmap*` in `cpu.cc`) already
+  increments these counters with *signed* saturating ops (`_mm_subs_epi16`, NEON
+  `vqsubq_s16`, AltiVec `vec_subs`) and so caps at 32767. Both paths update the
+  same array, so letting the scalar path run past 32767 is also unsafe: a value
+  it pushes into 32768..65535 is negative under the SIMD path's signed
+  reinterpretation, and a later saturating increment there can drive it back
+  through zero. Capping the scalar path at `INT16_MAX` keeps every counter in
+  `[0, 32767]`, where the two paths agree and neither can wrap — zero memory cost
+  and no per-architecture SIMD rewrite (the `uint32_t` widening would require
+  re-coding the SSE2/SSSE3/NEON/AltiVec/SIMDe kernels for 32-bit lanes and
+  doubling the per-thread `kmers` array).
+- **Overflow needs >65 535 *distinct* shared k-mers, and a CLI repro is blocked
+  by the aligner cap.** The counter rises at most once per distinct shared k-mer
+  (the db index dedups k-mers per sequence, `dbindex.cc:187–196`), so both
+  sequences must exceed ~32 k bp — which also exceeds the SIMD aligner's 25 M
+  sequence-length-product cap (`align_simd.cc:1346`), so such a pair never yields
+  an observable hit. This is why the item stayed *needs-confirmation*. The fix is
+  verified by no-regression (pre/post-fix binaries byte-identical on normal
+  search/cluster output) plus an isolated boundary check (old `++` wraps to 0 at
+  65 536; new saturates at 32 767).
+
 The per-target shared-k-mer counter is `using count_t = unsigned short`
 (`searchcore.h:128`). In `searchcore.cc` it is incremented once per matching
 query k-mer sample with **no saturation guard** —
@@ -1199,13 +1227,15 @@ fills. Result: a true best hit is silently missed or mis-ranked.
   shared samples. Short-read data stays well under the limit.
 - **Not caught by tooling:** unsigned overflow is not UB, so UBSan stays silent
   (this is why the class-1 note flagged regression testing, not sanitizers).
-- **Fix:** widen `count_t` to `uint32_t` (the matched `unsigned int count`
-  field at `searchcore.h:83` already implies the wider domain), or clamp on
-  increment. Widening costs memory in the per-target `kmers` array
-  (`indexed_count * sizeof(count_t)`), so measure.
+- **Fix (applied):** clamp on increment — saturate the scalar path at
+  `INT16_MAX` to match the SIMD path's existing cap (see the Status block above).
+  The alternative of widening `count_t` to `uint32_t` was not taken because it
+  would require rewriting the per-architecture SIMD kernels for 32-bit lanes and
+  doubling the per-thread `kmers` array, for precision only relevant in an edge
+  the aligner cap makes unobservable.
 - **Effort:** Low–Medium · **Impact:** High · **Criticality:** Medium
-  (long-read workflows) · *verified (mechanism); needs-confirmation (a crafted
-  long-read regression case)*
+  (long-read workflows) · *verified (mechanism + fix); end-to-end CLI repro
+  unobservable by construction (aligner product cap)*
 - Cross-ref: previously noted as a parenthetical under "Checked and found safe"
   (memory-safety context, where it is correctly *not* a safety bug); this is its
   correctness writeup.
@@ -1941,6 +1971,9 @@ and low risk; listed for completeness only.
 **Status legend** (workflow state, not severity — severity is in the other columns):
 
 - **Fixed** — corrected in the codebase (commit referenced in the finding).
+- **Partially fixed** — a multi-part finding whose sub-items are split across
+  states; the per-sub-item status is given in the finding (commit referenced for
+  the fixed parts).
 - **Pending** — verified by reading the source *and* reachable on supported
   inputs/platforms; fix recommended, not yet made. The actionable backlog.
 - **Latent** — mechanism verified, but not reachable on today's inputs/config/
@@ -1991,7 +2024,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium | Pending |
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
 | CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
-| N1 | `count_t` saturation mis-ranks long-read hits; unguarded `/0` → `inf`/`nan` | Numerical | Low–Med | High | Medium | Pending |
+| N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths | Numerical | Medium | Medium | Low–Med | Latent |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
