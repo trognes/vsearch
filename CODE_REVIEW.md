@@ -82,14 +82,19 @@ copy-paste slip. An exhaustive sweep originally found three occurrences:
 
 ### B2. MSA consensus `;length=` reported one too large (off-by-one)
 
+**Status: FIXED (`bb45598`).** `print_consensus_sequence` (`msa.cc`) now passes
+`cons_v.size() - 1`, excluding the `'\0'` terminator slot, so the reported length
+matches the true residue count. Merged via the `bugfixes` branch here and
+upstreamed as PR #629. Original analysis retained below.
+
 `compute_and_print_consensus` (`msa.cc`) sizes `cons_v.resize(conslen + 1)` (the
-last slot is the `'\0'`), but `print_consensus_sequence` (`msa.cc:493`) passes
+last slot is the `'\0'`), but `print_consensus_sequence` (`msa.cc:493`) passed
 `static_cast<int>(cons_v.size())` — i.e. `conslen + 1` — as the **sequence
 length** argument to `fasta_print_general`. Every other caller passes the true
 residue count (e.g. `alignment_length`, `db_getsequencelen`). The sequence body
 is unaffected (it is printed via `"%.*s"`, which stops at the embedded NUL), so
-the only visible effect is the `;length=` field: with `--cluster_* --consout
---lengthout`, each cluster's consensus length is reported one too high.
+the only visible effect was the `;length=` field: with `--cluster_* --consout
+--lengthout`, each cluster's consensus length was reported one too high.
 
 - **Type:** Bug (incorrect output value)
 - **Reachability:** `--consout --lengthout` — every cluster.
@@ -1980,7 +1985,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low | Latent |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (3 sites `310e7de`+`6dbba98`; `rereplicate.cc` sibling `273c40d`) | Bug | Low | Low–Med | Medium | Fixed |
-| B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`) | Bug | Low | Low | Low | Pending |
+| B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`, `bb45598`) | Bug | Low | Low | Low | Fixed |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med | Pending |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med | Latent |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium | Pending |
