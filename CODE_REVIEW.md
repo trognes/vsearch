@@ -1410,6 +1410,47 @@ memory bug:
   reproducibility) · **Criticality:** Low · *verified (logic); (d)/(b) reachable,
   others latent*
 
+### N4. `opt_maxqsize` default caps query abundance at `int_max`; abskew/size-ratio comparison loses precision above 2⁵³
+
+Two entangled issues, surfaced while widening the query abundance to 64-bit
+(the N1(c) batch).
+
+- **(a) `opt_maxqsize` defaults to `int_max`, not `int64_max`** (`vsearch.cc:929`).
+  The sibling abundance limits `opt_maxsize`/`opt_maxuniquesize` default to
+  `int64_max` (no effective cap), but `opt_maxqsize` defaults to `INT_MAX`
+  (~2.1e9) — a leftover from when the query abundance (`qsize`) was `int`. Now
+  that `qsize` is `int64_t`, this default **silently drops every query whose
+  `;size=` exceeds ~2.1e9** from search/usearch_global/chimera, with no message
+  and no user-set `--maxqsize`. Reachable on deeply pooled data; the workaround
+  is to pass an explicit `--maxqsize`. Fix is one line (`int_max` → `int64_max`),
+  **but see (b)** — it un-masks the precision issue below.
+
+- **(b) The abskew / size-ratio comparison is done in `double` and cannot
+  distinguish abundances differing by less than ~1 ULP above 2⁵³.**
+  `searchcore.cc:492–495` evaluates `qsize >= opt_minsizeratio * tsize` and
+  `qsize <= opt_maxsizeratio * tsize` (with `opt_maxsizeratio = 1/abskew`) in
+  `double`. For abundances above 2⁵³ (~9.0e15) an integer `+1` is below double
+  precision, so e.g. a query of `1e16+1` against a parent of `2e16` at
+  `--abskew 2` is treated as exactly half — the parent is wrongly accepted and
+  the query mis-flagged as a chimera. The `frederic-mahe/vsearch-tests`
+  `chimeras_denovo` "distinguish … below DBL_EPSILON" test exercises exactly
+  this (abundances ~2e16) and **only ever passed by accident**: first via 32-bit
+  abundance truncation (pre-N1(c)), then via the `opt_maxqsize = int_max` cap in
+  (a) dropping the high-abundance query before the comparison runs. Fixing (a)
+  removes that cap and exposes (b), so the two must be addressed together.
+
+- **Status:** *not fixed.* (a) was prepared but reverted because it regressed the
+  `chimeras_denovo` DBL_EPSILON test through (b). To fix properly: raise the
+  `opt_maxqsize` default to `int64_max` **and** make the abskew/size-ratio
+  comparison precision-safe above 2⁵³ (cross-multiplied integer form, e.g.
+  `qsize * abskew` vs `tsize`, noting `abskew` may be fractional, or `long double`
+  with its portability caveats), **and** adjust the test, which currently probes
+  beyond-`double` precision that vsearch does not actually provide.
+- **Effort:** (a) Low · (b) Medium · **Impact:** Medium (silent query drop;
+  wrong chimera calls at extreme abundance) · **Criticality:** Low–Medium ·
+  *verified (default mismatch, double-precision mechanism, test dependency)* ·
+  related N1(c).
+
 ---
 
 ## Assertions / NDEBUG
@@ -2055,6 +2096,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
+| N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled) | Numerical | Low/Med | Medium | Low–Med | Pending |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium | Pending |
