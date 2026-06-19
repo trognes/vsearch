@@ -46,12 +46,14 @@ build) — see **"Analysis methods not yet applied"** at the end of this documen
 
 ### B1. `--log` quality-error messages written to `stderr` instead of the log file
 
-**Status: FIXED (all 3 sites).** The `eestats.cc` and `filter.cc` sites were
-corrected in commit `310e7de`; the remaining `fastq_mergepairs.cc` `get_qual()`
-site was fixed in commit `6dbba98` ("Write to logfile instead of stderr in
-fastq_mergepairs.cc"). All three qmin branches now write to `fp_log`. Retained
-here for the record and the E8 dedup note; **no open work** (but see the
-`rereplicate.cc:133` sibling slip below, still open).
+**Status: FIXED (all 3 sites + the `rereplicate.cc` sibling slip).** The
+`eestats.cc` and `filter.cc` sites were corrected in commit `310e7de`; the
+remaining `fastq_mergepairs.cc` `get_qual()` site was fixed in commit `6dbba98`
+("Write to logfile instead of stderr in fastq_mergepairs.cc"). All three qmin
+branches now write to `fp_log`. The `rereplicate.cc` sibling slip was
+subsequently fixed in commit `273c40d` ("Write missing-abundance warning to
+logfile in rereplicate.cc"; merged via PR #16 here and upstreamed as PR #628).
+Retained here for the record and the E8 dedup note; **no open work.**
 
 The "FASTQ quality value below qmin" fatal-error branch re-emits to `stderr`
 from inside an `if (fp_log != nullptr)` guard, instead of writing to `fp_log`.
@@ -72,10 +74,11 @@ copy-paste slip. An exhaustive sweep originally found three occurrences:
   a shared quality-check helper (see E8) would collapse this to one point of
   correctness. The upstream fix patched two sites independently rather than
   introducing such a helper, so the duplication (and the third site) persists.
-- **Related slip (Tier-3 audit):** `rereplicate.cc:133` writes a WARNING to
-  `stderr` from inside the `if (fp_log != nullptr)` log branch — the same
-  `stderr`-instead-of-`fp_log` copy-paste pattern as B1 (the message is then
-  missing from the log and duplicated on `stderr`). One-token fix, same class.
+- **Related slip (Tier-3 audit) — FIXED (`273c40d`):** `rereplicate.cc:133` wrote
+  a WARNING to `stderr` from inside the `if (fp_log != nullptr)` log branch — the
+  same `stderr`-instead-of-`fp_log` copy-paste pattern as B1 (the message was
+  missing from the log and duplicated on `stderr`). Corrected to write to
+  `fp_log`; same one-token class as the three qmin sites above.
 
 ### B2. MSA consensus `;length=` reported one too large (off-by-one)
 
@@ -1976,7 +1979,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low | Latent |
-| B1 | `--log` qmin message → `stderr` not `fp_log` (all 3 sites, `310e7de`+`6dbba98`) | Bug | Low | Low–Med | Medium | Fixed |
+| B1 | `--log` qmin message → `stderr` not `fp_log` (3 sites `310e7de`+`6dbba98`; `rereplicate.cc` sibling `273c40d`) | Bug | Low | Low–Med | Medium | Fixed |
 | B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`) | Bug | Low | Low | Low | Pending |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med | Pending |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med | Latent |
