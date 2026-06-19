@@ -1284,6 +1284,31 @@ same pattern at algorithm sites the original list didn't enumerate.)
 
 #### (b2) Alignment counters are `unsigned short` — wrap on long alignment paths (N2)
 
+**Status: FIXED (`3b1ee82` + `677b2ee` + `be53758` + `54d18f6`).** Rather than
+widening the counters, the fix bounds what the SIMD aligner accepts: a new
+`search16_fits(qlen, dlen)` helper requires `qlen + dlen ≤ 65535` (so the path
+length can never exceed the 16-bit counters) **in addition to** the existing
+`qlen * dlen ≤ 25e6` product limit, diverting any pair that exceeds either to the
+linear-memory aligner (`linmemalign`, which already reports `int64` statistics).
+The `qlen == 0` truncation is fixed the same way — an over-long empty-query target
+is diverted to `linmemalign` instead of being written into the `unsigned short`
+outputs. Three follow-up commits also widened the aligner's own `int`
+length-arithmetic to 64-bit (`dirbuffersize = qlen*maxdlen*4`, the `16*qlen`
+backtrack index and fill-loop pointer advance, and the `hearray` allocation) —
+latent today but would bite if the product limit were raised. Merged via the
+`bugfixes` branch.
+
+**Reachability refinement.** The original "`qlen=1, dlen=25e6` wraps `aligned`"
+example does not actually trigger: `usearch_global` uses free end-gaps, so the
+unaligned target tail is a *terminal* gap that is **not** counted, and optimal
+alignment minimises columns — so in the SIMD regime (product ≤ 25e6) the counter
+stays well bounded and the wrap is not observably reachable on the search path.
+This is therefore verified **hardening / defense-in-depth** plus the real
+`qlen == 0` truncation fix, not a demonstrated-output bug — consistent with the
+Latent rating. (Verified: pre/post-fix binaries byte-identical on normal
+search / cluster / allpairs / alnout; the sum-guard divert case is
+behaviour-preserving — SIMD and `linmemalign` agree.)
+
 Distinct from (a)'s `count_t`: the per-alignment counters `aligned`, `matches`,
 `mismatches`, `gaps` in `backtrack16` (`align_simd.cc:995–998`) are
 `unsigned short`, the `search16` output parameters are `unsigned short *`
@@ -1300,11 +1325,14 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
 - **Reachability:** a very short query (1–few nt) vs a long target (path length
   > 65 535) under the product cap — `usearch_global`/`allpairs_global` with a
   1-mer query, or a pathological cluster input. Latent (degenerate lengths).
-- **Fix:** widen the counters, the `search16` `p*` output params, and the
-  `searchcore` lists to `uint32_t`/`int64_t` (an API-surface change, ~5 sites),
-  or saturate at 65535 with downstream awareness.
-- **Effort:** Medium · **Impact:** Medium (wrong stats, no crash) · **Criticality:**
-  Low–Medium · *verified (16-bit end-to-end); trigger latent* · distinct from N1(a).
+- **Fix (applied):** sum guard + `linmemalign` divert (see Status above), keeping
+  the counters 16-bit rather than widening the `search16` API. The alternative —
+  widening the counters / `p*` output params / `searchcore` lists to
+  `uint32_t`/`int64_t` — was not taken; bounding the input is smaller and reuses
+  the existing fallback.
+- **Effort:** Low (applied) · **Impact:** Medium (wrong stats, no crash) ·
+  **Criticality:** Low–Medium · *verified (fix + behaviour-preserving); wrap not
+  observably reachable on the search path* · distinct from N1(a).
 
 #### (c) Accumulator widths — mostly safe, recorded for completeness
 
@@ -2025,7 +2053,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
 | CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
-| N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths | Numerical | Medium | Medium | Low–Med | Latent |
+| N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
@@ -2069,9 +2097,10 @@ for a scientific tool, and invisible without reference-output regression.
 - **N1(b)** — secondary output fields (qcov, tcov, LCA, ee stats, masked %) divide
   without a zero guard → `inf`/`nan` emitted on empty/zero-length/degenerate
   records. One guarded-divide helper.
-- **N2** — alignment counters (`aligned`/`matches`/`mismatches`/`gaps`) are
-  `unsigned short` and wrap on long alignment paths (short query vs long target,
-  within the product cap) → wrong reported alignment statistics.
+- **N2** — *FIXED* (`3b1ee82` et al.): alignment counters (`aligned`/`matches`/
+  `mismatches`/`gaps`) are `unsigned short` and could wrap on long alignment paths;
+  addressed by a sum guard that diverts oversized pairs to `linmemalign` (plus the
+  `qlen==0` fix and 64-bit length arithmetic). Hardening — see the N2 finding.
 - **N3** — RNG reproducibility: `--randseed` truncated to 32 bits and global RNG
   state is not thread-safe, so seeded runs are **not reproducible under threads** —
   a real reproducibility problem for subsample/shuffle/bootstrap.
