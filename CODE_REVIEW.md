@@ -255,8 +255,8 @@ itself is correct; only the print interface narrows.
 - **Additional sites (Tier-1 audit):** `fasta.cc:417, 426, 452–456, 459–472`,
   `fastq.cc:659–675, 764–765`, `fasta2fastq.cc:110–114`. The same narrowing also
   occurs on the *storage* side in the DB index struct — see the N1(c) note on
-  `seqinfo_s.seqlen`/`headerlen` being `unsigned int` with an unbounded
-  `opt_maxseqlength`.
+  `seqinfo_s.seqlen`/`headerlen` being `unsigned int`; `opt_maxseqlength` is now
+  bounded to `UINT32_MAX` (`749b439`), though those fields stay `unsigned int`.
 - **Additional sites (Tier-2 audit) — with a write-overflow twist:** the library
   search entry points narrow `std::strlen(query_head)` to `int head_len`
   (`search.cc:1081` `search_session_single`, `search.cc:1244`
@@ -1344,16 +1344,21 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
   abundance above `UINT_MAX` (~4.29e9) silently wraps, and a negative value
   becomes large-positive; the sort comparators compare the 32-bit field.
   Reachable only with a `;size=` (or summed) abundance above ~4.29 billion on a
-  single sequence — realistic only on very large pooled datasets. Fix: widen
-  `seqinfo_s.size` to `uint64_t` (matches the return type and the `int64_t`
-  source). *verified.*
+  single sequence — realistic only on very large pooled datasets. **FIXED
+  (`a7d7a0e`):** `seqinfo_s.size` widened to `uint64_t` (matching the return type
+  and the `int64_t` source); it fits the struct's existing tail padding, so
+  `sizeof(seqinfo_s)` is unchanged. *verified.*
 - **Per-record lengths** `seqinfo_s.seqlen` / `headerlen` are likewise
   `unsigned int` (`db.h:72–73`); `db_add` stores `size_t` lengths into them, and
   `opt_maxseqlength` has **no upper bound** (only `< 1` is rejected,
   `vsearch.cc:5092`). A single record > `UINT_MAX` (~4 GB) with `--maxseqlength`
   raised above it truncates `seqlen`, which then feeds k-mer indexing,
   alignment, and `%.*s` output — same class as **S5**, distinct site (the DB
-  index struct + the unbounded option). Gated on >4 GB input. *verified.*
+  index struct + the unbounded option). Gated on >4 GB input. **Partially FIXED
+  (`749b439`):** `--maxseqlength` above `UINT32_MAX` is now rejected, so the
+  option can no longer push `seqlen` past the field width; the `seqlen` /
+  `headerlen` fields themselves remain `unsigned int`, so a >4 GB single record
+  arriving from input still truncates (the S5 class). *verified.*
 - **Abundance narrowed *below* the 32-bit storage (Tier-3 audit).** Two sites
   narrow the `int64_t` abundance even further, to `int`, before use — diverging
   from their siblings: `derep_smallmem.cc:390` (`int const abundance =
@@ -1364,8 +1369,18 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
   mass_total` accumulate (`subsample.cc:383`). `rereplicate.cc:110` likewise casts
   the cumulative `int64_t n_reads` to `int` for the output ordinal → wraps past
   2³¹ on very large re-replications. Reachable with `;size=` annotations above
-  the relevant bound (the regime N1(c) already concerns). Fix: keep these
-  `int64_t`/`uint64_t`.
+  the relevant bound (the regime N1(c) already concerns). **FIXED:**
+  `derep_smallmem` reads the abundance as `int64_t` directly (`0eb7f24`); the
+  subsample deck is now `std::vector<uint64_t>` (`80af472`); and the rereplicate
+  ordinal stays `int64_t` end-to-end (`31a4d30`).
+- **Query abundance and `;size=` / `;centroid_size=` / `;seqs=` output — FIXED
+  in the same batch.** `searchinfo_s.qsize` and `chimera_info_s.query_size`
+  widened to `int64_t` (`350c7fe`); the query-abundance reads and the public
+  library API widened to `int64_t` (`8c28156`, ABI bumped 0.1.0 → 0.2.0); and the
+  abundance / centroid-size / cluster-size output fields print at full 64-bit
+  width (`31a4d30` / `344a091` / `b423c3c`). Together with the size-ratio
+  precision fix (N4, `4dbf556`) this completes 64-bit abundance handling across
+  storage → filtering → output.
 - **Statistics sums** (`sum_error_probabilities`, `sumee_length_table`,
   `qsum`) are `double` (`fastq_stats.cc:302–304`): no integer overflow, but
   floating-point summation drifts on very large inputs (a precision, not
@@ -1374,9 +1389,13 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
 
 - **Overall — Effort:** Low–Medium · **Impact:** High (a) / Medium (b) ·
   **Criticality:** Medium
-- **Status:** *verified (types, guards, overflow mechanism); the wrong-output
-  consequences are by construction and want a reference-output regression to pin
-  down exact thresholds*
+- **Status:** **Largely FIXED** by the PR #22 64-bit-abundance batch — storage
+  truncation (`a7d7a0e`), the sub-32-bit narrowings (`0eb7f24` / `80af472` /
+  `31a4d30`), query-abundance and library-API widening (`350c7fe` / `8c28156`),
+  the 64-bit output fields (`344a091` / `b423c3c`), and the `--maxseqlength`
+  bound (`749b439`); the size-ratio precision half is N4 (`4dbf556`). *Remaining
+  here:* `seqlen` / `headerlen` stay `unsigned int` (S5 class, >4 GB single
+  record) and the `double` statistics sums are a precision-only note.
 
 ### N3. RNG quality, reproducibility, and reentrancy (Tier-5)
 

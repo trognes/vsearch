@@ -146,17 +146,32 @@ parsers (UDB/SFF), the search/cluster hit handling, or the library lifecycle.
 
 ## Contributing a fix upstream
 
-This is a development fork; upstream is `torognes/vsearch`. The fork carries
-commits that must **never** go upstream — `CODE_REVIEW.md`, `CLAUDE.md`,
-`.clang-tidy`, and the fork-only CI workflows
-(`.github/workflows/{sanitizers,valgrind,static-analysis,codeql}.yml`). So you
-never merge a whole fork branch upstream; you lift the individual fix commit(s)
-onto a branch based on upstream's tip and open a PR with exactly that diff.
+This is a development fork; upstream is `torognes/vsearch`. The fork keeps a
+small set of files that must **never** go upstream — `CODE_REVIEW.md`,
+`CLAUDE.md`, `.clang-tidy`, and the fork-only CI workflows
+(`.github/workflows/{sanitizers,valgrind,static-analysis,static-analysis-clang-tidy,codeql}.yml`).
+So you never merge a whole fork branch upstream; you lift the individual fix
+commit(s) onto a branch based on upstream's tip and open a PR with exactly that
+diff.
+
+**Branch layout (important).** `trognes/master` is an **exact mirror of
+`upstream/master`** — it carries *none* of the fork-only files, so it stays a
+clean fast-forward of upstream. All fork work lives on **`trognes/dev`**, which
+is `upstream/dev` plus a single fork-only commit (the docs, `.clang-tidy`, and
+the extra CI workflows). **Develop on `dev`** (or a short-lived branch off it);
+treat `master` as read-only-from-upstream and never commit to it directly.
+Keeping it in sync:
+
+- `master`: `git fetch upstream && git merge --ff-only upstream/master` (no
+  fork commits → pure fast-forward, no force-push).
+- `dev`: `git fetch upstream && git rebase upstream/dev` (re-stacks the lone
+  fork-only commit) then `git push --force-with-lease origin dev`.
 
 **The enabling habit: one fix = one atomic commit** touching only the real
 source files for that fix, with a message written as if addressing upstream.
-Keep edits to the review docs / CI workflows in *separate* commits. When fixes
-are isolated this way, sending one upstream is a single `git cherry-pick`.
+Keep edits to the review docs / CI workflows in *separate* commits (they live on
+`dev` only). When fixes are isolated this way, sending one upstream is a single
+`git cherry-pick`.
 
 ### Division of work (read this first)
 
@@ -168,15 +183,17 @@ reachable. The split is:
 
 | Step | Who |
 |------|-----|
-| Make the fix as one atomic, source-only commit on the dev branch | **Claude** |
+| Make the fix as one atomic, source-only commit on `dev` (or a branch off it) | **Claude** |
 | Push that commit to `trognes/vsearch` and report its SHA | **Claude** |
 | Cherry-pick the commit onto a clean branch based on `upstream/master` | **You** |
 | Build-check, push the clean branch to your fork, open the upstream PR | **You** |
 
-Why you (not Claude) must do the cherry-pick: `trognes/master` itself carries the
-fork-only files above, so any branch built on it would show them in a PR against
-`torognes/master`. A clean upstream diff requires re-basing the lone fix commit
-onto the *real* `upstream/master`, which is only reachable from your machine.
+Why you (not Claude) must do the cherry-pick: the cloud session's git remote
+reaches only `trognes/vsearch`, never `torognes/vsearch`, so Claude can neither
+fetch `upstream/master` nor push/PR there. You cherry-pick the lone fix commit
+onto a clean branch off the real `upstream/master` (reachable only from your
+machine) and open the PR. The fix commit is source-only, so its diff is exactly
+the fix — no review-doc or CI noise rides along.
 
 ### What Claude hands you
 
