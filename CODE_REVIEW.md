@@ -1439,16 +1439,28 @@ Two entangled issues, surfaced while widening the query abundance to 64-bit
   (a) dropping the high-abundance query before the comparison runs. Fixing (a)
   removes that cap and exposes (b), so the two must be addressed together.
 
-- **Status:** *not fixed.* (a) was prepared but reverted because it regressed the
-  `chimeras_denovo` DBL_EPSILON test through (b). To fix properly: raise the
-  `opt_maxqsize` default to `int64_max` **and** make the abskew/size-ratio
-  comparison precision-safe above 2⁵³ (cross-multiplied integer form, e.g.
-  `qsize * abskew` vs `tsize`, noting `abskew` may be fractional, or `long double`
-  with its portability caveats), **and** adjust the test, which currently probes
-  beyond-`double` precision that vsearch does not actually provide.
+- **Status:** **FIXED** (`4dbf556`). Both parts landed together in one commit
+  (they are unseparable — fixing (a) alone regresses the DBL_EPSILON test
+  through (b)):
+  - **(a)** `opt_maxqsize` default raised `int_max` → `int64_max`
+    (`vsearch.cc:929`), matching the `--maxsize`/`--maxuniquesize` defaults.
+  - **(b)** the two size-ratio comparisons now route through a new
+    `abundance_ratio_cmp()` (`searchcore.cc`) that returns the exact sign of
+    `value − ratio·reference`. It keeps the historical `double` comparison while
+    both abundances are below 2⁵³ (where `double` is exact, preserving boundary
+    behaviour for non-dyadic ratios such as `1/9` when `--abskew 9` — the old
+    code accepted the equal case because `double(1/9)·9` rounds up to `1.0`),
+    and switches to exact 128-bit integer arithmetic above 2⁵³, decomposing the
+    stored ratio as `mantissa · 2^exponent` (via `frexp`/`ldexp`) and
+    cross-multiplying in `unsigned __int128` with a per-bit overflow guard.
+  - The `chimeras_denovo` test is unchanged and now passes **for the right
+    reason**: the FLT/DBL_EPSILON "distinguish" cases plus the abskew
+    greater/equal/smaller boundary cases all pass (full suite 297/297). The
+    chosen 2⁵³ threshold means the *only* behaviour change versus the old code
+    is at abundances above 2⁵³, exactly where `double` was already wrong.
 - **Effort:** (a) Low · (b) Medium · **Impact:** Medium (silent query drop;
   wrong chimera calls at extreme abundance) · **Criticality:** Low–Medium ·
-  *verified (default mismatch, double-precision mechanism, test dependency)* ·
+  *verified (unit-checked sign table + full `chimeras_denovo` suite)* ·
   related N1(c).
 
 ---
@@ -2096,7 +2108,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
-| N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled) | Numerical | Low/Med | Medium | Low–Med | Pending |
+| N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled; exact 128-bit cmp + int64_max default, `4dbf556`) | Numerical | Low/Med | Medium | Low–Med | Fixed |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium | Pending |
