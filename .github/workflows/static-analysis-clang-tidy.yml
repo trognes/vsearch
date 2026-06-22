@@ -1,0 +1,74 @@
+name: Static analysis (clang-tidy)
+
+on:
+  schedule:
+    # Weekly (Monday 03:37 UTC). clang-tidy's clang-analyzer-* checks are slow
+    # per file and the job needs a full build to produce a compile database, so
+    # it runs on a schedule / on demand rather than on every push or PR. The
+    # cheap cppcheck half runs per-PR in static-analysis.yml.
+    - cron: "37 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  clang-tidy:
+
+    runs-on: ubuntu-latest
+
+    # Non-gating inventory, mirroring the sanitizers job. Findings are
+    # summarized below and triaged into CODE_REVIEW.md by hand; flip to gating
+    # once the backlog is cleared.
+    continue-on-error: true
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          bear clang-tidy ghostscript groff libbz2-dev zlib1g-dev
+
+    # clang-tidy needs a compilation database. Generate it with bear by
+    # observing a normal build, then run the bug-only check set from .clang-tidy.
+    - name: Build (generate compile_commands.json)
+      run: |
+        ./autogen.sh
+        ./configure CFLAGS="-O2" CXXFLAGS="-O2"
+        bear -- make ARFLAGS="cr" -j"$(nproc)"
+
+    - name: clang-tidy
+      run: |
+        # Analyze the project's own .cc/.c translation units, one clang-tidy
+        # process per core. clang-tidy's clang-analyzer-* checks are slow per
+        # file, so a sequential loop over ~132 units dominates the job; xargs
+        # -P fans them out. Each file writes its own log to avoid interleaved
+        # appends, then the logs are concatenated.
+        grep -oE '"file": "[^"]+\.(cc|c)"' compile_commands.json \
+          | sed 's/"file": "//; s/"$//' | sort -u > tidy-files.txt
+        echo "translation units: $(wc -l < tidy-files.txt)"
+        mkdir -p .tidy-out
+        xargs -a tidy-files.txt -P"$(nproc)" -I{} \
+          sh -c 'clang-tidy -p . "$1" 2>/dev/null > ".tidy-out/$(echo "$1" | tr "/" "_").log" || true' _ {}
+        cat .tidy-out/*.log > clang-tidy.txt
+        echo "clang-tidy warning lines: $(grep -c 'warning:' clang-tidy.txt || true)"
+
+    - name: Upload raw logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: static-analysis-clang-tidy-logs
+        path: clang-tidy.txt
+
+    - name: Summarize findings
+      if: always()
+      run: |
+        set +e
+        {
+          echo "## clang-tidy inventory"
+          echo
+          echo "### warnings by check id (top 30)"
+          echo '```'
+          grep -oE '\[[a-z]+-[a-z0-9.-]+\]$' clang-tidy.txt | sort | uniq -c | sort -rn | head -30
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"

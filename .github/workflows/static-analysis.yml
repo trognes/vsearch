@@ -1,0 +1,64 @@
+name: Static analysis (cppcheck)
+
+on:
+  push:
+    branches: [ "master", "dev" ]
+  pull_request:
+    branches: [ "master", "dev" ]
+  workflow_dispatch:
+
+jobs:
+  cppcheck:
+
+    runs-on: ubuntu-latest
+
+    # Non-gating inventory. cppcheck parses the sources directly (no build), so
+    # it is cheap enough to run on every push/PR for fast per-change signal.
+    # The slower clang-tidy half lives in static-analysis-clang-tidy.yml, which
+    # runs weekly / on demand instead of per-PR.
+    continue-on-error: true
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cppcheck
+
+    # cppcheck needs no build; it parses the sources directly.
+    - name: cppcheck
+      run: |
+        cppcheck \
+          --enable=warning,performance,portability \
+          --std=c++11 --language=c++ \
+          --suppress=missingIncludeSystem \
+          --inline-suppr --quiet \
+          -j"$(nproc)" \
+          -I src -I src/utils src 2> cppcheck.txt || true
+        echo "cppcheck findings: $(wc -l < cppcheck.txt)"
+
+    - name: Upload raw logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: static-analysis-cppcheck-logs
+        path: cppcheck.txt
+
+    - name: Summarize findings
+      if: always()
+      run: |
+        set +e
+        {
+          echo "## cppcheck inventory"
+          echo
+          echo "### findings by check id"
+          echo '```'
+          grep -oE '\[[a-zA-Z0-9_]+\]' cppcheck.txt | sort | uniq -c | sort -rn
+          echo '```'
+          echo "### error-severity findings"
+          echo '```'
+          grep -E 'error:' cppcheck.txt | sort -u
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"
