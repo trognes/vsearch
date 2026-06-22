@@ -1164,6 +1164,48 @@ candidates for ThreadSanitizer):
   under threading) · **Criticality:** Medium · *not yet analysed — flagged as a
   method gap, see "Analysis methods not yet applied"* · cross-ref E4, L1, L2(d).
 
+### CC2. `fastq_mergepairs` calls `std::exit()` from a worker thread → intermittent crash
+
+`get_qual()` (`fastq_mergepairs.cc:268`) validates each quality symbol and, on an
+out-of-range value, prints a fatal message and calls `exit(EXIT_FAILURE)`
+directly (qmin branch ~`288`, qmax branch ~`311`). It runs deep inside the worker
+pool: `pair_worker` (`~1232`, the thread body) → `chunk_perform_process`
+(`~1210`) → `process()` (`~922`) → `get_qual()` (called at `~953` and `~974`).
+
+So a worker thread can call `std::exit()` **while sibling workers are still
+alive** — some blocked in `cond_chunks.wait()`, others actively running
+`chunk_perform_process` and touching the shared output `FILE*`s and counters.
+`std::exit()` does not join those threads; it runs stdio flush/close and static
+destructors concurrently with them. That is a data race on the streams/globals
+being torn down. On glibc/Linux it happens to be benign; on FreeBSD (clang + the
+QEMU CI guest) it intermittently faults with **SIGILL** ("Illegal instruction").
+
+- **How it surfaced:** the `frederic-mahe/vsearch-tests` FreeBSD CI job, once it
+  could run to completion (see the FreeBSD CI-hang fix), showed an intermittent
+  `Illegal instruction (core dumped)` on the qmax/qmin tests, e.g.
+  `vsearch --fastq_mergepairs <(printf "@s\nA\n+\nJ\n") --reverse <(printf "@s\nT\n+\nJ\n") --fastq_qmax 40 --fastaout /dev/null`.
+  A rerun passed, confirming it is timing-dependent (a thread race), not a
+  deterministic miscompile. Native (gcc) Linux/macOS jobs stay green.
+  The visible failing assertion was `fastq_mergepairs writes the below-qmin fatal
+  error to the log file`: the crash can pre-empt the `fp_log` flush, so the
+  message never reaches `--log -`.
+- **Note:** `fastq_mergepairs.cc:244` already documents a *partial* mitigation of
+  this hazard — `mutex_chunks`/`cond_chunks` were made locals of `pair_all()` so
+  `std::exit()` cannot destroy a condition variable with waiters present. That
+  covers only the condvar; it does not stop the broader stdio/static teardown
+  from racing live threads, which is the remaining defect here.
+- **Suggested fix:** do not `exit()` from a worker. In `get_qual()`'s
+  out-of-range branches, record the error (offending value + which limit) and
+  signal the pool to stop, let `ThreadRunner` **join** every worker, then call
+  `fatal()` from the main thread after the join, so teardown is single-threaded
+  and the log message flushes reliably. Audit `process()` for any other
+  `fatal()`/`exit()` reachable from a worker and route them the same way.
+- **Type:** Concurrency (data race at `exit()`; intermittent crash) ·
+  **Effort:** Medium · **Impact:** Medium (crash instead of clean error message;
+  worse under the library API, where a worker `exit()` kills the host process) ·
+  **Criticality:** Medium · cross-ref CC1, B1, the `fatal()`→`exit()` discussion
+  under the error-handling section.
+
 ## Numerical correctness
 
 ### N1. Silent numerical-correctness issues (wrong results, no crash)
@@ -2124,6 +2166,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium | Pending |
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
 | CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
+| CC2 | `fastq_mergepairs` `get_qual()` calls `std::exit()` from a worker thread → intermittent crash (SIGILL on FreeBSD CI) | Concurrency | Medium | Medium | Medium | Confirmed (intermittent) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
