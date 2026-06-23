@@ -3,6 +3,10 @@ name: Build release binaries for all platforms
 on:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ubuntu:
     runs-on: ubuntu-latest
