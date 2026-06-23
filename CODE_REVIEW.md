@@ -2118,6 +2118,12 @@ and low risk; listed for completeness only.
 
 ### E11. Checked-in generated `src/Makefile.in` is stale (lists removed `utils/xpthread`)
 
+**Status: FIXED (`e2ca3cc`).** The checked-in generated files (`Makefile.in`,
+`config.h.in`, `configure`, `src/Makefile.in`) were regenerated; `src/Makefile.in`
+now lists `utils/threads` and no longer references `utils/xpthread`, so a plain
+`configure && make` from a fresh checkout works again. Retained below for the
+record.
+
 The committed `src/Makefile.in` still references `utils/xpthread.cpp` /
 `utils/xpthread.hpp` / `utils/xpthread.o`, but those were renamed to
 `utils/threads.hpp` (the `ThreadRunner` used by `fastq_mergepairs.cc` and the
@@ -2212,7 +2218,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | E8 | Shared `struct Scoring` initializer | Enhancement | Low | Low–Med | Low | Pending |
 | E9 | Remove dead/debug code | Enhancement | Low | Low | Low | Pending |
 | E10 | Deduplicate license headers | Enhancement | Low | Low | Low | Pending |
-| E11 | Stale checked-in `src/Makefile.in` (lists removed `utils/xpthread`); refresh or untrack | Enhancement | Low | Low | Low | Pending |
+| E11 | Stale checked-in `src/Makefile.in` (lists removed `utils/xpthread`); refresh or untrack | Enhancement | Low | Low | Low | Fixed (`e2ca3cc`) |
 
 ## Suggested sequencing
 
