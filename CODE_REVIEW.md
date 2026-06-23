@@ -1166,6 +1166,16 @@ candidates for ThreadSanitizer):
 
 ### CC2. `fastq_mergepairs` calls `std::exit()` from a worker thread → intermittent crash
 
+**Status: FIXED (`de99570`).** Both worker-thread `std::exit()` sites
+(`get_qual()` and the "More forward reads than reverse reads" check in
+`read_pair()`) were converted to a cooperative abort: a worker records the first
+error and sets an `std::atomic<bool>` flag, every worker unwinds its loop, and
+`pair_all()` reports the error and exits from the main thread after the
+`ThreadRunner` join — so stdio/static teardown is single-threaded and the
+message reliably reaches `--log`. Verified with a multi-threaded stress loop and
+a clean ThreadSanitizer run on both the abort and normal paths. The diagnosis is
+retained below for the record.
+
 `get_qual()` (`fastq_mergepairs.cc:268`) validates each quality symbol and, on an
 out-of-range value, prints a fatal message and calls `exit(EXIT_FAILURE)`
 directly (qmin branch ~`288`, qmax branch ~`311`). It runs deep inside the worker
@@ -2166,7 +2176,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium | Pending |
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
 | CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
-| CC2 | `fastq_mergepairs` `get_qual()` calls `std::exit()` from a worker thread → intermittent crash (SIGILL on FreeBSD CI) | Concurrency | Medium | Medium | Medium | Confirmed (intermittent) |
+| CC2 | `fastq_mergepairs` `get_qual()` calls `std::exit()` from a worker thread → intermittent crash (SIGILL on FreeBSD CI) | Concurrency | Medium | Medium | Medium | Fixed (`de99570`) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
