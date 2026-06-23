@@ -2116,6 +2116,25 @@ and low risk; listed for completeness only.
 
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low
 
+### E11. Checked-in generated `src/Makefile.in` is stale (lists removed `utils/xpthread`)
+
+The committed `src/Makefile.in` still references `utils/xpthread.cpp` /
+`utils/xpthread.hpp` / `utils/xpthread.o`, but those were renamed to
+`utils/threads.hpp` (the `ThreadRunner` used by `fastq_mergepairs.cc` and the
+other threaded commands). Building straight from the checked-in `Makefile.in`
+therefore fails with `No rule to make target 'utils/xpthread.cpp'`. It is
+harmless in practice because the documented build runs `./autogen.sh` first,
+which regenerates `Makefile.in` from `src/Makefile.am` (the source of truth,
+which is correct) before `configure`/`make`. Still, the checked-in generated
+file should be refreshed (or dropped from version control) so a plain
+`configure && make` from a fresh checkout works and the tracked artifact
+matches `Makefile.am`.
+
+- **Type:** Enhancement (build hygiene; stale generated artifact)
+- **Effort:** Low · **Impact:** Low · **Criticality:** Low
+- **Note:** surfaced while building the CC2 fix — reverting the regenerated
+  `Makefile.in` to its committed (stale) version broke an incremental build.
+
 ---
 
 ## Summary table
@@ -2193,6 +2212,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | E8 | Shared `struct Scoring` initializer | Enhancement | Low | Low–Med | Low | Pending |
 | E9 | Remove dead/debug code | Enhancement | Low | Low | Low | Pending |
 | E10 | Deduplicate license headers | Enhancement | Low | Low | Low | Pending |
+| E11 | Stale checked-in `src/Makefile.in` (lists removed `utils/xpthread`); refresh or untrack | Enhancement | Low | Low | Low | Pending |
 
 ## Suggested sequencing
 
