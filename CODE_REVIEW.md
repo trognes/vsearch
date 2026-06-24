@@ -1216,6 +1216,56 @@ QEMU CI guest) it intermittently faults with **SIGILL** ("Illegal instruction").
   **Criticality:** Medium · cross-ref CC1, B1, the `fatal()`→`exit()` discussion
   under the error-handling section.
 
+### CC3. Threaded commands parse the query file inside a worker → `fatal()`/`std::exit()` from a worker thread on malformed input
+
+The same hazard fixed for `fastq_mergepairs` in CC2 exists in the search-family
+commands, but the offending `exit()` is reached through the **shared FASTA/FASTQ
+parser** rather than command-local code. Each of these worker bodies reads the
+next query inside the thread (under `mutex_input`) via `fastx_next` / `fasta_next`:
+
+| Command | Worker body | Read site |
+|---------|-------------|-----------|
+| `search` (`usearch_global`, `search_global`, …) | `search_thread_run` | `search.cc:417` |
+| `search_exact` | `search_exact_thread_run` | `search_exact.cc:429` |
+| `sintax` | `sintax_thread_run` | `sintax.cc:478` |
+| `uchime_ref` | `chimera_thread_core` | `chimera.cc:2099` |
+
+`fastx_next` → `fastq_next`/`fasta_next`/`fastx_filter_header` call `fatal()`
+(hence `std::exit()`) on malformed input — illegal header character
+(`fastx.cc:198`), truncated/inconsistent record, bad quality line, unparseable
+abundance, etc. When that fires, sibling workers are still running `search_query`
+/ alignment (input lock released) and writing to the shared output `FILE*`s under
+`mutex_output`, so `exit()`'s stdio flush/close and static destruction race the
+live threads — the same data race as CC2. Symptom profile matches: usually benign
+on glibc/Linux, intermittent crash or lost/garbled error message under unlucky
+timing, more likely on FreeBSD.
+
+- **Input-triggered and reachable in practice:** any malformed query FASTA/FASTQ
+  fed to a multi-threaded run (the default) hits this. Unlike CC2 it does not need
+  an out-of-range option value — just a bad record.
+- **Not affected:** `cluster`, `allpairs`, `mask` operate on the database loaded
+  by `db_read` on the main thread (no in-worker file parsing); `orient` reads
+  single-threaded (`orient.cc:217`). `searchcore.cc` has no `fatal()`/`exit()`.
+- **Secondary, lower-severity instances** (worker-reachable but only on memory
+  exhaustion or "can't happen" internal errors, not normal input): aligner OOM
+  (`align_simd.cc:1524`), `search_exact.cc:136` (OOM), `linmemalign.cc:240`
+  (`snprintf` < 0), `chimera.cc:2435` ("Internal error"), and the pervasive
+  `xmalloc`/`xrealloc` → `fatal()` (`arch.cc`) reachable from any worker
+  allocation.
+- **Why harder than CC2:** in CC2 the `exit()` calls were command-local, so a
+  cooperative-abort flag was a contained fix. Here the `exit()` lives in the
+  shared parser, which many single-threaded callers use correctly. A fix needs
+  the parser to *signal* a recoverable error (at least on the threaded path)
+  rather than `exit()` in place — then each worker can record + flag + stop and
+  the main thread reports/`exit()`s after the `ThreadRunner` join. That overlaps
+  the broader `fatal()`→`exit()` architecture issue (L1) and the data-race
+  surface (CC1).
+- **Type:** Concurrency (data race at `exit()`; intermittent crash / lost error
+  message) · **Effort:** Medium–High (touches the shared parser) · **Impact:**
+  Medium (crash or dropped error on malformed input; worse under the library API,
+  where a worker `exit()` kills the host process) · **Criticality:** Medium ·
+  cross-ref CC1, CC2, L1.
+
 ## Numerical correctness
 
 ### N1. Silent numerical-correctness issues (wrong results, no crash)
@@ -2202,6 +2252,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
 | CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
 | CC2 | `fastq_mergepairs` `get_qual()` calls `std::exit()` from a worker thread → intermittent crash (SIGILL on FreeBSD CI) | Concurrency | Medium | Medium | Medium | Fixed (`de99570`) |
+| CC3 | `search`/`search_exact`/`sintax`/`uchime_ref` parse the query in-worker; malformed input → `fatal()`/`exit()` from a worker thread (shared parser) | Concurrency | Med–High | Medium | Medium | Open |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
