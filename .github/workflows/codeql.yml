@@ -38,6 +38,11 @@ jobs:
       uses: github/codeql-action/init@v4
       with:
         languages: c-cpp
+        # We drive the build ourselves (autogen/configure/make in the Build
+        # step below), so use the manual build mode. This also makes the
+        # build-mode explicit for CodeQL Action v4, which otherwise reports it
+        # as "undefined" and skips its overlay-database path.
+        build-mode: manual
         # security-extended adds the deeper security queries (taint tracking
         # from file/CLI input to array indices) that target the S1-S4 class of
         # bugs in CODE_REVIEW.md — exactly what sanitizers cannot reach without
