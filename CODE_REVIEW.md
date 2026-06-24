@@ -1218,6 +1218,20 @@ QEMU CI guest) it intermittently faults with **SIGILL** ("Illegal instruction").
 
 ### CC3. Threaded commands parse the query file inside a worker → `fatal()`/`std::exit()` from a worker thread on malformed input
 
+**Status: FIXED (PR #29, commits `82433f9` + `94ae891`).** A deferred-error
+channel was added to the fastx handle (`defer_errors`/`error`/message +
+`fastx_set_deferred_error()`): when enabled, a parse error records its message
+and makes `fastx_next()` return `false` instead of calling `fatal()` from the
+worker. The shared parser sites (`fastx_filter_header`, all `fastq_fatal`
+sites in `fastq_next`, and the `fasta_next`/`fasta_filter_sequence` fatals) defer
+when the flag is set; every other caller keeps the immediate-fatal behavior
+unchanged. `sintax`, `usearch_global`/`search`, `search_exact`, and `uchime_ref`
+enable the flag on their query handle and report any recorded error with
+`fatal()` from the main thread after the `ThreadRunner` join. Verified with
+per-class malformed-input tests, concurrent-abort stress, a clean
+ThreadSanitizer run, and no `vsearch-tests` regressions. The diagnosis is
+retained below for the record.
+
 The same hazard fixed for `fastq_mergepairs` in CC2 exists in the search-family
 commands, but the offending `exit()` is reached through the **shared FASTA/FASTQ
 parser** rather than command-local code. Each of these worker bodies reads the
@@ -2252,7 +2266,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
 | CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
 | CC2 | `fastq_mergepairs` `get_qual()` calls `std::exit()` from a worker thread → intermittent crash (SIGILL on FreeBSD CI) | Concurrency | Medium | Medium | Medium | Fixed (`de99570`) |
-| CC3 | `search`/`search_exact`/`sintax`/`uchime_ref` parse the query in-worker; malformed input → `fatal()`/`exit()` from a worker thread (shared parser) | Concurrency | Med–High | Medium | Medium | Open |
+| CC3 | `search`/`search_exact`/`sintax`/`uchime_ref` parse the query in-worker; malformed input → `fatal()`/`exit()` from a worker thread (shared parser) | Concurrency | Med–High | Medium | Medium | Fixed (PR #29) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
