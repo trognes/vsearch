@@ -1280,6 +1280,34 @@ timing, more likely on FreeBSD.
   where a worker `exit()` kills the host process) · **Criticality:** Medium ·
   cross-ref CC1, CC2, L1.
 
+### CC4. `uchime_ref` reads the query file position under the wrong mutex → data race
+
+**Status: FIXED (`28a25bf`).** The first concrete race surfaced by the new
+ThreadSanitizer lane (CC1). In `chimera_thread_core` (`chimera.cc`), the
+`uchime_ref` path read the query-file progress position with
+`fasta_get_position(query_fasta_h)` while holding `mutex_output` (`chimera.cc`
+~2274), but another worker advances the *same* shared handle in `fasta_next()`
+— which writes `file_position` via `fastx_file_fill_buffer()` (`fastx.cc:673`) —
+while holding `mutex_input`. The two accesses to `file_position` were serialized
+by *different* mutexes, so they raced (clean TSan report: read in
+`fasta_get_position` vs previous write in `fastx_file_fill_buffer`).
+
+Fix: capture the position into a worker-local immediately after `fasta_next()`,
+**under `mutex_input`**, and assign the shared `progress` counter from that local
+under `mutex_output` — matching how `search` and `sintax` already capture
+progress inside the input lock. The reported progress value is unchanged.
+
+- **Pre-existing**, not introduced by CC2/CC3; intermittent (timing-dependent —
+  did not reproduce in local full-suite runs, only in CI once). The structural
+  fix removes it by construction: `file_position` is now only ever read by the
+  worker that holds `mutex_input`.
+- **Note:** this is exactly the kind of finding the TSan lane (CC1) was added to
+  catch. The remaining CC1 candidates (the `scorematrix` init, partly-guarded
+  counters, `si_plus`/`si_minus` save/restore) are still worth a sweep.
+- **Type:** Concurrency (data race) · **Effort:** Low · **Impact:** Medium
+  (silent, and corrupts the progress display at minimum) · **Criticality:**
+  Medium · cross-ref CC1.
+
 ## Numerical correctness
 
 ### N1. Silent numerical-correctness issues (wrong results, no crash)
@@ -2267,6 +2295,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
 | CC2 | `fastq_mergepairs` `get_qual()` calls `std::exit()` from a worker thread → intermittent crash (SIGILL on FreeBSD CI) | Concurrency | Medium | Medium | Medium | Fixed (`de99570`) |
 | CC3 | `search`/`search_exact`/`sintax`/`uchime_ref` parse the query in-worker; malformed input → `fatal()`/`exit()` from a worker thread (shared parser) | Concurrency | Med–High | Medium | Medium | Fixed (PR #29) |
+| CC4 | `uchime_ref` reads query file position under `mutex_output` while another worker writes it under `mutex_input` → data race (found by the TSan lane) | Concurrency | Low | Medium | Medium | Fixed (`28a25bf`) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
