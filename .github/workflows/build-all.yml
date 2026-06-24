@@ -42,7 +42,7 @@ jobs:
         mv bin/${{ matrix.target.bin }} bin/${{ matrix.target.out }}
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: ${{ matrix.target.out }}
         path: bin/${{ matrix.target.out }}
@@ -78,7 +78,7 @@ jobs:
         bin/${{ matrix.target.out }} -v
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: ${{ matrix.target.out }}
         path: bin/${{ matrix.target.out }}
