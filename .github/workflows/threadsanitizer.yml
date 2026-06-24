@@ -1,0 +1,105 @@
+name: ThreadSanitizer
+
+on:
+  push:
+    branches: [ "master", "dev" ]
+  pull_request:
+    branches: [ "master", "dev" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tsan:
+
+    runs-on: ubuntu-latest
+
+    # ThreadSanitizer is mutually exclusive with AddressSanitizer (separate
+    # build/run from the asan-ubsan job). Non-gating for now: the multi-threaded
+    # commands (search, cluster, chimera, sintax, allpairs, fastq_mergepairs)
+    # have a data-race surface that has not been fully audited, so this job
+    # inventories findings without blocking merges. Flip to gating once the
+    # backlog is cleared.
+    continue-on-error: true
+
+    # TSan instrumentation slows the suite down substantially; give it room.
+    timeout-minutes: 60
+
+    env:
+      # -O1 + frame pointers gives readable stack traces.
+      TSAN_FLAGS: "-fsanitize=thread -fno-omit-frame-pointer -g -O1"
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ghostscript groff libbz2-dev zlib1g-dev
+
+    - name: Relax ASLR entropy for the sanitizer runtime
+      run: |
+        # Newer kernels default vm.mmap_rnd_bits high enough that the
+        # sanitizer runtime can fail with "unexpected memory mapping"; lower
+        # it to the value the sanitizer shadow mapping expects. Harmless if
+        # already acceptable.
+        sudo sysctl -w vm.mmap_rnd_bits=28 || true
+
+    - name: Configure (ThreadSanitizer)
+      run: |
+        ./autogen.sh
+        ./configure \
+          CFLAGS="$TSAN_FLAGS" \
+          CXXFLAGS="$TSAN_FLAGS" \
+          LDFLAGS="-fsanitize=thread"
+
+    - name: Build
+      run: |
+        JOBS=$(nproc 2>/dev/null || echo 1)
+        make ARFLAGS="cr" -j$JOBS
+
+    - name: Install tests
+      run: |
+        git clone https://github.com/frederic-mahe/vsearch-tests
+
+    - name: Run tests under ThreadSanitizer (inventory mode, non-blocking)
+      run: |
+        export PATH=$PWD/bin:$PATH
+        # Inventory mode: report every race and keep going (exitcode=0) so the
+        # whole suite runs. history_size raises the chance of a usable second
+        # stack for each race.
+        export TSAN_OPTIONS="halt_on_error=0:exitcode=0:history_size=7:print_stacktrace=1"
+        cd vsearch-tests
+        bash ./run_all_tests.sh > "$GITHUB_WORKSPACE/tsan-run.log" 2>&1 || true
+        echo "Test run finished (non-blocking)."
+
+    - name: Upload ThreadSanitizer log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: tsan-run-log
+        path: tsan-run.log
+
+    - name: Summarize ThreadSanitizer findings
+      if: always()
+      run: |
+        set +e
+        log=tsan-run.log
+        {
+          echo "## ThreadSanitizer findings (inventory)"
+          echo
+          if [ ! -f "$log" ]; then
+            echo "No log produced (an earlier step failed)."
+          else
+            count=$(grep -cE "WARNING: ThreadSanitizer:" "$log")
+            echo "Total ThreadSanitizer warnings: $count"
+            echo
+            echo "### Unique warning kinds"
+            echo '```'
+            grep -hoE "WARNING: ThreadSanitizer: [a-z -]+" "$log" | sort | uniq -c | sort -rn
+            echo '```'
+          fi
+        } | tee -a "$GITHUB_STEP_SUMMARY"
