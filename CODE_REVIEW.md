@@ -1302,11 +1302,40 @@ progress inside the input lock. The reported progress value is unchanged.
   fix removes it by construction: `file_position` is now only ever read by the
   worker that holds `mutex_input`.
 - **Note:** this is exactly the kind of finding the TSan lane (CC1) was added to
-  catch. The remaining CC1 candidates (the `scorematrix` init, partly-guarded
-  counters, `si_plus`/`si_minus` save/restore) are still worth a sweep.
+  catch. The remaining CC1 candidates were then swept (see CC5): the
+  partly-guarded counters and the `si_plus`/`si_minus` save/restore were found
+  safe; the `scorematrix` write was dead and is removed.
 - **Type:** Concurrency (data race) · **Effort:** Low · **Impact:** Medium
   (silent, and corrupts the progress display at minimum) · **Criticality:**
   Medium · cross-ref CC1.
+
+### CC5. CC1 sweep: dead file-scope `scorematrix` write (removed); counters and `si_plus`/`si_minus` confirmed safe
+
+A targeted read of the three remaining CC1 suspects:
+
+- **`scorematrix` (`align_simd.cc`) — FIXED (`15d5490`).** The file-static
+  `scorematrix` array was written by `search16_init()` but **never read** (the
+  aligner uses the per-instance `s->matrix`). The write was dead, and because
+  `search16_init()` runs inside the worker threads on the chimera path
+  (`chimera_thread_init`), multiple workers wrote the shared global
+  concurrently — a latent data race on a value nobody consumes. The global and
+  its lone write were removed; no behavioral change.
+- **Global stats counters (`search.cc`, `chimera.cc`) — safe, no action.** All
+  counter mutations occur under `mutex_output` (search `~461–467`; chimera
+  `~2155–2290`, after the lock at `~2146`); resets happen before the pool
+  starts and the final reads after it joins. Fully guarded — the earlier
+  "partly-guarded" concern is resolved.
+- **`si_plus`/`si_minus` save/restore — safe, no action.** `search`'s batch path
+  uses a per-call local context (`ctx.batch_si_plus`), not the file-static.
+  `cluster_assign_batch` repoints the file-static `si_plus`/`si_minus` only on
+  the main thread (allocate → `threads_wakeup`/`run()` which joins → restore);
+  workers read `si_plus[t]` in between with thread create/join providing
+  happens-before. The only theoretical hazard — two concurrent library sessions
+  — is already serialized by the global session mutex.
+
+- **Type:** Concurrency (one dead-store/latent-race removed; two confirmed
+  safe) · **Effort:** Low · **Impact:** Low–Medium · **Criticality:** Low ·
+  cross-ref CC1, CC4.
 
 ## Numerical correctness
 
@@ -2296,6 +2325,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | CC2 | `fastq_mergepairs` `get_qual()` calls `std::exit()` from a worker thread → intermittent crash (SIGILL on FreeBSD CI) | Concurrency | Medium | Medium | Medium | Fixed (`de99570`) |
 | CC3 | `search`/`search_exact`/`sintax`/`uchime_ref` parse the query in-worker; malformed input → `fatal()`/`exit()` from a worker thread (shared parser) | Concurrency | Med–High | Medium | Medium | Fixed (PR #29) |
 | CC4 | `uchime_ref` reads query file position under `mutex_output` while another worker writes it under `mutex_input` → data race (found by the TSan lane) | Concurrency | Low | Medium | Medium | Fixed (`28a25bf`) |
+| CC5 | CC1 sweep: dead file-scope `scorematrix` write (latent chimera race) removed; counters and `si_plus`/`si_minus` confirmed safe | Concurrency | Low | Low–Med | Low | Fixed (`15d5490`) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
