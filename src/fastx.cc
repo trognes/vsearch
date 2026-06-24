@@ -199,11 +199,12 @@ auto fastx_filter_header(fastx_handle input_handle, bool truncateatspace) -> voi
         /* Record the error and stop scanning instead of exiting here:
            this may run on a worker thread (see the deferred-error note in
            fastx.h). The caller reports it from the main thread. */
-        std::snprintf(input_handle->errmsg.data(), input_handle->errmsg.size(),
+        std::array<char, 256> message {{}};
+        std::snprintf(message.data(), message.size(),
                       "Illegal character encountered in FASTA/FASTQ header.\n"
                       "Unprintable ASCII character no %d on line %" PRIu64 ".",
                       symbol, input_handle->lineno_start);
-        input_handle->error = true;
+        fastx_set_deferred_error(input_handle, message.data());
         return;
       }
       fatal("Illegal character encountered in FASTA/FASTQ header.\n"
@@ -710,6 +711,19 @@ auto fastx_get_error(struct fastx_s const * input_handle) -> bool
 auto fastx_get_errmsg(struct fastx_s const * input_handle) -> char const *
 {
   return input_handle->errmsg.data();
+}
+
+
+auto fastx_set_deferred_error(fastx_handle input_handle, char const * message) -> void
+{
+  /* record the first deferred parse error and flag the handle (see the
+     deferred-error note in fastx.h). First error wins; later ones are
+     ignored so the message reflects the earliest failure. */
+  if (not input_handle->error)
+    {
+      std::snprintf(input_handle->errmsg.data(), input_handle->errmsg.size(), "%s", message);
+      input_handle->error = true;
+    }
 }
 
 
