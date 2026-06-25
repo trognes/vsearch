@@ -1619,8 +1619,11 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
 
 ### N3. RNG quality, reproducibility, and reentrancy (Tier-5)
 
-**Status: Tier-1 hardening FIXED (`dabd467`). Tier-2 modernization in
-progress — (d) FIXED (`853b87a`), (a)/(b) remaining.**
+**Status: FIXED.** Tier-1 hardening (`dabd467`) plus the Tier-2 cross-platform
+RNG overhaul: (a) `f00510b`, (d) `853b87a`, shuffle `976069c`, and the legacy
+helpers removed in `a64929c`. All `--randseed` consumers (sintax, subsample,
+shuffle) now use the in-house reproducible RNG; the C library `random()` path and
+its 32-bit seed truncation are gone, so (a)–(f) are all resolved.
 Tier-1 (no-behavioural-change robustness): (c) generator-range coupling,
 (e) `/dev/urandom` short read, (f) NDEBUG-stripped divide guard — done (per-item
 notes below).
@@ -1639,11 +1642,19 @@ every platform.
   platforms. Verified: `--threads 1` vs `8` byte-identical (sorted), reproducible
   across runs, on a tie-heavy dataset where the draw decides the genus; the old
   binary is non-reproducible across runs there.
-- **(a)/(b) remaining:** `subsample` (`random_ulong`) and `shuffle`
-  (`std::shuffle`) still use the legacy path; they will move onto the same
-  facility (mt19937_64 seeded once + `random_bounded`/`random_shuffle`) in the
-  next steps. (b) is already resolved on the new path (64-bit base seed); the
-  legacy `arch_srandom` truncation persists only for those two until migrated.
+- **(a) FIXED (`f00510b`):** `subsample` now draws from a `std::mt19937_64`
+  seeded once from `random_base_seed()` and sampled with `random_bounded()`
+  (uniform, no overlapping-shift), bit-identical across platforms. Verified:
+  reproducible for a fixed seed, still input-size-dependent, exact sample count.
+- **shuffle FIXED (`976069c`):** seeds its `mt19937_64` from `random_base_seed()`
+  (full 64-bit, no more `unsigned int` truncation) and shuffles with the portable
+  `random_shuffle()` instead of the implementation-defined `std::shuffle`, so the
+  order is identical across platforms for a given seed.
+- **legacy helpers removed (`a64929c`):** `random_int`/`random_ulong`
+  (`util.*`) and `arch_srandom`/`arch_random`/`arch_random_max` (`arch.*`) are
+  deleted, and `random_init()` no longer calls `arch_srandom()`. This removes the
+  last use of the C library `random()`/`srandom()` path, so (b)'s 32-bit
+  `--randseed` truncation no longer exists anywhere.
 
 The shared random-number path has several correctness/quality issues, none a
 memory bug:
@@ -1653,12 +1664,17 @@ memory bug:
   so the shifted terms **overlap** and are XORed — the result is not a uniform
   64-bit value, weakening any consumer needing uniform 64-bit randomness (large
   shuffles). Fix: take non-overlapping low-16-bit slices, or use a real 64-bit PRNG.
+  **FIXED (`f00510b`):** `subsample` (the only `random_ulong` consumer) now uses
+  `std::mt19937_64` + `random_bounded()`; `random_ulong` is left callerless.
 - **(b) `--randseed` is truncated to 32 bits on the shared path.** Stored
   `int64_t` (`vsearch.cc:1976`, no range check) but narrowed to `unsigned int` in
   `arch_srandom` (`arch.cc:177`), so `--randseed 4294967297` ≡ `--randseed 1` —
   two documented seeds silently collide. (Extends the E9 `shuffle.cc`-RNG note to
   the main `arch_srandom` path; `shuffle` additionally uses a *separate*
   `mt19937_64` engine, so the two RNG paths aren't comparable.)
+  **FIXED:** sintax (`853b87a`), subsample (`f00510b`) and shuffle (`976069c`)
+  now seed from the 64-bit `random_base_seed()`, and the legacy `arch_srandom`
+  path that truncated to `unsigned int` was removed entirely (`a64929c`).
 - **(c) `random_int` re-derives the generator range from `RAND_MAX`** in `util.cc`
   while `arch_random` independently wraps `random()`/`rand()` — they agree only by
   coincidence of the platform `RAND_MAX`, a portability/coupling hazard.
@@ -2413,7 +2429,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | CC5 | CC1 sweep: dead file-scope `scorematrix` write (latent chimera race) removed; counters and `si_plus`/`si_minus` confirmed safe | Concurrency | Low | Low–Med | Low | Fixed (`15d5490`) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, verified non-reachable — zero-length seqs not analysed) | Numerical | Low–Med | High | Medium | Fixed (a); (b) non-reachable |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
-| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Tier-1 fixed (`dabd467`); Tier-2: (d) fixed (`853b87a`), (a)/(b) in progress |
+| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Fixed (`dabd467`/`853b87a`/`f00510b`/`976069c`/`a64929c`): in-house cross-platform RNG; legacy path removed |
 | N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled; exact 128-bit cmp + int64_max default, `4dbf556`) | Numerical | Low/Med | Medium | Low–Med | Fixed |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
