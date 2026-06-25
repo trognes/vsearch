@@ -87,8 +87,10 @@ jobs:
         # images and trigger Homebrew tap-trust warnings; we use nothing from
         # them, so drop them before updating/installing. --force is required
         # because azure/bicep has an installed formula (bicep), which a plain
-        # untap refuses to remove.
-        brew untap --force aws/tap azure/bicep 2>/dev/null || true
+        # untap refuses to remove. We keep "|| true" so a no-op untap on a
+        # future image doesn't fail the step, but do NOT silence stderr:
+        # hiding it is what masked the earlier failure to remove azure/bicep.
+        brew untap --force aws/tap azure/bicep || true
         brew update
         brew install autoconf automake ghostscript groff
 
@@ -122,8 +124,10 @@ jobs:
         # images and trigger Homebrew tap-trust warnings; we use nothing from
         # them, so drop them before updating/installing. --force is required
         # because azure/bicep has an installed formula (bicep), which a plain
-        # untap refuses to remove.
-        brew untap --force aws/tap azure/bicep 2>/dev/null || true
+        # untap refuses to remove. We keep "|| true" so a no-op untap on a
+        # future image doesn't fail the step, but do NOT silence stderr:
+        # hiding it is what masked the earlier failure to remove azure/bicep.
+        brew untap --force aws/tap azure/bicep || true
         brew update
         brew install autoconf automake ghostscript groff
 
