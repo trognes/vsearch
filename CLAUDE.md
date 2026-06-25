@@ -146,14 +146,16 @@ user-visible documentation change must be made in *both*:
    source man page (`man/Makefile.am`: `dist_man_MANS = vsearch.1`) and the
    input from which the PDF/HTML manual is generated. Edit the roff directly.
 2. **The per-command markdown system under `man/`** — one page per command in
-   `man/commands/vsearch-<command>.1.md`, format/reference pages in
-   `man/formats/`, the overview/changelog in `man/index.1.md`, and **shared
-   option snippets in `man/commands/fragments/`** that are `#include`d into
-   several command pages (e.g. `option_randseed.md` is used by sintax, shuffle
-   and subsample — edit the fragment once and it propagates). These build into
-   per-command roff pages via `man/scripts/generate_manpage*.sh` using
-   **pandoc** (so a build check needs pandoc installed; em dashes are written
-   `---`).
+   `man/commands/vsearch-<command>.1.md` (section 1), format/reference pages in
+   `man/formats/` (section 5, e.g. fasta/fastq/sam/sff/udb/cigar), topic pages
+   in `man/misc/` (section 7, e.g. `expected_error`, `nucleotides`,
+   `pairwise_alignment_parameters`, `userfields`), the overview/changelog in
+   `man/index.1.md`, and **shared option snippets** in
+   `man/commands/fragments/` (and `man/formats/fragments/`) that are `#include`d
+   into several pages (e.g. `option_randseed.md` is used by sintax, shuffle and
+   subsample — edit the fragment once and it propagates). These build into roff
+   pages via `man/scripts/generate_manpage*.sh` using **pandoc** (so a build
+   check needs pandoc installed; em dashes are written `---`).
 
 When changing option behaviour, update the roff in `vsearch.1` **and** the
 matching markdown — either the per-command `.md` body or the shared
