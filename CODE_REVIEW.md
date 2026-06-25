@@ -1584,17 +1584,31 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
 
 ### N3. RNG quality, reproducibility, and reentrancy (Tier-5)
 
-**Status: Tier-1 hardening FIXED (`dabd467`); Tier-2 modernization deferred.**
-The three no-behavioural-change robustness fixes — (c) generator-range coupling,
-(e) `/dev/urandom` short read, (f) NDEBUG-stripped divide guard — are done (see
-per-item notes below; subsample/sintax output byte-identical pre/post for a fixed
-`--randseed` on Linux). The remaining items — (a) non-uniform 64-bit draw,
-(b) 32-bit seed truncation, (d) non-reentrant global RNG state — are the
-"Tier-2" modernization: they require moving the shared path to `std::mt19937_64`
-(as `shuffle.cc` already does) with per-thread engines and a full 64-bit seed,
-which **changes the random stream** for a given seed and so needs coordinated
-updates to the `frederic-mahe/vsearch-tests` fixtures. Deferred pending a
-decision on that.
+**Status: Tier-1 hardening FIXED (`dabd467`). Tier-2 modernization in
+progress — (d) FIXED (`853b87a`), (a)/(b) remaining.**
+Tier-1 (no-behavioural-change robustness): (c) generator-range coupling,
+(e) `/dev/urandom` short read, (f) NDEBUG-stripped divide guard — done (per-item
+notes below).
+
+Tier-2 (cross-platform reproducible RNG; **changes the random stream** for a
+given seed) introduces a small facility in `util.h`/`util.cc`: a `SplitMix64`
+generator, a 64-bit `random_base_seed()` (set by `random_init()` from
+`opt_randseed` in full, else `std::random_device`), `random_substream_seed()`,
+and `random_bounded()` (Lemire+rejection) / `random_shuffle()` (Fisher-Yates)
+implemented in-house rather than via `std::uniform_int_distribution` /
+`std::shuffle` (both implementation-defined) so a seed gives identical output on
+every platform.
+- **(d) FIXED (`853b87a`):** sintax — the only multi-threaded RNG consumer — now
+  seeds a per-query `SplitMix64` from `(base seed, query number)`, so its
+  classifications are identical for any `--threads` and reproducible across
+  platforms. Verified: `--threads 1` vs `8` byte-identical (sorted), reproducible
+  across runs, on a tie-heavy dataset where the draw decides the genus; the old
+  binary is non-reproducible across runs there.
+- **(a)/(b) remaining:** `subsample` (`random_ulong`) and `shuffle`
+  (`std::shuffle`) still use the legacy path; they will move onto the same
+  facility (mt19937_64 seeded once + `random_bounded`/`random_shuffle`) in the
+  next steps. (b) is already resolved on the new path (64-bit base seed); the
+  legacy `arch_srandom` truncation persists only for those two until migrated.
 
 The shared random-number path has several correctness/quality issues, none a
 memory bug:
@@ -1620,6 +1634,9 @@ memory bug:
 - **(d) Global RNG state is not reentrant/thread-safe.** `srandom`/`random`
   operate on one process-global state; threaded use (search/cluster) gives
   non-deterministic results and breaks `--randseed` reproducibility under threads.
+  **FIXED (`853b87a`):** sintax (the only multi-threaded RNG consumer) uses a
+  per-query `SplitMix64` seeded from `(base, query_no)`, removing the shared
+  state from the threaded path; results are now thread-count-independent.
 - **(e) `arch_srandom` accepts a short read of `/dev/urandom`** — only checks
   `read(...) < 0`, so a partial read leaves the seed partly at its `0` init.
   **FIXED (`dabd467`):** the read now must return `sizeof(seed)` bytes or it is
@@ -1632,7 +1649,8 @@ memory bug:
 
 - **Effort:** Low–Medium · **Impact:** Low–Medium (statistical quality /
   reproducibility) · **Criticality:** Low · *(c)/(e)/(f) fixed (`dabd467`);
-  (a)/(b)/(d) deferred to the Tier-2 RNG modernization (changes the stream)*
+  (d) fixed (`853b87a`); (a)/(b) remaining — subsample/shuffle migration to the
+  new RNG facility (changes the stream)*
 
 ### N4. `opt_maxqsize` default caps query abundance at `int_max`; abskew/size-ratio comparison loses precision above 2⁵³
 
@@ -2360,7 +2378,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | CC5 | CC1 sweep: dead file-scope `scorematrix` write (latent chimera race) removed; counters and `si_plus`/`si_minus` confirmed safe | Concurrency | Low | Low–Med | Low | Fixed (`15d5490`) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
-| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Tier-1 hardening fixed (`dabd467`); Tier-2 modernization deferred |
+| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Tier-1 fixed (`dabd467`); Tier-2: (d) fixed (`853b87a`), (a)/(b) in progress |
 | N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled; exact 128-bit cmp + int64_max default, `4dbf556`) | Numerical | Low/Med | Medium | Low–Med | Fixed |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
