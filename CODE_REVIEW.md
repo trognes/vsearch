@@ -1434,6 +1434,39 @@ fills. Result: a true best hit is silently missed or mis-ranked.
 
 #### (b) Inconsistent division-by-zero guarding in output fields → `inf`/`nan` emitted silently
 
+**Status: VERIFIED NON-REACHABLE (no fix applied).** A degenerate-input run
+(2026-06-25) against every site below failed to float a single user-visible
+`inf`/`nan`. The "silent `inf`/`nan` in output columns" framing is **not borne
+out**: each site is gated by one of three mechanisms, and the root cause is that
+**vsearch does not analyse zero-length sequences** — `db_read` discards any
+record with `length < opt_minseqlength` (`db.cc:265`), and the default is `1`
+(`vsearch.cc:5173`; `32` for the search/cluster/derep family, `vsearch.cc:5168`).
+Per-site verdicts:
+
+- **Dead computes** — `derep.cc:727`, `derep_prefix.cc:383`,
+  `derep_smallmem.cc:511`: `average = sumsize / clusters` is computed even when
+  `clusters == 0`, but it is only *printed* in the `clusters >= 1` branch; the
+  empty path prints "0 unique sequences". The `nan` never reaches output.
+- **Loop-guarded** — `eestats.cc` ratios and `fastq_chars.cc` frequency factor:
+  the divisions live inside per-position / per-character print loops that have
+  zero iterations on empty or all-zero-length input, so they are never
+  evaluated (only headers print).
+- **K-mer-gated** — `results.cc:473/477` (qcov/tcov), `searchcore.cc` /
+  `allpairs.cc` / `cluster.cc` `nwid`, `chimera.cc` `divfrac`: all require an
+  actual hit/alignment, which requires shared k-mers. A zero-length sequence has
+  no k-mers, so it never produces an output row — the division is unreachable.
+- **Comparison-only** — `mask.cc:388` (`unmasked_pct`) and `results.cc:636`
+  (LCA): the quotient feeds only a `<` test, never an output column. And even
+  the `mask.cc` site cannot produce `nan`: its sole caller is `fastx_mask`,
+  which uses the default `minseqlength = 1` and does **not** accept
+  `--minseqlength` (absent from its valid-options list), so `len` is always
+  `>= 1` at line 388.
+
+No code change was made; this entry is retained as a verified-negative so the
+sites are not re-flagged. A defensive guarded-divide helper remains an option if
+the `minseqlength` defaults or the `fastx_mask` option set ever change, but
+there is no reachable bug to fix today.
+
 The primary percent-identity fields are correctly guarded
 (`internal_alignmentlength > 0 ? 100.0 * matches / internal_alignmentlength :
 0.0`, `results.cc:359, 362, 747`). But several secondary/statistics fields
@@ -1462,10 +1495,12 @@ consistent guard), so the reachability of each is edge-case but real. (The
 aligner-side `nwid`/`divfrac` rows were added by the Tier-2 audit; they are the
 same pattern at algorithm sites the original list didn't enumerate.)
 
-- **Fix:** a single guarded-divide helper (`den > 0 ? num/den : 0.0`) applied to
-  the secondary fields, matching the pattern the %id fields already use.
-- **Effort:** Low · **Impact:** Medium · **Criticality:** Low–Medium · *verified
-  (unguarded sites); per-site reachability needs an empty/degenerate-input run*
+- **Fix:** none applied — see the Status note above; all sites are gated and the
+  zero denominator is not reachable with any accepted option combination. A
+  guarded-divide helper (`den > 0 ? num/den : 0.0`) is available as defensive
+  hardening should the `minseqlength` defaults / `fastx_mask` options change.
+- **Effort:** Low (if ever needed) · **Impact:** None observed · **Criticality:**
+  Low · *verified non-reachable via degenerate-input run, 2026-06-25*
 
 #### (b2) Alignment counters are `unsigned short` — wrap on long alignment paths (N2)
 
@@ -2338,7 +2373,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | CC3 | `search`/`search_exact`/`sintax`/`uchime_ref` parse the query in-worker; malformed input → `fatal()`/`exit()` from a worker thread (shared parser) | Concurrency | Med–High | Medium | Medium | Fixed (PR #29) |
 | CC4 | `uchime_ref` reads query file position under `mutex_output` while another worker writes it under `mutex_input` → data race (found by the TSan lane) | Concurrency | Low | Medium | Medium | Fixed (`28a25bf`) |
 | CC5 | CC1 sweep: dead file-scope `scorematrix` write (latent chimera race) removed; counters and `si_plus`/`si_minus` confirmed safe | Concurrency | Low | Low–Med | Low | Fixed (`15d5490`) |
-| N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, pending) | Numerical | Low–Med | High | Medium | Partially fixed |
+| N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, verified non-reachable — zero-length seqs not analysed) | Numerical | Low–Med | High | Medium | Fixed (a); (b) non-reachable |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
 | N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled; exact 128-bit cmp + int64_max default, `4dbf556`) | Numerical | Low/Med | Medium | Low–Med | Fixed |
