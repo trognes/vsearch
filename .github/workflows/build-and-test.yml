@@ -85,8 +85,10 @@ jobs:
       run: |
         # aws/tap and azure/bicep are pre-tapped on the GitHub macOS runner
         # images and trigger Homebrew tap-trust warnings; we use nothing from
-        # them, so drop them before updating/installing.
-        brew untap aws/tap azure/bicep 2>/dev/null || true
+        # them, so drop them before updating/installing. --force is required
+        # because azure/bicep has an installed formula (bicep), which a plain
+        # untap refuses to remove.
+        brew untap --force aws/tap azure/bicep 2>/dev/null || true
         brew update
         brew install autoconf automake ghostscript groff
 
@@ -118,8 +120,10 @@ jobs:
       run: |
         # aws/tap and azure/bicep are pre-tapped on the GitHub macOS runner
         # images and trigger Homebrew tap-trust warnings; we use nothing from
-        # them, so drop them before updating/installing.
-        brew untap aws/tap azure/bicep 2>/dev/null || true
+        # them, so drop them before updating/installing. --force is required
+        # because azure/bicep has an installed formula (bicep), which a plain
+        # untap refuses to remove.
+        brew untap --force aws/tap azure/bicep 2>/dev/null || true
         brew update
         brew install autoconf automake ghostscript groff
 
