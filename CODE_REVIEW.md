@@ -1619,6 +1619,18 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
 
 ### N3. RNG quality, reproducibility, and reentrancy (Tier-5)
 
+**Status: Tier-1 hardening FIXED (`dabd467`); Tier-2 modernization deferred.**
+The three no-behavioural-change robustness fixes — (c) generator-range coupling,
+(e) `/dev/urandom` short read, (f) NDEBUG-stripped divide guard — are done (see
+per-item notes below; subsample/sintax output byte-identical pre/post for a fixed
+`--randseed` on Linux). The remaining items — (a) non-uniform 64-bit draw,
+(b) 32-bit seed truncation, (d) non-reentrant global RNG state — are the
+"Tier-2" modernization: they require moving the shared path to `std::mt19937_64`
+(as `shuffle.cc` already does) with per-thread engines and a full 64-bit seed,
+which **changes the random stream** for a given seed and so needs coordinated
+updates to the `frederic-mahe/vsearch-tests` fixtures. Deferred pending a
+decision on that.
+
 The shared random-number path has several correctness/quality issues, none a
 memory bug:
 - **(a) `random_ulong` builds 64 bits from four overlapping 31-bit draws.**
@@ -1636,18 +1648,26 @@ memory bug:
 - **(c) `random_int` re-derives the generator range from `RAND_MAX`** in `util.cc`
   while `arch_random` independently wraps `random()`/`rand()` — they agree only by
   coincidence of the platform `RAND_MAX`, a portability/coupling hazard.
+  **FIXED (`dabd467`):** `random_int` now reads the bound from a new
+  `arch_random_max()` (`arch.cc`) returning `2^31-1` for the POSIX `random()`
+  backend and `RAND_MAX` for the Windows `rand()` backend. Output unchanged on
+  both; the coupling is explicit.
 - **(d) Global RNG state is not reentrant/thread-safe.** `srandom`/`random`
   operate on one process-global state; threaded use (search/cluster) gives
   non-deterministic results and breaks `--randseed` reproducibility under threads.
 - **(e) `arch_srandom` accepts a short read of `/dev/urandom`** — only checks
   `read(...) < 0`, so a partial read leaves the seed partly at its `0` init.
+  **FIXED (`dabd467`):** the read now must return `sizeof(seed)` bytes or it is
+  treated as a failure.
 - **(f) `random_int`/`random_ulong` guard `upper_limit != 0` only with an
   NDEBUG-stripped `assert`** (`util.cc:256, 274`) → `% 0` if a zero ever reaches
   them; current callers pass non-zero, so latent (A1 class).
+  **FIXED (`dabd467`):** both asserts replaced with a `fatal()` guard that holds
+  in the default `-DNDEBUG` build.
 
 - **Effort:** Low–Medium · **Impact:** Low–Medium (statistical quality /
-  reproducibility) · **Criticality:** Low · *verified (logic); (d)/(b) reachable,
-  others latent*
+  reproducibility) · **Criticality:** Low · *(c)/(e)/(f) fixed (`dabd467`);
+  (a)/(b)/(d) deferred to the Tier-2 RNG modernization (changes the stream)*
 
 ### N4. `opt_maxqsize` default caps query abundance at `int_max`; abskew/size-ratio comparison loses precision above 2⁵³
 
@@ -2375,7 +2395,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | CC5 | CC1 sweep: dead file-scope `scorematrix` write (latent chimera race) removed; counters and `si_plus`/`si_minus` confirmed safe | Concurrency | Low | Low–Med | Low | Fixed (`15d5490`) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, verified non-reachable — zero-length seqs not analysed) | Numerical | Low–Med | High | Medium | Fixed (a); (b) non-reachable |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
-| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Pending |
+| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Tier-1 hardening fixed (`dabd467`); Tier-2 modernization deferred |
 | N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled; exact 128-bit cmp + int64_max default, `4dbf556`) | Numerical | Low/Med | Medium | Low–Med | Fixed |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
