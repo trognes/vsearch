@@ -85,12 +85,16 @@ jobs:
       run: |
         # aws/tap and azure/bicep are pre-tapped on the GitHub macOS runner
         # images and trigger Homebrew tap-trust warnings; we use nothing from
-        # them, so drop them before updating/installing. --force is required
-        # because azure/bicep has an installed formula (bicep), which a plain
-        # untap refuses to remove. We keep "|| true" so a no-op untap on a
-        # future image doesn't fail the step, but do NOT silence stderr:
-        # hiding it is what masked the earlier failure to remove azure/bicep.
-        brew untap --force aws/tap azure/bicep || true
+        # them, so remove them before updating/installing. azure/bicep ships an
+        # installed formula (bicep): uninstall it first so the tap untaps
+        # cleanly without --force (which would itself print a warning). Each
+        # step is guarded so it stays quiet and non-fatal on a future image
+        # that no longer has these taps/formulae. We do NOT silence stderr of
+        # the actual operations: hiding it is what masked the earlier failure.
+        brew list bicep >/dev/null 2>&1 && brew uninstall bicep
+        for tap in aws/tap azure/bicep; do
+          brew tap | grep -qx "$tap" && brew untap "$tap"
+        done
         brew update
         brew install autoconf automake ghostscript groff
 
@@ -122,12 +126,16 @@ jobs:
       run: |
         # aws/tap and azure/bicep are pre-tapped on the GitHub macOS runner
         # images and trigger Homebrew tap-trust warnings; we use nothing from
-        # them, so drop them before updating/installing. --force is required
-        # because azure/bicep has an installed formula (bicep), which a plain
-        # untap refuses to remove. We keep "|| true" so a no-op untap on a
-        # future image doesn't fail the step, but do NOT silence stderr:
-        # hiding it is what masked the earlier failure to remove azure/bicep.
-        brew untap --force aws/tap azure/bicep || true
+        # them, so remove them before updating/installing. azure/bicep ships an
+        # installed formula (bicep): uninstall it first so the tap untaps
+        # cleanly without --force (which would itself print a warning). Each
+        # step is guarded so it stays quiet and non-fatal on a future image
+        # that no longer has these taps/formulae. We do NOT silence stderr of
+        # the actual operations: hiding it is what masked the earlier failure.
+        brew list bicep >/dev/null 2>&1 && brew uninstall bicep
+        for tap in aws/tap azure/bicep; do
+          brew tap | grep -qx "$tap" && brew untap "$tap"
+        done
         brew update
         brew install autoconf automake ghostscript groff
 
