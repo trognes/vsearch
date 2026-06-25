@@ -137,6 +137,33 @@ deadlocks the next init. Per-command files also keep working state (file
 handles, counters, thread coordination) in file-`static` variables, so the
 commands are not reentrant.
 
+## Documentation (two manual systems — keep both in sync)
+
+The manual exists in **two parallel systems, both maintained upstream**, so a
+user-visible documentation change must be made in *both*:
+
+1. **`man/vsearch.1`** — the monolithic roff man page. It is the autotools
+   source man page (`man/Makefile.am`: `dist_man_MANS = vsearch.1`) and the
+   input from which the PDF/HTML manual is generated. Edit the roff directly.
+2. **The per-command markdown system under `man/`** — one page per command in
+   `man/commands/vsearch-<command>.1.md` (section 1), format/reference pages in
+   `man/formats/` (section 5, e.g. fasta/fastq/sam/sff/udb/cigar), topic pages
+   in `man/misc/` (section 7, e.g. `expected_error`, `nucleotides`,
+   `pairwise_alignment_parameters`, `userfields`), the overview/changelog in
+   `man/index.1.md`, and **shared option snippets** in
+   `man/commands/fragments/` (and `man/formats/fragments/`) that are `#include`d
+   into several pages (e.g. `option_randseed.md` is used by sintax, shuffle and
+   subsample — edit the fragment once and it propagates). These build into roff
+   pages via `man/scripts/generate_manpage*.sh` using **pandoc** (so a build
+   check needs pandoc installed; em dashes are written `---`).
+
+When changing option behaviour, update the roff in `vsearch.1` **and** the
+matching markdown — either the per-command `.md` body or the shared
+`fragments/option_*.md`, whichever holds that text. Keep these as separate man
+commits from the source fix (same "one fix = one atomic commit" habit), but note
+both manual systems are real source and **do** go upstream (unlike
+`CODE_REVIEW.md` / `CLAUDE.md`).
+
 ## Known issues
 
 `CODE_REVIEW.md` catalogues known bugs, security findings, and structural
