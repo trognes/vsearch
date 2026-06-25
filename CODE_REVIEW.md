@@ -1130,6 +1130,17 @@ and the correction to C1(c).
 
 ### CC1. Multi-threaded commands have an unaudited data-race surface (no ThreadSanitizer coverage)
 
+**Status: ADDRESSED.** The method gap is closed and the named suspects are
+resolved: a **ThreadSanitizer CI lane** was added (`threadsanitizer.yml`, PR
+#30) and now runs the multi-threaded vsearch-tests suite under `-fsanitize=thread`
+on every push/PR (non-gating inventory). The three spots flagged below were
+swept under **CC5** — the unsynchronized `scorematrix` write was removed
+(`15d5490`), and the partly-guarded counters and the `si_plus`/`si_minus`
+save/restore were confirmed correctly serialized. The lane also caught a real,
+previously-unflagged race in `uchime_ref` (**CC4**, `28a25bf`), which is exactly
+the runtime coverage this item asked for. The data-race class is now under
+continuous automated detection rather than relying on code reading alone.
+
 The findings above (E4, L1, C1) address **reentrancy** — single-threaded
 reasoning about file-`static` state surviving between sessions. They do **not**
 cover *data races* inside a single run: `search`, `cluster`, `chimera`, `sintax`,
@@ -1159,10 +1170,11 @@ candidates for ThreadSanitizer):
   Valgrind CI uses Memcheck, not Helgrind/DRD. So the entire data-race class is
   outside today's automated coverage. The vsearch-tests suite *does* exercise
   multi-threaded runs, so a TSan lane would get real coverage immediately.
-- **Type:** Concurrency (latent; unaudited) · **Effort:** Medium (stand up a TSan
-  lane + triage) · **Impact:** Medium–High (silent wrong results / rare crashes
-  under threading) · **Criticality:** Medium · *not yet analysed — flagged as a
-  method gap, see "Analysis methods not yet applied"* · cross-ref E4, L1, L2(d).
+- **Type:** Concurrency (method gap — now closed) · **Effort:** Medium (TSan lane
+  stood up + suspects triaged) · **Impact:** Medium–High (silent wrong results /
+  rare crashes under threading) · **Criticality:** Medium · *addressed: TSan lane
+  added (PR #30), suspects swept (CC5), one real race found and fixed (CC4)* ·
+  cross-ref CC4, CC5, E4, L1, L2(d).
 
 ### CC2. `fastq_mergepairs` calls `std::exit()` from a worker thread → intermittent crash
 
@@ -2321,7 +2333,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med | Latent |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium | Pending |
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
-| CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Needs-confirm |
+| CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Addressed (TSan lane PR #30; CC4/CC5) |
 | CC2 | `fastq_mergepairs` `get_qual()` calls `std::exit()` from a worker thread → intermittent crash (SIGILL on FreeBSD CI) | Concurrency | Medium | Medium | Medium | Fixed (`de99570`) |
 | CC3 | `search`/`search_exact`/`sintax`/`uchime_ref` parse the query in-worker; malformed input → `fatal()`/`exit()` from a worker thread (shared parser) | Concurrency | Med–High | Medium | Medium | Fixed (PR #29) |
 | CC4 | `uchime_ref` reads query file position under `mutex_output` while another worker writes it under `mutex_input` → data race (found by the TSan lane) | Concurrency | Low | Medium | Medium | Fixed (`28a25bf`) |
