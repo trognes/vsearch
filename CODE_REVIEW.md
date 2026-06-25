@@ -1619,9 +1619,9 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
 
 ### N3. RNG quality, reproducibility, and reentrancy (Tier-5)
 
-**Status: Tier-1 hardening FIXED (`dabd467`). Tier-2 modernization in
-progress — (a) FIXED (`f00510b`), (d) FIXED (`853b87a`); shuffle migration +
-legacy retirement remaining.**
+**Status: Tier-1 hardening FIXED (`dabd467`). Tier-2 modernization — (a) FIXED
+(`f00510b`), (d) FIXED (`853b87a`), shuffle migrated (`976069c`); (b) resolved on
+all live consumers; only the legacy-helper retirement (step 4) remains.**
 Tier-1 (no-behavioural-change robustness): (c) generator-range coupling,
 (e) `/dev/urandom` short read, (f) NDEBUG-stripped divide guard — done (per-item
 notes below).
@@ -1644,11 +1644,16 @@ every platform.
   seeded once from `random_base_seed()` and sampled with `random_bounded()`
   (uniform, no overlapping-shift), bit-identical across platforms. Verified:
   reproducible for a fixed seed, still input-size-dependent, exact sample count.
-- **Remaining:** `shuffle` still uses `std::shuffle` (step 3), after which the
-  now-callerless `random_int`/`random_ulong`/`arch_random*` can be retired
-  (step 4), removing the legacy `arch_srandom` 32-bit truncation entirely. (b) is
-  already resolved on every live consumer (sintax + subsample use the 64-bit base
-  seed); only the soon-to-be-dead legacy helpers still truncate.
+- **shuffle FIXED (`976069c`):** seeds its `mt19937_64` from `random_base_seed()`
+  (full 64-bit, no more `unsigned int` truncation) and shuffles with the portable
+  `random_shuffle()` instead of the implementation-defined `std::shuffle`, so the
+  order is identical across platforms for a given seed.
+- **Remaining (step 4 cleanup):** `random_int`/`random_ulong`/`arch_random`/
+  `arch_random_max` are now callerless and `arch_srandom` is only kept alive by
+  `random_init()`; retiring them removes the legacy 32-bit truncation entirely.
+  (b) is already resolved on every live consumer (sintax, subsample, and shuffle
+  all use the 64-bit base seed); only the soon-to-be-dead legacy helpers still
+  truncate.
 
 The shared random-number path has several correctness/quality issues, none a
 memory bug:
@@ -1666,6 +1671,10 @@ memory bug:
   two documented seeds silently collide. (Extends the E9 `shuffle.cc`-RNG note to
   the main `arch_srandom` path; `shuffle` additionally uses a *separate*
   `mt19937_64` engine, so the two RNG paths aren't comparable.)
+  **RESOLVED on all live consumers:** sintax (`853b87a`), subsample (`f00510b`),
+  and shuffle (`976069c`) now seed from the 64-bit `random_base_seed()`; the
+  `unsigned int` truncation survives only in the callerless legacy `arch_srandom`
+  path, to be removed in step 4.
 - **(c) `random_int` re-derives the generator range from `RAND_MAX`** in `util.cc`
   while `arch_random` independently wraps `random()`/`rand()` — they agree only by
   coincidence of the platform `RAND_MAX`, a portability/coupling hazard.
@@ -2420,7 +2429,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | CC5 | CC1 sweep: dead file-scope `scorematrix` write (latent chimera race) removed; counters and `si_plus`/`si_minus` confirmed safe | Concurrency | Low | Low–Med | Low | Fixed (`15d5490`) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, verified non-reachable — zero-length seqs not analysed) | Numerical | Low–Med | High | Medium | Fixed (a); (b) non-reachable |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
-| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Tier-1 fixed (`dabd467`); Tier-2: (a) fixed (`f00510b`), (d) fixed (`853b87a`); shuffle + cleanup left |
+| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Tier-1 fixed (`dabd467`); Tier-2: (a)`f00510b`/(d)`853b87a`/shuffle`976069c` fixed; step-4 cleanup left |
 | N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled; exact 128-bit cmp + int64_max default, `4dbf556`) | Numerical | Low/Med | Medium | Low–Med | Fixed |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
