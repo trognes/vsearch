@@ -7,6 +7,15 @@ clustering, chimera detection, dereplication, FASTQ processing, paired-end
 merging). It is a single CLI binary (`bin/vsearch`) plus an optional static
 library. This is a development fork; upstream is `torognes/vsearch`.
 
+## Editing conventions
+
+**Make minimal, focused diffs — change only the lines relevant to the task.**
+**Never** reformat or "tidy" unrelated code: do not convert tabs to spaces or
+spaces to tabs, re-indent, reflow, or strip trailing whitespace on lines you are
+not otherwise changing, unless you are explicitly asked to and it is confirmed.
+Whitespace-only churn on untouched lines bloats the diff, hides the real change,
+and complicates upstream cherry-picks — keep commits small and readable.
+
 ## Build
 
 ```bash
