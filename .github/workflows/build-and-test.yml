@@ -158,6 +158,13 @@ jobs:
   freebsd-x86_64:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The FreeBSD VM (vmactions / nested QEMU) intermittently hangs during the
+    # test run — roughly half the time the suite stalls after "Running tests..."
+    # and the job is cancelled at the 20-minute limit. Until that is understood
+    # and fixed, keep this job from gating PRs: it still runs and reports, but a
+    # hang/failure here no longer fails the workflow. See the diagnostics added
+    # to the run step below (per-suite timeout + heartbeat + uploaded log).
+    continue-on-error: true
 
     steps:
     - name: Checkout
@@ -209,12 +216,44 @@ jobs:
           # instead, then surface a bounded summary so CI still reports
           # failures. root bypasses POSIX permission checks, so the "file
           # not readable/writable" tests need an unprivileged user.
+          #
+          # Diagnostics for the intermittent FreeBSD hang: the suite runs in
+          # the background under its own timeout (so a hung test cannot eat the
+          # whole 20-minute job budget and skip the summary below), and a
+          # bounded heartbeat prints the last log line every 15 s. The heartbeat
+          # localises the stall point (the hang is in the test *after* the last
+          # line shown) without flooding the SSH channel, and the per-suite
+          # timeout guarantees the FAIL grep / tail / log upload still run.
           echo "========== Running tests... =========="
-          status=0
-          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH bash ./run_all_tests.sh > test.log 2>&1" || status=$?
+          suite_timeout=720
+          rm -f vsearch-tests/test.log
+          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2>&1" &
+          suite_pid=$!
+          while kill -0 "$suite_pid" 2>/dev/null; do
+            echo "[heartbeat $(date -u +%H:%M:%S)] last log line: $(tail -n 1 vsearch-tests/test.log 2>/dev/null)"
+            sleep 15
+          done
+          wait "$suite_pid"
+          status=$?
           echo "========== Tests finished (exit status $status) =========="
+          if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+            echo "!!! Test suite TIMED OUT after ${suite_timeout}s — the hang is in or just"
+            echo "!!! after the last test shown below. (status $status)"
+          fi
           echo "===== FAIL lines ====="
           grep -E 'FAIL' vsearch-tests/test.log || echo "(none)"
-          echo "===== last 50 lines of test.log ====="
-          tail -n 50 vsearch-tests/test.log
+          echo "===== last 80 lines of test.log ====="
+          tail -n 80 vsearch-tests/test.log
           exit $status
+
+    # vmactions copies the workspace back to the host, so the full in-VM test
+    # log (all ~7,700 result lines, not just the tail above) is available here.
+    # Upload it for offline inspection of which test hung. Runs even when the
+    # suite times out or fails.
+    - name: Upload FreeBSD test log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: freebsd-test-log
+        path: vsearch-tests/test.log
+        if-no-files-found: warn
