@@ -2518,7 +2518,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low | Latent |
 | S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low | Needs-confirm |
 | S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low | Latent |
-| S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Bug | Low | Low | Low | Pending |
+| S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Bug | Low | Low | Low | Fixed (`3946769`) |
 | S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium | Pending |
 | S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Pending |
 | S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med | Pending |
@@ -2529,8 +2529,8 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Bug | Low | Low–Med | Medium | Pending |
 | S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Latent |
 | S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Pending |
-| S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Bug | Low | High | High | Pending |
-| S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Pending |
+| S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Bug | Low | High | High | Fixed (`94ed5fe`) |
+| S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Fixed (`6740721`) |
 | S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium | Latent |
 | S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Pending |
 | S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
