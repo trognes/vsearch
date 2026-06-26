@@ -39,9 +39,17 @@ jobs:
       with:
         languages: c-cpp
         # We drive the build ourselves (autogen/configure/make in the Build
-        # step below), so use the manual build mode. This also makes the
-        # build-mode explicit for CodeQL Action v4, which otherwise reports it
-        # as "undefined" and skips its overlay-database path.
+        # step below) because the project requires `make ARFLAGS="cr"`, so use
+        # the manual build mode to get a complete, accurate database from the
+        # real compilation. Buildless `build-mode: none` would be faster (and is
+        # the only mode CodeQL v4's overlay-database optimization supports) but
+        # would miss the autotools-generated config.h and the conditionally
+        # compiled SIMD variants, so we deliberately stay on manual.
+        #
+        # Expected, harmless: because this is not `build-mode: none`, the
+        # analyze step logs "Cannot build an overlay database because build-mode
+        # is set to 'manual' instead of 'none'. Falling back to creating a
+        # normal full database instead." A full database is exactly what we want.
         build-mode: manual
         # security-extended adds the deeper security queries (taint tracking
         # from file/CLI input to array indices) that target the S1-S4 class of
