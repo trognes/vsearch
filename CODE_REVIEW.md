@@ -2406,6 +2406,30 @@ len 300, ~16 GB at len 2000, ~400 GB at len 10000 — so `--fastq_eestats` OOMs 
 PacBio/Nanopore/merged-amplicon data. (`fastq_eestats2` is unaffected; it uses a
 small fixed `count_table`.)
 
+**Crash mode on OOM (verified).** The table is a raw `std::vector<uint64_t>`, not
+an `xmalloc` allocation, so it bypasses vsearch's clean
+`fatal("Unable to allocate enough memory")` path. What happens when the
+allocation can't be satisfied was confirmed empirically (3000 bp read needing
+~36 GB, run under a 2 GB `ulimit -v`):
+
+- **`malloc` refuses** (request too large, or rejected by `ulimit`/the overcommit
+  heuristic): `operator new` throws `std::bad_alloc`, but the code is compiled
+  `-fno-exceptions`, so there is no handler — `std::terminate()` → `abort()` →
+  **SIGABRT** (exit 134). Observed output: `terminate called after throwing an
+  instance of 'std::bad_alloc'` then `Aborted`.
+- **`malloc` succeeds via overcommit** (`overcommit_memory=1` or a request under
+  the heuristic): `std::vector(count)` value-initializes every element to 0,
+  touching all pages, so RAM+swap is exhausted during the zero-fill → the kernel
+  **OOM killer** sends **SIGKILL** (exit 137), often after thrashing.
+
+Either way it is a hard crash with no vsearch diagnostic, and because
+`fopen_output()` runs *before* the read loop while the header is written *after*
+it, a **0-byte `--output` file is left behind** and the exit status reflects the
+signal, not `EXIT_FAILURE`. Routing these tables through `xmalloc` (or a checked
+allocation) would convert the `bad_alloc`/`terminate` abort into the standard
+`fatal()` message, but it cannot help the overcommit/OOM-killer path — only a
+smaller footprint (A–E below) actually cures that.
+
 The structural waste: EE accumulates slowly for real data (per-base error
 ~0.001–0.01), so the occupied bins hug the bottom of each row and the dense
 triangle is **almost entirely zeros** that exist only to keep the `max_ee` column
@@ -2445,8 +2469,9 @@ space" vs. "accept approximation for better asymptotics":
 - **Type:** Enhancement (memory efficiency; (A)/(B) behavior-preserving, (C)/(D)
   change output)
 - **Effort:** Medium (A) / Medium–High (B, E) · **Impact:** High (makes
-  `fastq_eestats` usable on long reads) · **Criticality:** Low–Medium (it now
-  fails honestly via OOM rather than corrupting, post-S23)
+  `fastq_eestats` usable on long reads) · **Criticality:** Low–Medium (post-S23 it
+  no longer corrupts the heap, but still hard-crashes via SIGABRT/SIGKILL with a
+  0-byte output rather than a graceful error — see the crash-mode note above)
 - **Recommendation:** (A) sparse storage if the goal is "stop blowing up, keep
   output identical"; (C) constant cap if an output-contract change is acceptable
   for the biggest, simplest win. Either needs a regression test asserting identical
