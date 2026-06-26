@@ -63,7 +63,7 @@ jobs:
 
     - name: Install tests
       run: |
-        git clone --depth 1 https://github.com/frederic-mahe/vsearch-tests
+        git clone --depth 1 --branch ${{ github.event_name == 'pull_request' && github.base_ref || github.ref_name }} https://github.com/frederic-mahe/vsearch-tests
 
     - name: Run tests under ThreadSanitizer (inventory mode, non-blocking)
       run: |
