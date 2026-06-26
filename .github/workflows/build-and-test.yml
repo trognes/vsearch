@@ -219,19 +219,36 @@ jobs:
           #
           # Diagnostics for the intermittent FreeBSD hang: the suite runs in
           # the background under its own timeout (so a hung test cannot eat the
-          # whole 20-minute job budget and skip the summary below), and a
-          # bounded heartbeat prints the last log line every 15 s. The heartbeat
-          # localises the stall point (the hang is in the test *after* the last
-          # line shown) without flooding the SSH channel, and the per-suite
-          # timeout guarantees the FAIL grep / tail / log upload still run.
+          # whole 20-minute job budget and skip the summary below). A watcher
+          # polls the log once a second but prints only when the last non-blank
+          # line changes — near-real-time progress without flooding the vmactions
+          # SSH channel (high output volume wedges the guest, which is why the
+          # suite output is redirected to a file in the first place). On a stall
+          # it ticks every ~30 s and dumps the running vsearch command line,
+          # which names the hanging test. The per-suite timeout guarantees the
+          # FAIL grep / tail / log upload still run.
           echo "========== Running tests... =========="
           suite_timeout=720
           rm -f vsearch-tests/test.log
           su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2>&1" &
           suite_pid=$!
+          last_sig=""
+          stall=0
           while kill -0 "$suite_pid" 2>/dev/null; do
-            echo "[heartbeat $(date -u +%H:%M:%S)] last log line: $(tail -n 1 vsearch-tests/test.log 2>/dev/null)"
-            sleep 15
+            sig=$(tail -n 20 vsearch-tests/test.log 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1)
+            if [ "$sig" != "$last_sig" ]; then
+              echo "[$(date -u +%H:%M:%S)] $sig"
+              last_sig="$sig"
+              stall=0
+            else
+              stall=$((stall + 1))
+              if [ "$stall" -ge 30 ]; then
+                echo "[$(date -u +%H:%M:%S)] no new test output for ${stall}s; running vsearch process(es):"
+                ps axww 2>/dev/null | grep -w '[v]search' | head -n 3 | sed 's/^/    /'
+                stall=0
+              fi
+            fi
+            sleep 1
           done
           wait "$suite_pid"
           status=$?
