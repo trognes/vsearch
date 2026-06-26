@@ -593,6 +593,15 @@ through, and only for options whose validation is a pure range test.
 
 #### S23. `fastq_eestats` `ee_start()` overflows 32-bit `int` for reads > ~2074 bp → heap OOB (High, reachable)
 
+**Status: FIXED (`94ed5fe`).** `ee_start` now takes `pos` as `int64_t`, so the
+`pos * ((resolution * (pos + 1)) + 2) / 2` arithmetic is performed in 64-bit; all
+four call sites already passed `int64_t` lengths (previously narrowed to the `int`
+parameter), so this also removes that narrowing. Verified with an old-vs-new unit
+check (old `ee_start` goes negative/wrong at `pos ≳ 2000`, new is correct) and an
+ASan build. Note the table still grows ~quadratically with read length (a
+multi-GB allocation for multi-kbp reads) — a separate memory concern, but the
+overflow/heap-corruption bug is closed. Original analysis below.
+
 `ee_start(int pos, int resolution)` returns `pos * ((resolution * (pos + 1)) + 2)
 / 2` (`eestats.cc:127–130`). Every operand is `int`, so the whole product is
 computed in 32-bit `int` and only *then* widened to the `int64_t` return type.
@@ -615,6 +624,15 @@ heap writes and reads.
   *verified (int arithmetic; sizes + indexes the table)*.
 
 #### S24. `fastq_eestats` writes past the per-position quality row when `--fastq_qmin ≥ 2` → heap OOB write (High, reachable)
+
+**Status: FIXED (`6740721`).** Rows are now sized by `qmax` rather than
+`qmax - qmin`: `max_quality = opt_fastq_qmax + 1` (`eestats.cc`), so the raw
+quality index stays in bounds for any `qmin`. The reader loops already treat the
+row index as the quality value, so this needed no reader change, and the default
+`qmin = 0` layout is byte-for-byte identical. Verified under ASan: the unfixed
+line trips a `heap-buffer-overflow` WRITE at `eestats.cc:216` with `--fastq_qmin
+30` on near-`qmax` data; the fixed build runs clean with correct output. Original
+analysis below.
 
 Each per-position row of `qual_length_table` has width `max_quality + 1` where
 `max_quality = opt_fastq_qmax - opt_fastq_qmin + 1` (`eestats.cc:161, 166, 190`),
@@ -2502,10 +2520,11 @@ without reference-output regression.
 
 Reachable with normal data or a sensible option choice — no crafted file:
 
-- **S23** + **S24** — `fastq_eestats` heap OOB: 32-bit overflow in `ee_start()` for
-  reads > ~2074 bp (**routine long reads**), and the per-position quality-row
-  over-write when **`--fastq_qmin ≥ 2`** (an ordinary option). Both Low effort, one
-  `eestats.cc` pass.
+- **S23** + **S24** — *FIXED* (`94ed5fe`, `6740721`). `fastq_eestats` heap OOB:
+  32-bit overflow in `ee_start()` for reads > ~2074 bp (**routine long reads**), and
+  the per-position quality-row over-write when **`--fastq_qmin ≥ 2`** (an ordinary
+  option). `ee_start` now computes in 64-bit; the quality rows are sized by `qmax`.
+  Both verified under ASan.
 - **S10** — the hit-list buffer overflows when `--maxaccepts + --maxrejects` exceeds
   a small `seqcount` — a **legitimate option combination on small datasets**, not an
   attack. Size the buffer by the same bound used for indexing; confirm with the
