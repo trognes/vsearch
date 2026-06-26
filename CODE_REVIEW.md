@@ -348,6 +348,14 @@ correcting for portability/correctness.
 
 #### S12. Signed `int` left-shift overflow in DUST k-mer accumulator (Low — confirmed by CI sanitizers)
 
+**Status: FIXED (`3946769`).** The accumulator is now `auto word = 0U;`
+(`mask.cc:97`), so the `word <<= 2U` shift at `mask.cc:101` is an unsigned
+(well-defined, wrapping) shift rather than signed-overflow UB. The change rode
+in with the anonymous-namespace reorganization of `mask.cc`; it is exactly the
+behaviour-preserving fix prescribed below (the stored value is masked with
+`& bitmask` before use, so downstream indexing is unaffected). Retained here for
+the record; **no open work.** Original analysis below.
+
 `mask.cc:101` in `wo()` (called from `dust_core` → `dust`): the k-mer
 accumulator `word` is a signed `int` (`auto word = 0;`) and is shifted with
 `word <<= 2U` before being masked. Once enough 2-bit codes accumulate, the
@@ -709,7 +717,8 @@ AddressSanitizer + UndefinedBehaviorSanitizer and runs the full
 "inventory" run over the whole suite produced exactly one finding:
 
 - **UBSan:** `mask.cc:101` — the signed left-shift overflow above (S12), the
-  only UB site reported.
+  only UB site reported. *(Since fixed in `3946769`; the accumulator is now
+  unsigned.)*
 - **AddressSanitizer:** **no errors** anywhere in the suite — no
   out-of-bounds, use-after-free, or related memory corruption on the inputs
   the suite exercises.
@@ -2506,8 +2515,9 @@ Reachable with normal data or a sensible option choice — no crafted file:
   twin too.
 - **S20** — `random_subsampling` reads one element past `seqindex` on `--sizein`.
   ASan-detectable; Low effort.
-- **S12** — DUST `int` left-shift UB, UBSan-confirmed, fires on the **first masking
-  command** of normal data. Make the accumulator `unsigned`. Trivial.
+- **S12** — *FIXED* (`3946769`). DUST `int` left-shift UB (UBSan-confirmed, fired on
+  the **first masking command** of normal data); the accumulator is now `unsigned`
+  (`mask.cc:97`), making the shift well-defined.
 
 ### Band 3 — Output integrity & robustness on imperfect (non-malicious) files
 
