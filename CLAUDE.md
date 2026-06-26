@@ -86,10 +86,12 @@ bash ./scripts/cluster_fast.sh /abs/path/to/vsearch   # or pass the binary as $1
   output against ground-truth files in `api_examples/data/`).
 
 CI workflows (`.github/workflows/`): `build-and-test` (default gate),
-`sanitizers` (ASan/UBSan, non-gating inventory), `valgrind` (Memcheck, gating),
-`static-analysis` (cppcheck + clang-tidy, non-gating inventory; clang-tidy
-scoped to bug-finding checks via the repo `.clang-tidy`), `codeql` (C/C++
-`security-extended`), `build-all` (cross-platform matrix, manual dispatch).
+`sanitizers` (ASan/UBSan, non-gating inventory), `threadsanitizer` (TSan,
+non-gating inventory; mutually exclusive with ASan, so a separate lane),
+`valgrind` (Memcheck, gating), `static-analysis` (cppcheck + clang-tidy,
+non-gating inventory; clang-tidy scoped to bug-finding checks via the repo
+`.clang-tidy`), `codeql` (C/C++ `security-extended`), `build-all` (cross-platform
+matrix, manual dispatch).
 
 ## Architecture
 
@@ -136,6 +138,28 @@ blast6, uc, SAM). All textual output goes through `fprintf` to `FILE *`.
 `__attribute__((noreturn))` and calls `std::exit(EXIT_FAILURE)`. There is no
 recoverable error channel — important for the library API, where an error in a
 core routine terminates the caller's process.
+
+**Concurrency model.** The multithreaded commands (search, cluster, chimera,
+sintax, allpairs, orient, mask, fastq_mergepairs) use a small RAII worker pool,
+`ThreadRunner` (`utils/threads.hpp`, `std::thread`), which replaced the older
+hand-rolled pthread pools. Because `fatal()` calls `std::exit()`, **a worker
+thread must never call `fatal()`/`std::exit()`** — terminating from a non-main
+thread crashes intermittently (the CC2–CC4 class in `CODE_REVIEW.md`). Instead a
+worker records the first error in shared state and stops cooperatively — or, for
+query-parse errors, uses the `fastx` deferred-error channel
+(`fastx_set_deferred_error()`) — and the **main** thread calls `fatal()` *after*
+the `ThreadRunner` join. A ThreadSanitizer CI lane (`threadsanitizer.yml`) guards
+this class of bug.
+
+**Random numbers are reproducible across platforms.** `util.h` provides an
+in-house RNG facility — `SplitMix64`, a 64-bit `random_base_seed()` (set once by
+`random_init()` from `opt_randseed`, or the OS when 0), `random_substream_seed()`,
+and `random_bounded()` (Lemire) / `random_shuffle()` (Fisher–Yates) used instead
+of `std::uniform_int_distribution`/`std::shuffle` (both implementation-defined).
+A given `--randseed` therefore reproduces on every platform; `sintax` seeds a
+per-query `SplitMix64` from `(base seed, query number)` so results are also
+independent of `--threads`. The legacy C-library `random()`/`arch_random` path
+was removed (N3 in `CODE_REVIEW.md`).
 
 **The library API has a strict lifecycle.** `vsearch_api.h` documents a required
 sequence (`vsearch_init_defaults` → override `opt_*` → `apply_defaults_fixups`
@@ -185,7 +209,7 @@ parsers (UDB/SFF), the search/cluster hit handling, or the library lifecycle.
 This is a development fork; upstream is `torognes/vsearch`. The fork keeps a
 small set of files that must **never** go upstream — `CODE_REVIEW.md`,
 `CLAUDE.md`, `.clang-tidy`, and the fork-only CI workflows
-(`.github/workflows/{sanitizers,valgrind,static-analysis,static-analysis-clang-tidy,codeql}.yml`).
+(`.github/workflows/{sanitizers,valgrind,threadsanitizer,static-analysis,static-analysis-clang-tidy,codeql}.yml`).
 So you never merge a whole fork branch upstream; you lift the individual fix
 commit(s) onto a branch based on upstream's tip and open a PR with exactly that
 diff.

@@ -1619,7 +1619,7 @@ times into a 16-bit counter → wraps mod 65536. The `qlen == 0` path truncates 
 
 ### N3. RNG quality, reproducibility, and reentrancy (Tier-5)
 
-**Status: FIXED.** Tier-1 hardening (`dabd467`) plus the Tier-2 cross-platform
+**Status: FIXED.** Tier-1 hardening (`3b762eb`) plus the Tier-2 cross-platform
 RNG overhaul: (a) `f00510b`, (d) `853b87a`, shuffle `976069c`, and the legacy
 helpers removed in `a64929c`. All `--randseed` consumers (sintax, subsample,
 shuffle) now use the in-house reproducible RNG; the C library `random()` path and
@@ -1678,7 +1678,7 @@ memory bug:
 - **(c) `random_int` re-derives the generator range from `RAND_MAX`** in `util.cc`
   while `arch_random` independently wraps `random()`/`rand()` — they agree only by
   coincidence of the platform `RAND_MAX`, a portability/coupling hazard.
-  **FIXED (`dabd467`):** `random_int` now reads the bound from a new
+  **FIXED (`3b762eb`):** `random_int` now reads the bound from a new
   `arch_random_max()` (`arch.cc`) returning `2^31-1` for the POSIX `random()`
   backend and `RAND_MAX` for the Windows `rand()` backend. Output unchanged on
   both; the coupling is explicit.
@@ -1690,16 +1690,16 @@ memory bug:
   state from the threaded path; results are now thread-count-independent.
 - **(e) `arch_srandom` accepts a short read of `/dev/urandom`** — only checks
   `read(...) < 0`, so a partial read leaves the seed partly at its `0` init.
-  **FIXED (`dabd467`):** the read now must return `sizeof(seed)` bytes or it is
+  **FIXED (`3b762eb`):** the read now must return `sizeof(seed)` bytes or it is
   treated as a failure.
 - **(f) `random_int`/`random_ulong` guard `upper_limit != 0` only with an
   NDEBUG-stripped `assert`** (`util.cc:256, 274`) → `% 0` if a zero ever reaches
   them; current callers pass non-zero, so latent (A1 class).
-  **FIXED (`dabd467`):** both asserts replaced with a `fatal()` guard that holds
+  **FIXED (`3b762eb`):** both asserts replaced with a `fatal()` guard that holds
   in the default `-DNDEBUG` build.
 
 - **Effort:** Low–Medium · **Impact:** Low–Medium (statistical quality /
-  reproducibility) · **Criticality:** Low · *(c)/(e)/(f) fixed (`dabd467`);
+  reproducibility) · **Criticality:** Low · *(c)/(e)/(f) fixed (`3b762eb`);
   (d) fixed (`853b87a`); (a)/(b) remaining — subsample/shuffle migration to the
   new RNG facility (changes the stream)*
 
@@ -2429,7 +2429,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | CC5 | CC1 sweep: dead file-scope `scorematrix` write (latent chimera race) removed; counters and `si_plus`/`si_minus` confirmed safe | Concurrency | Low | Low–Med | Low | Fixed (`15d5490`) |
 | N1 | `count_t` saturation mis-ranks long-read hits (a, FIXED `441ffff`); unguarded `/0` → `inf`/`nan` (b, verified non-reachable — zero-length seqs not analysed) | Numerical | Low–Med | High | Medium | Fixed (a); (b) non-reachable |
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
-| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Fixed (`dabd467`/`853b87a`/`f00510b`/`976069c`/`a64929c`): in-house cross-platform RNG; legacy path removed |
+| N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Fixed (`3b762eb`/`853b87a`/`f00510b`/`976069c`/`a64929c`): in-house cross-platform RNG; legacy path removed |
 | N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled; exact 128-bit cmp + int64_max default, `4dbf556`) | Numerical | Low/Med | Medium | Low–Med | Fixed |
 | A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
