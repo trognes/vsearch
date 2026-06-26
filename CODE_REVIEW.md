@@ -348,6 +348,14 @@ correcting for portability/correctness.
 
 #### S12. Signed `int` left-shift overflow in DUST k-mer accumulator (Low — confirmed by CI sanitizers)
 
+**Status: FIXED (`3946769`).** The accumulator is now `auto word = 0U;`
+(`mask.cc:97`), so the `word <<= 2U` shift at `mask.cc:101` is an unsigned
+(well-defined, wrapping) shift rather than signed-overflow UB. The change rode
+in with the anonymous-namespace reorganization of `mask.cc`; it is exactly the
+behaviour-preserving fix prescribed below (the stored value is masked with
+`& bitmask` before use, so downstream indexing is unaffected). Retained here for
+the record; **no open work.** Original analysis below.
+
 `mask.cc:101` in `wo()` (called from `dust_core` → `dust`): the k-mer
 accumulator `word` is a signed `int` (`auto word = 0;`) and is shifted with
 `word <<= 2U` before being masked. Once enough 2-bit codes accumulate, the
@@ -585,6 +593,16 @@ through, and only for options whose validation is a pure range test.
 
 #### S23. `fastq_eestats` `ee_start()` overflows 32-bit `int` for reads > ~2074 bp → heap OOB (High, reachable)
 
+**Status: FIXED (`94ed5fe`).** `ee_start` now takes `pos` as `int64_t`, so the
+`pos * ((resolution * (pos + 1)) + 2) / 2` arithmetic is performed in 64-bit; all
+four call sites already passed `int64_t` lengths (previously narrowed to the `int`
+parameter), so this also removes that narrowing. Verified with an old-vs-new unit
+check (old `ee_start` goes negative/wrong at `pos ≳ 2000`, new is correct) and an
+ASan build. Note the table still grows ~quadratically with read length (a
+multi-GB allocation for multi-kbp reads) — a separate memory concern tracked as
+**E12** (sparse/capped representation), but the overflow/heap-corruption bug is
+closed. Original analysis below.
+
 `ee_start(int pos, int resolution)` returns `pos * ((resolution * (pos + 1)) + 2)
 / 2` (`eestats.cc:127–130`). Every operand is `int`, so the whole product is
 computed in 32-bit `int` and only *then* widened to the `int64_t` return type.
@@ -607,6 +625,15 @@ heap writes and reads.
   *verified (int arithmetic; sizes + indexes the table)*.
 
 #### S24. `fastq_eestats` writes past the per-position quality row when `--fastq_qmin ≥ 2` → heap OOB write (High, reachable)
+
+**Status: FIXED (`6740721`).** Rows are now sized by `qmax` rather than
+`qmax - qmin`: `max_quality = opt_fastq_qmax + 1` (`eestats.cc`), so the raw
+quality index stays in bounds for any `qmin`. The reader loops already treat the
+row index as the quality value, so this needed no reader change, and the default
+`qmin = 0` layout is byte-for-byte identical. Verified under ASan: the unfixed
+line trips a `heap-buffer-overflow` WRITE at `eestats.cc:216` with `--fastq_qmin
+30` on near-`qmax` data; the fixed build runs clean with correct output. Original
+analysis below.
 
 Each per-position row of `qual_length_table` has width `max_quality + 1` where
 `max_quality = opt_fastq_qmax - opt_fastq_qmin + 1` (`eestats.cc:161, 166, 190`),
@@ -709,7 +736,8 @@ AddressSanitizer + UndefinedBehaviorSanitizer and runs the full
 "inventory" run over the whole suite produced exactly one finding:
 
 - **UBSan:** `mask.cc:101` — the signed left-shift overflow above (S12), the
-  only UB site reported.
+  only UB site reported. *(Since fixed in `3946769`; the accumulator is now
+  unsigned.)*
 - **AddressSanitizer:** **no errors** anywhere in the suite — no
   out-of-bounds, use-after-free, or related memory corruption on the inputs
   the suite exercises.
@@ -2363,6 +2391,98 @@ matches `Makefile.am`.
 - **Note:** surfaced while building the CC2 fix — reverting the regenerated
   `Makefile.in` to its committed (stale) version broke an incremental build.
 
+### E12. `fastq_eestats` `ee_length_table` uses O(len²) memory (quadratic blow-up on long reads)
+
+Follow-up to the S23 fix (`94ed5fe`): that commit made `ee_start()` compute the
+table size correctly in 64-bit, but the table is still genuinely huge for long
+reads. `ee_length_table` is a **ragged per-position histogram of expected
+errors**: row `i` (read position `i`) spans `e_int ∈ [0, resolution·(i+1)]` with
+bin width `1/resolution` (`resolution = 1000`), so the total size is
+`Σᵢ resolution·(i+1) ≈ resolution·len²/2 ≈ 500·len²` entries × 8 bytes. The
+reader walks each row from the bottom, accumulating counts, to extract five order
+statistics per position — **min / Q1 / median / Q3 / max** of the EE distribution
+(`mean_ee` comes separately from `sum_ee_length_table`). Concretely: ~360 MB at
+len 300, ~16 GB at len 2000, ~400 GB at len 10000 — so `--fastq_eestats` OOMs on
+PacBio/Nanopore/merged-amplicon data. (`fastq_eestats2` is unaffected; it uses a
+small fixed `count_table`.)
+
+**Crash mode on OOM (verified).** The table is a raw `std::vector<uint64_t>`, not
+an `xmalloc` allocation, so it bypasses vsearch's clean
+`fatal("Unable to allocate enough memory")` path. What happens when the
+allocation can't be satisfied was confirmed empirically (3000 bp read needing
+~36 GB, run under a 2 GB `ulimit -v`):
+
+- **`malloc` refuses** (request too large, or rejected by `ulimit`/the overcommit
+  heuristic): `operator new` throws `std::bad_alloc`, but the code is compiled
+  `-fno-exceptions`, so there is no handler — `std::terminate()` → `abort()` →
+  **SIGABRT** (exit 134). Observed output: `terminate called after throwing an
+  instance of 'std::bad_alloc'` then `Aborted`.
+- **`malloc` succeeds via overcommit** (`overcommit_memory=1` or a request under
+  the heuristic): `std::vector(count)` value-initializes every element to 0,
+  touching all pages, so RAM+swap is exhausted during the zero-fill → the kernel
+  **OOM killer** sends **SIGKILL** (exit 137), often after thrashing.
+
+Either way it is a hard crash with no vsearch diagnostic, and because
+`fopen_output()` runs *before* the read loop while the header is written *after*
+it, a **0-byte `--output` file is left behind** and the exit status reflects the
+signal.
+
+**Partial mitigation done (`17d7740`):** a `std::set_new_handler` is now installed
+at CLI startup that writes `"Fatal error: Unable to allocate enough memory."` with
+`write(2)` and exits `EXIT_FAILURE`, so the **`malloc`-refused** path now prints
+the standard message and exits 1 instead of the `std::bad_alloc`/`terminate`
+SIGABRT. This does **not** help the **overcommit → OOM-killer SIGKILL** path (no
+userspace hook runs), nor does it flush/clean the 0-byte output file — only a
+smaller footprint (A–E below) actually cures the underlying blow-up.
+
+The structural waste: EE accumulates slowly for real data (per-base error
+~0.001–0.01), so the occupied bins hug the bottom of each row and the dense
+triangle is **almost entirely zeros** that exist only to keep the `max_ee` column
+exact for pathological reads. Exact streaming quantiles need ~linear space in the
+distinct values seen, so the options split into "keep exact output, drop the empty
+space" vs. "accept approximation for better asymptotics":
+
+- **(A) Sparse storage — recommended, exact output.** Key the histogram on
+  `(position, e_int)` (per-position ordered map, or one hash map over the
+  flattened index) so memory scales with cells *actually observed*
+  (`≤ Σᵢ min(N_reads, resolution·(i+1))`) rather than the worst-case triangle.
+  Collapses the few-long-reads case from `~500·len²` to `≤ N_reads·len` with no
+  change to any reported value (you only decline to store zeros). A per-position
+  `std::map<int,uint64_t>` keeps the reader's ascending walk natural.
+- **(B) Observed-envelope rows — exact output.** Keep dense rows but size each to
+  the largest `e_int` actually seen at that position, not `resolution·(i+1)`.
+  Needs either a two-pass read (pass 1 = per-position high-water mark + length
+  distribution; pass 2 = fill) or dynamic row growth with a row-width prefix sum
+  instead of the closed-form `ee_start`. Tighter contiguous storage; doubles input
+  I/O (two-pass) but output stays identical.
+- **(C) Constant EE cap — linear memory, lossy only in `max_ee`.** Clamp `e_int`
+  at `resolution·E_max` (constant) instead of `resolution·(i+1)` → rows become
+  fixed width → total `O(len)`. min/Q1/median/Q3 stay exact (those quantiles are
+  always well below any sane `E_max`); only `max_ee` saturates at `E_max` for
+  garbage reads — could be surfaced honestly as `≥ E_max`. A real, if rarely
+  material, output change.
+- **(D) Lower `resolution`.** Memory scales linearly with `resolution`; output
+  prints EE to 2 decimals, so `resolution = 100` matches the printed precision and
+  cuts the table 10×, but `(e + 0.5)/resolution` + 2-dp rounding can flip the last
+  digit at bin boundaries → **not byte-identical**. Composes with (C); weak on its
+  own.
+- **(E) Streaming quantile sketches (t-digest / Greenwald–Khanna / P²).** Best
+  asymptotics — `O(len/ε)` for ε-approximate quantiles — but approximate and by far
+  the most code (one sketch per position). Reserve for if long-read eestats becomes
+  a first-class use case.
+
+- **Type:** Enhancement (memory efficiency; (A)/(B) behavior-preserving, (C)/(D)
+  change output)
+- **Effort:** Medium (A) / Medium–High (B, E) · **Impact:** High (makes
+  `fastq_eestats` usable on long reads) · **Criticality:** Low–Medium (post-S23 it
+  no longer corrupts the heap, but still hard-crashes via SIGABRT/SIGKILL with a
+  0-byte output rather than a graceful error — see the crash-mode note above)
+- **Recommendation:** (A) sparse storage if the goal is "stop blowing up, keep
+  output identical"; (C) constant cap if an output-contract change is acceptable
+  for the biggest, simplest win. Either needs a regression test asserting identical
+  output on the existing suite (A/B) or a deliberately documented output change
+  (C/D). Its own PR, separate from the S23/S24 overflow fixes. · related S23.
+
 ---
 
 ## Summary table
@@ -2444,6 +2564,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | E9 | Remove dead/debug code | Enhancement | Low | Low | Low | Pending |
 | E10 | Deduplicate license headers | Enhancement | Low | Low | Low | Pending |
 | E11 | Stale checked-in `src/Makefile.in` (lists removed `utils/xpthread`); refresh or untrack | Enhancement | Low | Low | Low | Fixed (`e2ca3cc`) |
+| E12 | `fastq_eestats` `ee_length_table` O(len²) memory — sparse/capped representation for long reads | Enhancement | Med | High | Low–Med | Pending |
 
 ## Suggested sequencing
 
@@ -2493,10 +2614,11 @@ without reference-output regression.
 
 Reachable with normal data or a sensible option choice — no crafted file:
 
-- **S23** + **S24** — `fastq_eestats` heap OOB: 32-bit overflow in `ee_start()` for
-  reads > ~2074 bp (**routine long reads**), and the per-position quality-row
-  over-write when **`--fastq_qmin ≥ 2`** (an ordinary option). Both Low effort, one
-  `eestats.cc` pass.
+- **S23** + **S24** — *FIXED* (`94ed5fe`, `6740721`). `fastq_eestats` heap OOB:
+  32-bit overflow in `ee_start()` for reads > ~2074 bp (**routine long reads**), and
+  the per-position quality-row over-write when **`--fastq_qmin ≥ 2`** (an ordinary
+  option). `ee_start` now computes in 64-bit; the quality rows are sized by `qmax`.
+  Both verified under ASan.
 - **S10** — the hit-list buffer overflows when `--maxaccepts + --maxrejects` exceeds
   a small `seqcount` — a **legitimate option combination on small datasets**, not an
   attack. Size the buffer by the same bound used for indexing; confirm with the
@@ -2506,8 +2628,9 @@ Reachable with normal data or a sensible option choice — no crafted file:
   twin too.
 - **S20** — `random_subsampling` reads one element past `seqindex` on `--sizein`.
   ASan-detectable; Low effort.
-- **S12** — DUST `int` left-shift UB, UBSan-confirmed, fires on the **first masking
-  command** of normal data. Make the accumulator `unsigned`. Trivial.
+- **S12** — *FIXED* (`3946769`). DUST `int` left-shift UB (UBSan-confirmed, fired on
+  the **first masking command** of normal data); the accumulator is now `unsigned`
+  (`mask.cc:97`), making the shift well-defined.
 
 ### Band 3 — Output integrity & robustness on imperfect (non-malicious) files
 
