@@ -599,8 +599,9 @@ four call sites already passed `int64_t` lengths (previously narrowed to the `in
 parameter), so this also removes that narrowing. Verified with an old-vs-new unit
 check (old `ee_start` goes negative/wrong at `pos ≳ 2000`, new is correct) and an
 ASan build. Note the table still grows ~quadratically with read length (a
-multi-GB allocation for multi-kbp reads) — a separate memory concern, but the
-overflow/heap-corruption bug is closed. Original analysis below.
+multi-GB allocation for multi-kbp reads) — a separate memory concern tracked as
+**E12** (sparse/capped representation), but the overflow/heap-corruption bug is
+closed. Original analysis below.
 
 `ee_start(int pos, int resolution)` returns `pos * ((resolution * (pos + 1)) + 2)
 / 2` (`eestats.cc:127–130`). Every operand is `int`, so the whole product is
@@ -2390,6 +2391,68 @@ matches `Makefile.am`.
 - **Note:** surfaced while building the CC2 fix — reverting the regenerated
   `Makefile.in` to its committed (stale) version broke an incremental build.
 
+### E12. `fastq_eestats` `ee_length_table` uses O(len²) memory (quadratic blow-up on long reads)
+
+Follow-up to the S23 fix (`94ed5fe`): that commit made `ee_start()` compute the
+table size correctly in 64-bit, but the table is still genuinely huge for long
+reads. `ee_length_table` is a **ragged per-position histogram of expected
+errors**: row `i` (read position `i`) spans `e_int ∈ [0, resolution·(i+1)]` with
+bin width `1/resolution` (`resolution = 1000`), so the total size is
+`Σᵢ resolution·(i+1) ≈ resolution·len²/2 ≈ 500·len²` entries × 8 bytes. The
+reader walks each row from the bottom, accumulating counts, to extract five order
+statistics per position — **min / Q1 / median / Q3 / max** of the EE distribution
+(`mean_ee` comes separately from `sum_ee_length_table`). Concretely: ~360 MB at
+len 300, ~16 GB at len 2000, ~400 GB at len 10000 — so `--fastq_eestats` OOMs on
+PacBio/Nanopore/merged-amplicon data. (`fastq_eestats2` is unaffected; it uses a
+small fixed `count_table`.)
+
+The structural waste: EE accumulates slowly for real data (per-base error
+~0.001–0.01), so the occupied bins hug the bottom of each row and the dense
+triangle is **almost entirely zeros** that exist only to keep the `max_ee` column
+exact for pathological reads. Exact streaming quantiles need ~linear space in the
+distinct values seen, so the options split into "keep exact output, drop the empty
+space" vs. "accept approximation for better asymptotics":
+
+- **(A) Sparse storage — recommended, exact output.** Key the histogram on
+  `(position, e_int)` (per-position ordered map, or one hash map over the
+  flattened index) so memory scales with cells *actually observed*
+  (`≤ Σᵢ min(N_reads, resolution·(i+1))`) rather than the worst-case triangle.
+  Collapses the few-long-reads case from `~500·len²` to `≤ N_reads·len` with no
+  change to any reported value (you only decline to store zeros). A per-position
+  `std::map<int,uint64_t>` keeps the reader's ascending walk natural.
+- **(B) Observed-envelope rows — exact output.** Keep dense rows but size each to
+  the largest `e_int` actually seen at that position, not `resolution·(i+1)`.
+  Needs either a two-pass read (pass 1 = per-position high-water mark + length
+  distribution; pass 2 = fill) or dynamic row growth with a row-width prefix sum
+  instead of the closed-form `ee_start`. Tighter contiguous storage; doubles input
+  I/O (two-pass) but output stays identical.
+- **(C) Constant EE cap — linear memory, lossy only in `max_ee`.** Clamp `e_int`
+  at `resolution·E_max` (constant) instead of `resolution·(i+1)` → rows become
+  fixed width → total `O(len)`. min/Q1/median/Q3 stay exact (those quantiles are
+  always well below any sane `E_max`); only `max_ee` saturates at `E_max` for
+  garbage reads — could be surfaced honestly as `≥ E_max`. A real, if rarely
+  material, output change.
+- **(D) Lower `resolution`.** Memory scales linearly with `resolution`; output
+  prints EE to 2 decimals, so `resolution = 100` matches the printed precision and
+  cuts the table 10×, but `(e + 0.5)/resolution` + 2-dp rounding can flip the last
+  digit at bin boundaries → **not byte-identical**. Composes with (C); weak on its
+  own.
+- **(E) Streaming quantile sketches (t-digest / Greenwald–Khanna / P²).** Best
+  asymptotics — `O(len/ε)` for ε-approximate quantiles — but approximate and by far
+  the most code (one sketch per position). Reserve for if long-read eestats becomes
+  a first-class use case.
+
+- **Type:** Enhancement (memory efficiency; (A)/(B) behavior-preserving, (C)/(D)
+  change output)
+- **Effort:** Medium (A) / Medium–High (B, E) · **Impact:** High (makes
+  `fastq_eestats` usable on long reads) · **Criticality:** Low–Medium (it now
+  fails honestly via OOM rather than corrupting, post-S23)
+- **Recommendation:** (A) sparse storage if the goal is "stop blowing up, keep
+  output identical"; (C) constant cap if an output-contract change is acceptable
+  for the biggest, simplest win. Either needs a regression test asserting identical
+  output on the existing suite (A/B) or a deliberately documented output change
+  (C/D). Its own PR, separate from the S23/S24 overflow fixes. · related S23.
+
 ---
 
 ## Summary table
@@ -2471,6 +2534,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | E9 | Remove dead/debug code | Enhancement | Low | Low | Low | Pending |
 | E10 | Deduplicate license headers | Enhancement | Low | Low | Low | Pending |
 | E11 | Stale checked-in `src/Makefile.in` (lists removed `utils/xpthread`); refresh or untrack | Enhancement | Low | Low | Low | Fixed (`e2ca3cc`) |
+| E12 | `fastq_eestats` `ee_length_table` O(len²) memory — sparse/capped representation for long reads | Enhancement | Med | High | Low–Med | Pending |
 
 ## Suggested sequencing
 
