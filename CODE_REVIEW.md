@@ -2425,10 +2425,15 @@ allocation can't be satisfied was confirmed empirically (3000 bp read needing
 Either way it is a hard crash with no vsearch diagnostic, and because
 `fopen_output()` runs *before* the read loop while the header is written *after*
 it, a **0-byte `--output` file is left behind** and the exit status reflects the
-signal, not `EXIT_FAILURE`. Routing these tables through `xmalloc` (or a checked
-allocation) would convert the `bad_alloc`/`terminate` abort into the standard
-`fatal()` message, but it cannot help the overcommit/OOM-killer path — only a
-smaller footprint (A–E below) actually cures that.
+signal.
+
+**Partial mitigation done (`17d7740`):** a `std::set_new_handler` is now installed
+at CLI startup that writes `"Fatal error: Unable to allocate enough memory."` with
+`write(2)` and exits `EXIT_FAILURE`, so the **`malloc`-refused** path now prints
+the standard message and exits 1 instead of the `std::bad_alloc`/`terminate`
+SIGABRT. This does **not** help the **overcommit → OOM-killer SIGKILL** path (no
+userspace hook runs), nor does it flush/clean the 0-byte output file — only a
+smaller footprint (A–E below) actually cures the underlying blow-up.
 
 The structural waste: EE accumulates slowly for real data (per-base error
 ~0.001–0.01), so the occupied bins hug the bottom of each row and the dense
