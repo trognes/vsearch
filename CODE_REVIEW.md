@@ -2462,30 +2462,32 @@ so each lands as a single atomic commit.
 
 ### Band 1 — Silent wrong scientific results on realistic data (highest)
 
-No crash, no sanitizer signal — just wrong numbers in the output. The worst class
-for a scientific tool, and invisible without reference-output regression.
+**COMPLETE — every item is fixed or verified non-reachable.** Retained for the
+record (and as the regression-coverage checklist). This is the worst class for a
+scientific tool: no crash, no sanitizer signal, just wrong numbers — invisible
+without reference-output regression.
 
-- **N1(a)** — the headline. `count_t` (`unsigned short`) saturates k-mer match
-  counts above 65 535, so on **long-read data (PacBio/Nanopore)** — which vsearch
-  supports — a true best hit is silently dropped or mis-ranked in search/cluster.
-  Widen to `uint32_t`; pair with a long-read reference-output regression case.
-- **B2** — MSA consensus `;length=` reported one too high for **every** cluster
-  under `--consout --lengthout`. Trivial fix, pure wrong-output-value bug.
-- **N1(b)** — secondary output fields (qcov, tcov, LCA, ee stats, masked %) divide
-  without a zero guard → `inf`/`nan` emitted on empty/zero-length/degenerate
-  records. One guarded-divide helper.
+- **N1(a)** — *FIXED* (`441ffff`). `count_t` (`unsigned short`) saturated k-mer
+  match counts above 65 535, mis-ranking the best hit on **long-read data
+  (PacBio/Nanopore)**. Fixed by clamping the scalar increment at `INT16_MAX` so it
+  agrees with the SIMD path's saturating ops (see the N1(a) finding).
+- **B2** — *FIXED* (`bb45598`). MSA consensus `;length=` was reported one too high
+  for **every** cluster under `--consout --lengthout`.
+- **N1(b)** — *VERIFIED NON-REACHABLE*. The secondary-field divisions (qcov, tcov,
+  LCA, ee stats, masked %) cannot reach a zero denominator: vsearch does not
+  analyse zero-length sequences, so every site is dead/loop-/k-mer-gated. No fix
+  needed (see the N1(b) finding).
 - **N2** — *FIXED* (`3b1ee82` et al.): alignment counters (`aligned`/`matches`/
-  `mismatches`/`gaps`) are `unsigned short` and could wrap on long alignment paths;
-  addressed by a sum guard that diverts oversized pairs to `linmemalign` (plus the
-  `qlen==0` fix and 64-bit length arithmetic). Hardening — see the N2 finding.
-- **N3** — RNG reproducibility: `--randseed` truncated to 32 bits and global RNG
-  state is not thread-safe, so seeded runs are **not reproducible under threads** —
-  a real reproducibility problem for subsample/shuffle/bootstrap.
-- **Investigate threaded correctness early (CC1).** Data races in the default
-  multi-threaded search/cluster/chimera path would corrupt results
-  non-deterministically on ordinary input. It is unaudited (needs-confirm), so the
-  **ThreadSanitizer lane (Band 8) is the highest-value of the three methods** under
-  this philosophy — promote it ahead of fuzzing/portability.
+  `mismatches`/`gaps`) could wrap on long alignment paths; addressed by a sum
+  guard that diverts oversized pairs to `linmemalign` (plus the `qlen==0` fix and
+  64-bit length arithmetic).
+- **N3** — *FIXED* (`3b762eb`/`853b87a`/`f00510b`/`976069c`/`a64929c`). RNG
+  reworked to an in-house cross-platform facility: `--randseed` is now reproducible
+  across platforms and, for sintax, independent of `--threads`; the legacy 32-bit
+  `random()`/`arch_random` path was removed.
+- **CC1** — *ADDRESSED*. The ThreadSanitizer lane (Band 8) was stood up
+  (`threadsanitizer.yml`, PR #30) and the threaded data-race surface swept; it
+  found and fixed CC4/CC5, and the named suspects were cleared (see CC1–CC5).
 
 ### Band 2 — Crashes / heap corruption on reasonable input or option settings
 
@@ -2576,7 +2578,8 @@ backlog before touching code.
 ### Band 8 — Different methods, not more reading
 
 See "Analysis methods not yet applied." Under this philosophy the order is:
-**(1) ThreadSanitizer** (CC1 — threaded correctness on *normal* runs, so promoted),
+**(1) ThreadSanitizer** — *DONE* (`threadsanitizer.yml`, PR #30; CC1 addressed,
+CC4/CC5 found and fixed),
 **(2) parser fuzzing** (turns the needs-confirm items S6/S7/S9/S16/S19 into
 repros-or-clears), **(3) big-endian/non-glibc build** (validates the P1 portability
 items; lowest, as no such platform is supported today).
@@ -2599,14 +2602,15 @@ has reached diminishing returns. The remaining high-value work is not *more
 reading* but a small number of **different techniques** a read cannot substitute
 for. Each is scoped as separate, tool-driven effort, not part of this review.
 
-1. **ThreadSanitizer on the threaded commands.** The single biggest coverage gap.
-   Our concurrency reasoning (E4, L1, C1) is single-threaded; the actual data-race
-   surface (**CC1**) — workers in `search`/`cluster`/`chimera`/`sintax`/`allpairs`/
-   `orient` sharing `datap`/`seqindex`/the k-mer index and updating global counters
-   — is entirely outside today's CI (ASan/UBSan + Memcheck, none of which detect
-   races). Stand up a TSan build (mutually exclusive with ASan, so a separate lane)
-   and run the multi-threaded parts of the vsearch-tests suite under it. Highest
-   expected value of the three.
+1. **ThreadSanitizer on the threaded commands.** *DONE (`threadsanitizer.yml`,
+   PR #30).* This was the single biggest coverage gap. Our concurrency reasoning
+   (E4, L1, C1) is single-threaded; the actual data-race surface (**CC1**) —
+   workers in `search`/`cluster`/`chimera`/`sintax`/`allpairs`/`orient` sharing
+   `datap`/`seqindex`/the k-mer index and updating global counters — was entirely
+   outside the older CI (ASan/UBSan + Memcheck, none of which detect races). A TSan
+   lane (mutually exclusive with ASan, so separate) now runs the multi-threaded
+   vsearch-tests suite; it caught CC4 and confirmed the other suspects (CC5),
+   closing CC1.
 
 2. **Coverage-guided fuzzing of the parsers.** We found the crafted-input bugs
    (S1 UDB, S2/S15 SFF, S20 subsample, S18 chimera) by hand; the binary/text format
