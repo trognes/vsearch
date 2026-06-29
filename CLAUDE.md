@@ -4,8 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 VSEARCH is a 64-bit C++11 tool for metagenomics sequence analysis (search,
 clustering, chimera detection, dereplication, FASTQ processing, paired-end
-merging). It is a single CLI binary (`bin/vsearch`) plus an optional static
-library. This is a development fork; upstream is `torognes/vsearch`.
+merging and read synchronization). It is a single CLI binary (`bin/vsearch`)
+plus an optional static library. This is a development fork; upstream is
+`torognes/vsearch`.
 
 ## Editing conventions
 
@@ -39,10 +40,14 @@ make ARFLAGS="cr"            # produces bin/vsearch
 ### Debug builds and the NDEBUG default
 
 `./configure --enable-debug` switches the compile profile to `-UNDEBUG`
-(asserts **on**), `-D_GLIBCXX_DEBUG`, and a large extra-warning set. **The
-default build defines `-DNDEBUG`, so every `assert()` is compiled out** —
-including in CI and release binaries. Do not use `assert()` for input
-validation; use `fatal()`.
+(asserts **on**), `-D_GLIBCXX_DEBUG`, and a large extra-warning set — which now
+includes `-Wconversion -Wsign-conversion` (plus `-Wcast-qual -Wold-style-cast
+-Woverloaded-virtual -Wnon-virtual-dtor -Wuseless-cast`; see `src/Makefile.am`).
+The width-narrowing backlog (CODE_REVIEW.md P1) has been swept and the debug
+build is now the gate that keeps it from regressing, so a new narrowing will
+fail `--enable-debug` even though the default build is silent. **The default
+build defines `-DNDEBUG`, so every `assert()` is compiled out** — including in CI
+and release binaries. Do not use `assert()` for input validation; use `fatal()`.
 
 ### Sanitizer / Valgrind builds
 
@@ -88,23 +93,31 @@ bash ./scripts/cluster_fast.sh /abs/path/to/vsearch   # or pass the binary as $1
 CI workflows (`.github/workflows/`): `build-and-test` (default gate),
 `sanitizers` (ASan/UBSan, non-gating inventory), `threadsanitizer` (TSan,
 non-gating inventory; mutually exclusive with ASan, so a separate lane),
-`valgrind` (Memcheck, gating), `static-analysis` (cppcheck + clang-tidy,
-non-gating inventory; clang-tidy scoped to bug-finding checks via the repo
-`.clang-tidy`), `codeql` (C/C++ `security-extended`), `build-all` (cross-platform
-matrix, manual dispatch).
+`valgrind` (Memcheck, gating), `static-analysis` (cppcheck, per-PR non-gating
+inventory) and `static-analysis-clang-tidy` (clang-tidy, weekly; scoped to
+bug-finding checks via the repo `.clang-tidy` — split into its own file because
+its `clang-analyzer-*` checks are slow), `codeql` (C/C++ `security-extended`),
+`build-all` (cross-platform matrix, manual dispatch), plus `jekyll-gh-pages` and
+`prune-pages-deployments` (docs-site build and weekly deployment housekeeping).
+Note: the `build-and-test` FreeBSD lane is `continue-on-error` (non-gating) while
+the intermittent vmactions hang is sorted out.
 
 ## Architecture
 
 The README has a per-file table. The points below are the cross-file structure
 that isn't obvious from reading any single file.
 
-**CLI and option handling are a monolith.** `vsearch.cc` is ~6,300 lines; its
-`args_init` function alone is ~4,000. Each of ~248 CLI options is declared in
-**five parallel, manually-synchronized places** inside that file: the
-`option_*` enum, the `long_options[]` getopt table, the `switch
-(options_index)` handler, the `command_options[]` / `valid_options[][]`
-matrices, and the `cmd_help` help text. Adding or renaming an option means
-editing all five in lockstep.
+**CLI and option handling are a (now-split) monolith.** The option parser was
+lifted out of `vsearch.cc` into **`src/cli.cc`** (~4,500 lines; `args_init` is
+almost all of it). `vsearch.cc` is now ~1,900 lines holding `main()`, the
+command dispatch, the `cmd_help` help text, and the global state. Each of ~254
+CLI options is still declared in **five parallel, manually-synchronized
+places**, now spread across two files: in `cli.cc` the `option_*` enum, the
+`long_options[]` getopt table, the `switch (options_index)` handler, and the
+`command_options[]` / `valid_options[][]` matrices; and in `vsearch.cc` the
+`cmd_help` help text. Adding or renaming an option still means editing all five
+in lockstep (now across `cli.cc` *and* `vsearch.cc`). The extraction moved the
+duplication; it did not remove it — see E2/E3 in `CODE_REVIEW.md`.
 
 **Configuration lives in global state, mid-migration.** ~255 `opt_*` globals are
 declared in `vsearch.h`. A half-finished refactor introduced a `Parameters`
@@ -123,11 +136,15 @@ database sequences at once**, with `linmemalign.cc` for the linear-memory case.
 Nucleotides are 2-bit/4-bit encoded via `utils/maps.cpp` (index lookup tables
 through `to_uchar()` accessors).
 
-**SIMD is dispatched at runtime.** `cpu.cc` is compiled multiple times into
-`libcpu_sse2.a` / `libcpu_ssse3.a` (see `src/Makefile.am`); CPU features are
-detected at runtime to pick SSE2 vs SSSE3 on x86_64. AltiVec/VSX and Neon have
-native paths; `riscv64`/`mips64el` and other little-endian targets use the
-SIMDe fallback (`libsimde-dev`). Binary on-disk formats (UDB, SFF) assume a
+**SIMD is dispatched at runtime.** `cpu.cc` is still compiled multiple times into
+`libcpu_sse2.a` / `libcpu_ssse3.a` (plus `_pic` variants; see `src/Makefile.am`)
+for the instruction-set-specific code (e.g. `increment_counters_from_bitmap`).
+The runtime *detection* was extracted from `vsearch.cc` into
+`utils/cpu_features.cpp/.hpp` — `cpu_features_detect()` / `cpu_features_show()`,
+called from `main()`, set the `sse2_present` / `ssse3_present` / `avx*_present`
+globals used to pick SSE2 vs SSSE3 on x86_64. AltiVec/VSX and Neon have native
+paths; `riscv64`/`mips64el` and other little-endian targets use the SIMDe
+fallback (`libsimde-dev`). Binary on-disk formats (UDB, SFF) assume a
 little-endian host.
 
 **I/O flow.** `fastx.cc` sniffs FASTA vs FASTQ and dispatches to `fasta.cc` /
