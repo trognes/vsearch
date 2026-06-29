@@ -150,7 +150,7 @@ auto fastx_revcomp(struct Parameters const & parameters) -> void
         }
 
       auto const * p = fastx_get_sequence(input_handle);
-      reverse_complement(seq_buffer.data(), p, length);
+      reverse_complement(seq_buffer.data(), p, static_cast<int64_t>(length));
 
 
       /* quality values */
@@ -172,10 +172,10 @@ auto fastx_revcomp(struct Parameters const & parameters) -> void
           fasta_print_general(fp_fastaout,
                               nullptr,
                               seq_buffer.data(),
-                              length,
+                              static_cast<int>(length),
                               header,
-                              hlen,
-                              abundance,
+                              static_cast<int>(hlen),
+                              static_cast<uint64_t>(abundance),
                               count,
                               -1.0,
                               -1, -1, nullptr, 0.0,
@@ -186,11 +186,11 @@ auto fastx_revcomp(struct Parameters const & parameters) -> void
         {
           fastq_print_general(fp_fastqout,
                               seq_buffer.data(),
-                              length,
+                              static_cast<int>(length),
                               header,
-                              hlen,
+                              static_cast<int>(hlen),
                               qual_buffer.data(),
-                              abundance,
+                              static_cast<uint64_t>(abundance),
                               count,
                               -1.0);
         }
@@ -201,12 +201,12 @@ auto fastx_revcomp(struct Parameters const & parameters) -> void
 
   if (parameters.opt_fastaout != nullptr)
     {
-      fclose(fp_fastaout);
+      std::fclose(fp_fastaout);
     }
 
   if (parameters.opt_fastqout != nullptr)
     {
-      fclose(fp_fastqout);
+      std::fclose(fp_fastqout);
     }
 
   fastx_close(input_handle);
@@ -260,10 +260,10 @@ auto fastq_convert(struct Parameters const & parameters) -> void
       auto const * quality = fastq_get_quality(input_handle);
       for (uint64_t i = 0; i < length; i++)
         {
-          int q = quality[i] - parameters.opt_fastq_ascii;
+          int q = static_cast<int>(quality[i] - parameters.opt_fastq_ascii);
           if (q < parameters.opt_fastq_qmin)
             {
-              fprintf(stderr,
+              std::fprintf(stderr,
                       "\nFASTQ quality score (%d) below minimum (%" PRId64
                       ") in entry no %" PRIu64
                       " starting on line %" PRIu64 "\n",
@@ -275,7 +275,7 @@ auto fastq_convert(struct Parameters const & parameters) -> void
             }
           if (q > parameters.opt_fastq_qmax)
             {
-              fprintf(stderr,
+              std::fprintf(stderr,
                       "\nFASTQ quality score (%d) above maximum (%" PRId64
                       ") in entry no %" PRIu64
                       " starting on line %" PRIu64 "\n",
@@ -285,22 +285,22 @@ auto fastq_convert(struct Parameters const & parameters) -> void
                       fastq_get_lineno(input_handle));
               fatal("FASTQ quality score too high");
             }
-          q = std::max<int64_t>(q, parameters.opt_fastq_qminout);
-          q = std::min<int64_t>(q, parameters.opt_fastq_qmaxout);
-          q += parameters.opt_fastq_asciiout;
+          q = static_cast<int>(std::max<int64_t>(q, parameters.opt_fastq_qminout));
+          q = static_cast<int>(std::min<int64_t>(q, parameters.opt_fastq_qmaxout));
+          q += static_cast<int>(parameters.opt_fastq_asciiout);
           q = std::max(q, 33);
           q = std::min(q, 126);
-          normalized_quality[i] = q;
+          normalized_quality[i] = static_cast<char>(q);
         }
 
-      int const hlen = fastq_get_header_length(input_handle);
+      int const hlen = static_cast<int>(fastq_get_header_length(input_handle));
       fastq_print_general(fp_fastqout,
                           sequence,
-                          length,
+                          static_cast<int>(length),
                           header,
                           hlen,
                           normalized_quality.data(),
-                          abundance,
+                          static_cast<uint64_t>(abundance),
                           n_entries,
                           default_expected_error);  // refactoring: prefer function overload?
 
@@ -311,6 +311,6 @@ auto fastq_convert(struct Parameters const & parameters) -> void
 
   progress_done();
 
-  fclose(fp_fastqout);
+  std::fclose(fp_fastqout);
   fastq_close(input_handle);
 }

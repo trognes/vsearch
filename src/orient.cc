@@ -202,8 +202,8 @@ auto orient(struct Parameters const & parameters) -> void
         {
           hardmask_all();
         }
-      dbindex_prepare(1, opt_dbmask);
-      dbindex_addallsequences(opt_dbmask);
+      dbindex_prepare(1, static_cast<int>(opt_dbmask));
+      dbindex_addallsequences(static_cast<int>(opt_dbmask));
     }
 
   uhandle_s * uh_fwd = unique_init();
@@ -219,9 +219,9 @@ auto orient(struct Parameters const & parameters) -> void
                     chrmap_no_change_vector.data()))
     {
       char const * query_head = fastx_get_header(query_h);
-      int const query_head_len = fastx_get_header_length(query_h);
+      int const query_head_len = static_cast<int>(fastx_get_header_length(query_h));
       char const * qseq_fwd = fastx_get_sequence(query_h);
-      int const qseqlen = fastx_get_sequence_length(query_h);
+      int const qseqlen = static_cast<int>(fastx_get_sequence_length(query_h));
       int64_t const qsize = fastx_get_abundance(query_h);
       char const * query_qual_fwd = fastx_get_quality(query_h);
 
@@ -230,8 +230,8 @@ auto orient(struct Parameters const & parameters) -> void
       unsigned int kmer_count_fwd = 0;
       unsigned int const * kmer_list_fwd = nullptr;
 
-      unique_count(uh_fwd, opt_wordlength, qseqlen, qseq_fwd,
-                   & kmer_count_fwd, & kmer_list_fwd, opt_qmask);
+      unique_count(uh_fwd, static_cast<int>(opt_wordlength), qseqlen, qseq_fwd,
+                   & kmer_count_fwd, & kmer_list_fwd, static_cast<int>(opt_qmask));
 
       /* count kmers matching on each strand */
 
@@ -287,7 +287,7 @@ auto orient(struct Parameters const & parameters) -> void
                                   qseqlen,
                                   query_head,
                                   query_head_len,
-                                  qsize,
+                                  static_cast<uint64_t>(qsize),
                                   qmatches,
                                   -1.0,
                                   -1,
@@ -305,7 +305,7 @@ auto orient(struct Parameters const & parameters) -> void
                                   query_head,
                                   query_head_len,
                                   query_qual_fwd,
-                                  qsize,
+                                  static_cast<uint64_t>(qsize),
                                   qmatches,
                                   -1.0);
             }
@@ -321,7 +321,7 @@ auto orient(struct Parameters const & parameters) -> void
           /* alloc more mem if necessary to keep reverse sequence and qual */
           assert(qseqlen > 0);
           static_assert(sizeof(std::size_t) >= sizeof(int), "size_t is too small");
-          const std::size_t requirements = qseqlen + 1;
+          const std::size_t requirements = static_cast<std::size_t>(qseqlen) + 1;
           // refactoring: unsigned int qseqlen
           if (requirements > alloc)
             {
@@ -345,7 +345,7 @@ auto orient(struct Parameters const & parameters) -> void
                                   qseqlen,
                                   query_head,
                                   query_head_len,
-                                  qsize,
+                                  static_cast<uint64_t>(qsize),
                                   qmatches,
                                   -1.0,
                                   -1,
@@ -364,9 +364,9 @@ auto orient(struct Parameters const & parameters) -> void
                   // copy query string in reverse order
                   for (int i = 0; i < qseqlen; i++)
                     {
-                      query_qual_rev[i] = query_qual_fwd[qseqlen - 1 - i];
+                      query_qual_rev[static_cast<std::size_t>(i)] = query_qual_fwd[qseqlen - 1 - i];
                     }
-                  query_qual_rev[qseqlen] = '\0';
+                  query_qual_rev[static_cast<std::size_t>(qseqlen)] = '\0';
                 }
 
               fastq_print_general(fp_fastqout,
@@ -375,7 +375,7 @@ auto orient(struct Parameters const & parameters) -> void
                                   query_head,
                                   query_head_len,
                                   query_qual_rev.data(),
-                                  qsize,
+                                  static_cast<uint64_t>(qsize),
                                   qmatches,
                                   -1.0);
             }
@@ -397,7 +397,7 @@ auto orient(struct Parameters const & parameters) -> void
                                       query_head,
                                       query_head_len,
                                       query_qual_fwd,
-                                      qsize,
+                                      static_cast<uint64_t>(qsize),
                                       notmatched,
                                       -1.0);
                 }
@@ -409,7 +409,7 @@ auto orient(struct Parameters const & parameters) -> void
                                       qseqlen,
                                       query_head,
                                       query_head_len,
-                                      qsize,
+                                      static_cast<uint64_t>(qsize),
                                       notmatched,
                                       -1.0,
                                       -1,
@@ -423,7 +423,7 @@ auto orient(struct Parameters const & parameters) -> void
 
       if (opt_tabbedout != nullptr)
         {
-          fprintf(fp_tabbedout,
+          std::fprintf(fp_tabbedout,
                   "%s\t%c\t%u\t%u\n",
                   query_head,
                   strand == 0 ? '+' : (strand == 1 ? '-' : '?'),
@@ -447,78 +447,78 @@ auto orient(struct Parameters const & parameters) -> void
 
   if (opt_tabbedout != nullptr)
     {
-      fclose(fp_tabbedout);
+      std::fclose(fp_tabbedout);
     }
   if (opt_notmatched != nullptr)
     {
-      fclose(fp_notmatched);
+      std::fclose(fp_notmatched);
     }
   if (opt_fastqout != nullptr)
     {
-      fclose(fp_fastqout);
+      std::fclose(fp_fastqout);
     }
   if (opt_fastaout != nullptr)
     {
-      fclose(fp_fastaout);
+      std::fclose(fp_fastaout);
     }
 
   fasta_close(query_h);
 
   if (not opt_quiet)
     {
-      fprintf(stderr, "Forward oriented sequences: %d", matches_fwd);
+      std::fprintf(stderr, "Forward oriented sequences: %d", matches_fwd);
       if (queries > 0)
         {
-          fprintf(stderr, " (%.2f%%)", 100.0 * matches_fwd / queries);
+          std::fprintf(stderr, " (%.2f%%)", 100.0 * matches_fwd / queries);
         }
-      fprintf(stderr, "\n");
-      fprintf(stderr, "Reverse oriented sequences: %d", matches_rev);
+      std::fprintf(stderr, "\n");
+      std::fprintf(stderr, "Reverse oriented sequences: %d", matches_rev);
       if (queries > 0)
         {
-          fprintf(stderr, " (%.2f%%)", 100.0 * matches_rev / queries);
+          std::fprintf(stderr, " (%.2f%%)", 100.0 * matches_rev / queries);
         }
-      fprintf(stderr, "\n");
-      fprintf(stderr, "All oriented sequences:     %d", qmatches);
+      std::fprintf(stderr, "\n");
+      std::fprintf(stderr, "All oriented sequences:     %d", qmatches);
       if (queries > 0)
         {
-          fprintf(stderr, " (%.2f%%)", 100.0 * qmatches / queries);
+          std::fprintf(stderr, " (%.2f%%)", 100.0 * qmatches / queries);
         }
-      fprintf(stderr, "\n");
-      fprintf(stderr, "Not oriented sequences:     %d", notmatched);
+      std::fprintf(stderr, "\n");
+      std::fprintf(stderr, "Not oriented sequences:     %d", notmatched);
       if (queries > 0)
         {
-          fprintf(stderr, " (%.2f%%)", 100.0 * notmatched / queries);
+          std::fprintf(stderr, " (%.2f%%)", 100.0 * notmatched / queries);
         }
-      fprintf(stderr, "\n");
-      fprintf(stderr, "Total number of sequences:  %d\n", queries);
+      std::fprintf(stderr, "\n");
+      std::fprintf(stderr, "Total number of sequences:  %d\n", queries);
     }
 
   if (opt_log != nullptr)
     {
-      fprintf(fp_log, "Forward oriented sequences: %d", matches_fwd);
+      std::fprintf(fp_log, "Forward oriented sequences: %d", matches_fwd);
       if (queries > 0)
         {
-          fprintf(fp_log, " (%.2f%%)", 100.0 * matches_fwd / queries);
+          std::fprintf(fp_log, " (%.2f%%)", 100.0 * matches_fwd / queries);
         }
-      fprintf(fp_log, "\n");
-      fprintf(fp_log, "Reverse oriented sequences: %d", matches_rev);
+      std::fprintf(fp_log, "\n");
+      std::fprintf(fp_log, "Reverse oriented sequences: %d", matches_rev);
       if (queries > 0)
         {
-          fprintf(fp_log, " (%.2f%%)", 100.0 * matches_rev / queries);
+          std::fprintf(fp_log, " (%.2f%%)", 100.0 * matches_rev / queries);
         }
-      fprintf(fp_log, "\n");
-      fprintf(fp_log, "All oriented sequences:     %d", qmatches);
+      std::fprintf(fp_log, "\n");
+      std::fprintf(fp_log, "All oriented sequences:     %d", qmatches);
       if (queries > 0)
         {
-          fprintf(fp_log, " (%.2f%%)", 100.0 * qmatches / queries);
+          std::fprintf(fp_log, " (%.2f%%)", 100.0 * qmatches / queries);
         }
-      fprintf(fp_log, "\n");
-      fprintf(fp_log, "Not oriented sequences:     %d", notmatched);
+      std::fprintf(fp_log, "\n");
+      std::fprintf(fp_log, "Not oriented sequences:     %d", notmatched);
       if (queries > 0)
         {
-          fprintf(fp_log, " (%.2f%%)", 100.0 * notmatched / queries);
+          std::fprintf(fp_log, " (%.2f%%)", 100.0 * notmatched / queries);
         }
-      fprintf(fp_log, "\n");
-      fprintf(fp_log, "Total number of sequences:  %d\n", queries);
+      std::fprintf(fp_log, "\n");
+      std::fprintf(fp_log, "Total number of sequences:  %d\n", queries);
     }
 }

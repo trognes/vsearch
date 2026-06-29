@@ -90,7 +90,7 @@ auto arch_get_memused() -> uint64_t
   return r_usage.ru_maxrss;
 # else
   /* Linux: ru_maxrss gives the size in kilobytes  */
-  return r_usage.ru_maxrss * 1024;
+  return static_cast<uint64_t>(r_usage.ru_maxrss) * 1024;
 # endif
 
 #endif
@@ -134,7 +134,7 @@ auto arch_get_memtotal() -> uint64_t
     {
       fatal("Cannot determine amount of RAM");
     }
-  return pagesize * phys_pages;
+  return static_cast<uint64_t>(pagesize * phys_pages);
 
 #else
 
@@ -177,10 +177,10 @@ auto arch_get_user_system_time(double * user_time, double * system_time) -> void
 #else
   struct rusage r_usage;
   getrusage(RUSAGE_SELF, & r_usage);
-  * user_time = (r_usage.ru_utime.tv_sec * 1.0)
-    + (r_usage.ru_utime.tv_usec * 1.0e-6);
-  * system_time = (r_usage.ru_stime.tv_sec * 1.0)
-    + (r_usage.ru_stime.tv_usec * 1.0e-6);
+  * user_time = (static_cast<double>(r_usage.ru_utime.tv_sec) * 1.0)
+    + (static_cast<double>(r_usage.ru_utime.tv_usec) * 1.0e-6);
+  * system_time = (static_cast<double>(r_usage.ru_stime.tv_sec) * 1.0)
+    + (static_cast<double>(r_usage.ru_stime.tv_usec) * 1.0e-6);
 #endif
 }
 
@@ -213,7 +213,7 @@ auto xrealloc(void * ptr, std::size_t size) -> void *
 #ifdef _WIN32
   void * new_ptr = _aligned_realloc(ptr, size, vsearch_memalignment);
 #else
-  void * new_ptr = realloc(ptr, size);
+  void * new_ptr = std::realloc(ptr, size);
 #endif
   if (new_ptr == nullptr)
     {
@@ -230,7 +230,7 @@ auto xfree(void * ptr) -> void
 #ifdef _WIN32
       _aligned_free(ptr);
 #else
-      free(ptr);
+      std::free(ptr);
 #endif
     }
   else
@@ -265,7 +265,7 @@ auto xlseek(int file_descriptor, uint64_t offset, int whence) -> uint64_t
 #ifdef _WIN32
   return _lseeki64(file_descriptor, offset, whence);
 #else
-  return lseek(file_descriptor, offset, whence);  // libC or linuxism: replace with std::fseek()?
+  return static_cast<uint64_t>(lseek(file_descriptor, static_cast<off_t>(offset), whence));  // libC or linuxism: replace with std::fseek()?
 #endif
 }
 
@@ -276,7 +276,7 @@ auto xftello(std::FILE * stream) -> uint64_t
 #ifdef _WIN32
   return _ftelli64(stream);
 #else
-  return ftello(stream);
+  return static_cast<uint64_t>(ftello(stream));
 #endif
 }
 

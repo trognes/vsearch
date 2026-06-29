@@ -23,24 +23,19 @@ endif
 if ENABLE_DEBUG
 # next warnings to activate:
 # -fsanitize=undefined,address (run-time warnings; at first, try one at a time)
-# -Wconversion
-# -Wsign-conversion
 # GCC 14: -Wnrvo (Named Return Value Optimization)
 # evaluated and left disabled:
-# -Wuseless-cast: only fires inside SIMD intrinsics where the cast is
-#   load-bearing in a shared macro (align_simd.cc) or documents intent
-#   in a symmetric constant block (cpu.cc)
 # -Wformat=2: its only delta over -Wformat=1 is -Wformat-nonliteral,
 #   which fires on the non-variadic printf wrappers fatal()/warn() and
 #   cannot be silenced by __attribute__((format)) on a non-variadic
 #   function
 # -Wold-style-cast is a debug-build flag, and debug builds target
 #   x86_64, where it is verified clean. The __PPC__ and __aarch64__
-#   SIMD paths in align_simd.cc keep some C-style casts: the v_load /
-#   v_store macros must strip const while reinterpreting (the PPC
-#   ALIGNCORE loads from a const vector), and PPC AltiVec vector-value
-#   casts have no portable C++ named-cast equivalent. These paths are
-#   only compiled when cross-building for POWER/ARM.
+#   SIMD paths in align_simd.cc keep some C-style casts: PPC AltiVec
+#   vector-value reinterpretations (in v_mask_gt, v_store and the
+#   dprofile merge pipeline) have no portable C++ named-cast
+#   equivalent. These paths are only compiled when cross-building for
+#   POWER/ARM.
 AM_CFLAGS += -UNDEBUG -D_GLIBCXX_DEBUG -Wcast-align -Wdate-time \
              -Wdouble-promotion -Wduplicated-branches -Wduplicated-cond -Wfloat-equal \
              -Wformat=1 -Wformat-overflow -Wlogical-op -Wnull-dereference \
@@ -62,8 +57,17 @@ AM_CXXFLAGS = $(AM_CFLAGS) -std=c++11 -fno-exceptions
 # the bundled C sources (md5.c, sha1.c).
 # -Wcast-qual is also restricted here because sha1.c intentionally
 # casts away const (it byte-swaps its input block in place).
+# -Wconversion and -Wsign-conversion are likewise restricted to C++:
+# the bundled C sources md5.c and sha1.c rely on many implicit integer
+# conversions that are intrinsic to the upstream hashing code.
+# -Wuseless-cast: align_simd.cc, the historical blocker (the casts were
+# load-bearing in the v_load/v_store/ALIGNCORE macros), is clean now
+# that those are functions. results.cc keeps one flagged cast on
+# purpose: uint64_t -> size_t is a no-op on the 64-bit targets but is
+# retained as an explicit, portable narrowing.
 if ENABLE_DEBUG
-AM_CXXFLAGS += -Wcast-qual -Wnon-virtual-dtor -Wold-style-cast -Woverloaded-virtual
+AM_CXXFLAGS += -Wcast-qual -Wconversion -Wnon-virtual-dtor -Wold-style-cast \
+               -Woverloaded-virtual -Wsign-conversion -Wuseless-cast
 endif
 
 export MACOSX_DEPLOYMENT_TARGET=10.9
@@ -76,6 +80,7 @@ attributes.h \
 bitmap.h \
 chimera.h \
 city.h \
+cli.h \
 cluster.h \
 cpu.h \
 cut.h \
@@ -96,6 +101,7 @@ fastq_mergepairs.h \
 fastq_stats.h \
 fastqops.h \
 fastx.h \
+fastx_syncpairs.h \
 filter.h \
 getseq.h \
 kmerhash.h \
@@ -128,6 +134,7 @@ utils/check_output_filehandle.hpp \
 utils/cigar.hpp \
 utils/cigar_operations.hpp \
 utils/compare_strings_nocase.hpp \
+utils/cpu_features.hpp \
 utils/fatal.hpp \
 utils/kmer_hash_struct.hpp \
 utils/maps.hpp \
@@ -165,16 +172,20 @@ libcityhash_pic_a_SOURCES = city.cc city.h
 
 if TARGET_WIN
 
-libcityhash_a_CXXFLAGS = $(AM_CXXFLAGS) -Wno-sign-compare -D_MSC_VER
-libcityhash_pic_a_CXXFLAGS = $(AM_CXXFLAGS) -Wno-sign-compare -D_MSC_VER -fPIC
+# -Wno-conversion -Wno-sign-conversion: city.cc is vendored upstream
+# (Google CityHash) and is kept verbatim for easy resynchronisation;
+# its many implicit integer conversions are not ours to fix.
+libcityhash_a_CXXFLAGS = $(AM_CXXFLAGS) -Wno-sign-compare -Wno-conversion -Wno-sign-conversion -D_MSC_VER
+libcityhash_pic_a_CXXFLAGS = $(AM_CXXFLAGS) -Wno-sign-compare -Wno-conversion -Wno-sign-conversion -D_MSC_VER -fPIC
 __top_builddir__bin_vsearch_LDFLAGS = -static
 __top_builddir__bin_vsearch_LDADD = libcityhash.a libcpu_ssse3.a libcpu_sse2.a
 VSEARCH_PIC_LIBS = libcityhash_pic.a libcpu_ssse3_pic.a libcpu_sse2_pic.a
 
 else
 
-libcityhash_a_CXXFLAGS = $(AM_CXXFLAGS) -Wno-sign-compare
-libcityhash_pic_a_CXXFLAGS = $(AM_CXXFLAGS) -Wno-sign-compare -fPIC
+# -Wno-conversion -Wno-sign-conversion: see note in the TARGET_WIN branch above.
+libcityhash_a_CXXFLAGS = $(AM_CXXFLAGS) -Wno-sign-compare -Wno-conversion -Wno-sign-conversion
+libcityhash_pic_a_CXXFLAGS = $(AM_CXXFLAGS) -Wno-sign-compare -Wno-conversion -Wno-sign-conversion -fPIC
 
 if TARGET_X86_64
 __top_builddir__bin_vsearch_LDADD = libcityhash.a libcpu_ssse3.a libcpu_sse2.a
@@ -196,6 +207,7 @@ arch.cc \
 attributes.cc \
 bitmap.cc \
 chimera.cc \
+cli.cc \
 cluster.cc \
 cut.cc \
 db.cc \
@@ -215,6 +227,7 @@ fastq_mergepairs.cc \
 fastq_stats.cc \
 fastqops.cc \
 fastx.cc \
+fastx_syncpairs.cc \
 filter.cc \
 getseq.cc \
 kmerhash.cc \
@@ -248,6 +261,7 @@ utils/maps.cpp \
 utils/check_output_filehandle.cpp \
 utils/cigar.cpp \
 utils/compare_strings_nocase.cpp \
+utils/cpu_features.cpp \
 utils/open_file.cpp \
 utils/os_byteswap.cpp \
 utils/seqcmp.cpp \

@@ -153,7 +153,7 @@ auto find_header_end_first_blank(Span<char> raw_header) -> std::size_t {
   if (result != raw_header.end()) {
     *result = '\0';
   }
-  return std::distance(raw_header.begin(), result);
+  return static_cast<std::size_t>(std::distance(raw_header.begin(), result));
 }
 
 
@@ -164,7 +164,7 @@ auto find_header_end(Span<char> raw_header) -> std::size_t {
   if (result != raw_header.end()) {
     *result = '\0';
   }
-  return std::distance(raw_header.begin(), result);
+  return static_cast<std::size_t>(std::distance(raw_header.begin(), result));
 }
 
 
@@ -284,7 +284,7 @@ auto fastx_open(char const * filename) -> fastx_handle
     }
   else
     {
-      input_handle->file_size = fs.st_size;
+      input_handle->file_size = static_cast<uint64_t>(fs.st_size);
     }
 
   bool const is_stdin = (std::strcmp(filename, "-") == 0);
@@ -327,15 +327,15 @@ auto fastx_open(char const * filename) -> fastx_handle
       input_handle->format = Format::plain;
 
       // refactoring: fread() see C++ Weekly - Ep 482 - Safely Wrapping C APIs
-      auto const bytes_read = fread(magic.data(), 1, 2, input_handle->fp);
+      auto const bytes_read = std::fread(magic.data(), 1, 2, input_handle->fp);
 
       if (bytes_read >= 2)
         {
-          if (memcmp(magic.data(), magic_gzip.data(), 2) == 0)
+          if (std::memcmp(magic.data(), magic_gzip.data(), 2) == 0)
             {
               input_handle->format = Format::gzip;
             }
-          else if (memcmp(magic.data(), magic_bzip.data(), 2) == 0)
+          else if (std::memcmp(magic.data(), magic_bzip.data(), 2) == 0)
             {
               input_handle->format = Format::bzip;
             }
@@ -348,7 +348,7 @@ auto fastx_open(char const * filename) -> fastx_handle
       /* close and reopen to avoid problems with gzip library */
       /* rewind was not enough */
 
-      fclose(input_handle->fp);
+      std::fclose(input_handle->fp);
       input_handle->fp = fopen_input(filename);
       if (input_handle->fp == nullptr)
         {
@@ -453,17 +453,17 @@ auto fastx_open(char const * filename) -> fastx_handle
               fatal("Internal error");
             }
 
-          fclose(input_handle->fp);
+          std::fclose(input_handle->fp);
           input_handle->fp = nullptr;
 
           if (rest >= 2)
             {
-              if (memcmp(first, magic_gzip.data(), 2) == 0)
+              if (std::memcmp(first, magic_gzip.data(), 2) == 0)
                 {
                   fatal("File appears to be gzip compressed. Please use --gzip_decompress");
                 }
 
-              if (memcmp(first, magic_bzip.data(), 2) == 0)
+              if (std::memcmp(first, magic_bzip.data(), 2) == 0)
                 {
                   fatal("File appears to be bzip2 compressed. Please use --bzip2_decompress");
                 }
@@ -515,29 +515,29 @@ auto fastx_close(fastx_handle input_handle) -> void
 
   if (input_handle->stripped_all != 0U)
     {
-      fprintf(stderr, "WARNING: %" PRIu64 " invalid characters stripped from %s file:", input_handle->stripped_all, (input_handle->is_fastq ? "FASTQ" : "FASTA"));
+      std::fprintf(stderr, "WARNING: %" PRIu64 " invalid characters stripped from %s file:", input_handle->stripped_all, (input_handle->is_fastq ? "FASTQ" : "FASTA"));
       for (int i = 0; i < 256; i++)
         {
-          if (input_handle->stripped[i] != 0U)
+          if (input_handle->stripped[static_cast<std::size_t>(i)] != 0U)
             {
-              fprintf(stderr, " %c(%" PRIu64 ")", i, input_handle->stripped[i]);
+              std::fprintf(stderr, " %c(%" PRIu64 ")", i, input_handle->stripped[static_cast<std::size_t>(i)]);
             }
         }
-      fprintf(stderr, "\n");
-      fprintf(stderr, "REMINDER: vsearch does not support amino acid sequences\n");
+      std::fprintf(stderr, "\n");
+      std::fprintf(stderr, "REMINDER: vsearch does not support amino acid sequences\n");
 
       if (opt_log != nullptr)
         {
-          fprintf(fp_log, "WARNING: %" PRIu64 " invalid characters stripped from %s file:", input_handle->stripped_all, (input_handle->is_fastq ? "FASTQ" : "FASTA"));
+          std::fprintf(fp_log, "WARNING: %" PRIu64 " invalid characters stripped from %s file:", input_handle->stripped_all, (input_handle->is_fastq ? "FASTQ" : "FASTA"));
           for (int i = 0; i < 256; i++)
             {
-              if (input_handle->stripped[i] != 0U)
+              if (input_handle->stripped[static_cast<std::size_t>(i)] != 0U)
                 {
-                  fprintf(fp_log, " %c(%" PRIu64 ")", i, input_handle->stripped[i]);
+                  std::fprintf(fp_log, " %c(%" PRIu64 ")", i, input_handle->stripped[static_cast<std::size_t>(i)]);
                 }
             }
-          fprintf(fp_log, "\n");
-          fprintf(fp_log, "REMINDER: vsearch does not support amino acid sequences\n");
+          std::fprintf(fp_log, "\n");
+          std::fprintf(fp_log, "REMINDER: vsearch does not support amino acid sequences\n");
         }
     }
 
@@ -568,7 +568,7 @@ auto fastx_close(fastx_handle input_handle) -> void
       fatal("Internal error");
     }
 
-  fclose(input_handle->fp);
+  std::fclose(input_handle->fp);
   input_handle->fp = nullptr;
 
   buffer_free(& input_handle->file_buffer);
@@ -616,11 +616,11 @@ auto fastx_file_fill_buffer(fastx_handle input_handle) -> uint64_t
   switch (input_handle->format)
     {
     case Format::plain:
-      bytes_read = fread(input_handle->file_buffer.data
+      bytes_read = static_cast<int>(std::fread(input_handle->file_buffer.data
                          + input_handle->file_buffer.position,
                          1,
                          space,
-                         input_handle->fp);
+                         input_handle->fp));
       break;
 
     case Format::gzip:
@@ -628,7 +628,7 @@ auto fastx_file_fill_buffer(fastx_handle input_handle) -> uint64_t
       bytes_read = (*gzread_p)(input_handle->fp_gz,
                                input_handle->file_buffer.data
                                + input_handle->file_buffer.position,
-                               space);
+                               static_cast<unsigned int>(space));
       if (bytes_read < 0)
         {
           fatal("Unable to read gzip compressed file");
@@ -642,7 +642,7 @@ auto fastx_file_fill_buffer(fastx_handle input_handle) -> uint64_t
                                    input_handle->fp_bz,
                                    input_handle->file_buffer.data
                                    + input_handle->file_buffer.position,
-                                   space);
+                                   static_cast<int>(space));
       if ((bytes_read < 0) or
           not ((bzError == BZ_OK) or
              (bzError == BZ_STREAM_END) or
@@ -674,8 +674,8 @@ auto fastx_file_fill_buffer(fastx_handle input_handle) -> uint64_t
         }
     }
 
-  input_handle->file_buffer.length += bytes_read;
-  return bytes_read;
+  input_handle->file_buffer.length += static_cast<uint64_t>(bytes_read);
+  return static_cast<uint64_t>(bytes_read);
 }
 
 

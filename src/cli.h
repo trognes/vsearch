@@ -2,7 +2,7 @@
 
   VSEARCH: a versatile open source tool for metagenomics
 
-  Copyright (C) 2014-2026, Torbjorn Rognes, Frederic Mahe and Tomas Flouri
+  Copyright (C) 2014-2025, Torbjorn Rognes, Frederic Mahe and Tomas Flouri
   All rights reserved.
 
   Contact: Torbjorn Rognes <torognes@ifi.uio.no>,
@@ -58,21 +58,14 @@
 
 */
 
+// Command-line interface: parse and validate the user-supplied options,
+// populate the global opt_* variables and the Parameters struct, and report
+// usage errors. Extracted from vsearch.cc to keep the argument-parsing
+// machinery separate from the command dispatch and the main program.
+
 #pragma once
 
-struct bitmap_s
-{
-  unsigned char * bitmap; /* the actual bitmap */
-  unsigned int size;      /* size in bits */
-};
 
-
-auto bitmap_init(unsigned int size) -> struct bitmap_s *;
-
-auto bitmap_get(struct bitmap_s * a_bitmap, unsigned int seed_value) -> unsigned char;
-
-auto bitmap_reset_all(struct bitmap_s * a_bitmap) -> void;
-
-auto bitmap_set(struct bitmap_s * a_bitmap, unsigned int seed_value) -> void;
-
-auto bitmap_free(struct bitmap_s * a_bitmap) -> void;
+// Parse the command line, set all opt_* globals and the matching fields in
+// parameters, and validate the requested command and its options.
+auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void;

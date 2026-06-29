@@ -67,7 +67,7 @@
 #include <cinttypes>  // macros PRIu64 and PRId64
 #include <cstdint> // int64_t, uint64_t
 #include <cstdio> // std::FILE, std::fprintf, std::size_t, std::snprintf
-#include <cstring>  // std::memchr
+#include <cstring>  // std::memchr, std::strlen
 #include <iterator>  // std::next
 #include <vector>
 
@@ -244,7 +244,7 @@ auto fasta_filter_sequence(fastx_handle input_handle,
 
   /* add nullchar after sequence */
   *dest = '\0';
-  input_handle->sequence_buffer.length = dest - input_handle->sequence_buffer.data;
+  input_handle->sequence_buffer.length = static_cast<uint64_t>(dest - input_handle->sequence_buffer.data);
 }
 
 
@@ -277,7 +277,7 @@ auto fasta_next(fastx_handle input_handle,
           fastx_set_deferred_error(input_handle, "Invalid FASTA - header must start with > character");
           return false;
         }
-      fprintf(stderr, "Found character %02x\n", static_cast<unsigned char>(input_handle->file_buffer.data[input_handle->file_buffer.position]));
+      std::fprintf(stderr, "Found character %02x\n", static_cast<unsigned char>(input_handle->file_buffer.data[input_handle->file_buffer.position]));
       fatal("Invalid FASTA - header must start with > character");
     }
   ++input_handle->file_buffer.position;
@@ -309,7 +309,7 @@ auto fasta_next(fastx_handle input_handle,
       if (line_end != nullptr)
         {
           /* LF found, copy up to and including LF */
-          len = line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1;
+          len = static_cast<uint64_t>(line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1);
           ++input_handle->lineno;
         }
       buffer_extend(& input_handle->header_buffer,
@@ -339,14 +339,14 @@ auto fasta_next(fastx_handle input_handle,
         }
 
       /* find LF */
-      auto * const current_position = std::next(input_handle->file_buffer.data, input_handle->file_buffer.position);
+      auto * const current_position = std::next(input_handle->file_buffer.data, static_cast<std::ptrdiff_t>(input_handle->file_buffer.position));
       line_end = static_cast<char *>(std::memchr(current_position, '\n', rest));
 
       uint64_t len = rest;
       if (line_end != nullptr)
         {
           /* LF found, copy up to and including LF */
-          len = line_end - current_position + 1;
+          len = static_cast<uint64_t>(line_end - current_position + 1);
         }
       buffer_extend(& input_handle->sequence_buffer,
                     current_position,
@@ -368,7 +368,7 @@ auto fasta_get_abundance(struct fastx_s const * input_handle) -> int64_t
 {
   // return 1 if not present
   auto const size = header_get_size(input_handle->header_buffer.data,
-                                 input_handle->header_buffer.length);
+                                 static_cast<int>(input_handle->header_buffer.length));
   if (size > 0)
     {
       return size;
@@ -380,7 +380,7 @@ auto fasta_get_abundance(struct fastx_s const * input_handle) -> int64_t
 auto fasta_get_abundance_and_presence(struct fastx_s const * input_handle) -> int64_t
 {
   // return 0 if not present
-  return header_get_size(input_handle->header_buffer.data, input_handle->header_buffer.length);
+  return header_get_size(input_handle->header_buffer.data, static_cast<int>(input_handle->header_buffer.length));
 }
 
 
@@ -404,7 +404,7 @@ auto fasta_get_lineno(struct fastx_s const * input_handle) -> uint64_t
 
 auto fasta_get_seqno(struct fastx_s const * input_handle) -> uint64_t
 {
-  return input_handle->seqno;
+  return static_cast<uint64_t>(input_handle->seqno);
 }
 
 
@@ -465,7 +465,7 @@ auto fasta_print(std::FILE * output_handle, char const * header,
                  char const * seq, uint64_t const len) -> void
 {
   std::fprintf(output_handle, ">%s\n", header);
-  fasta_print_sequence(output_handle, seq, len, opt_fasta_width);
+  fasta_print_sequence(output_handle, seq, len, static_cast<int>(opt_fasta_width));
 }
 
 
@@ -498,6 +498,11 @@ auto fasta_print_general(std::FILE * output_handle,
       std::fprintf(output_handle, "%s", prefix);
     }
 
+  // track whether the text printed so far ends with the annotation
+  // separator ';', so that appended annotations are merged with a single
+  // separator instead of producing ";;" (see issue #271)
+  auto trailing_separator = false;
+
   if (opt_relabel_self)
     {
       fprint_seq_label(output_handle, seq, len);
@@ -519,77 +524,82 @@ auto fasta_print_general(std::FILE * output_handle,
       bool const strip_size = opt_xsize or (opt_sizeout and (abundance > 0));
       bool const strip_ee = opt_xee or ((opt_eeout or opt_fastq_eeout) and (expected_error >= 0.0));
       bool const strip_length = opt_xlength or opt_lengthout;
-      header_fprint_strip(output_handle,
-                          header,
-                          header_length,
-                          strip_size,
-                          strip_ee,
-                          strip_length);
+      trailing_separator = header_fprint_strip(output_handle,
+                                               header,
+                                               header_length,
+                                               strip_size,
+                                               strip_ee,
+                                               strip_length);
     }
 
   if (opt_label_suffix != nullptr)
     {
       std::fprintf(output_handle, "%s", opt_label_suffix);
+      if (*opt_label_suffix != '\0')
+        {
+          trailing_separator = (opt_label_suffix[std::strlen(opt_label_suffix) - 1] == ';');
+        }
     }
 
   if (opt_sample != nullptr)
     {
-      std::fprintf(output_handle, ";sample=%s", opt_sample);
+      std::fprintf(output_handle, "%ssample=%s", annotation_separator(trailing_separator), opt_sample);
     }
 
   if (clustersize > 0)
     {
-      std::fprintf(output_handle, ";seqs=%" PRId64, clustersize);
+      std::fprintf(output_handle, "%sseqs=%" PRId64, annotation_separator(trailing_separator), clustersize);
     }
 
   if (clusterid >= 0)
     {
-      std::fprintf(output_handle, ";clusterid=%d", clusterid);
+      std::fprintf(output_handle, "%sclusterid=%d", annotation_separator(trailing_separator), clusterid);
     }
 
   if (opt_sizeout and (abundance > 0))
     {
-      std::fprintf(output_handle, ";size=%" PRIu64, abundance);
+      std::fprintf(output_handle, "%ssize=%" PRIu64, annotation_separator(trailing_separator), abundance);
     }
 
   if (opt_centroid_sizeout and (centroid_size > 0))
     {
-      std::fprintf(output_handle, ";centroid_size=%" PRIu64, centroid_size);
+      std::fprintf(output_handle, "%scentroid_size=%" PRIu64, annotation_separator(trailing_separator), centroid_size);
     }
 
   if ((opt_eeout or opt_fastq_eeout) and (expected_error >= 0.0))
     {
+      auto const * separator = annotation_separator(trailing_separator);
       if (expected_error < 0.000000001) {
-        std::fprintf(output_handle, ";ee=%.13lf", expected_error);
+        std::fprintf(output_handle, "%see=%.13lf", separator, expected_error);
       } else if (expected_error < 0.00000001) {
-        std::fprintf(output_handle, ";ee=%.12lf", expected_error);
+        std::fprintf(output_handle, "%see=%.12lf", separator, expected_error);
       } else if (expected_error < 0.0000001) {
-        std::fprintf(output_handle, ";ee=%.11lf", expected_error);
+        std::fprintf(output_handle, "%see=%.11lf", separator, expected_error);
       } else if (expected_error < 0.000001) {
-        std::fprintf(output_handle, ";ee=%.10lf", expected_error);
+        std::fprintf(output_handle, "%see=%.10lf", separator, expected_error);
       } else if (expected_error < 0.00001) {
-        std::fprintf(output_handle, ";ee=%.9lf", expected_error);
+        std::fprintf(output_handle, "%see=%.9lf", separator, expected_error);
       } else if (expected_error < 0.0001) {
-        std::fprintf(output_handle, ";ee=%.8lf", expected_error);
+        std::fprintf(output_handle, "%see=%.8lf", separator, expected_error);
       } else if (expected_error < 0.001) {
-        std::fprintf(output_handle, ";ee=%.7lf", expected_error);
+        std::fprintf(output_handle, "%see=%.7lf", separator, expected_error);
       } else if (expected_error < 0.01) {
-        std::fprintf(output_handle, ";ee=%.6lf", expected_error);
+        std::fprintf(output_handle, "%see=%.6lf", separator, expected_error);
       } else if (expected_error < 0.1) {
-        std::fprintf(output_handle, ";ee=%.5lf", expected_error);
+        std::fprintf(output_handle, "%see=%.5lf", separator, expected_error);
       } else {
-        std::fprintf(output_handle, ";ee=%.4lf", expected_error);
+        std::fprintf(output_handle, "%see=%.4lf", separator, expected_error);
       }
     }
 
   if (opt_lengthout)
     {
-      std::fprintf(output_handle, ";length=%d", len);
+      std::fprintf(output_handle, "%slength=%d", annotation_separator(trailing_separator), len);
     }
 
   if (score_name != nullptr)
     {
-      std::fprintf(output_handle, ";%s=%.4lf", score_name, score);
+      std::fprintf(output_handle, "%s%s=%.4lf", annotation_separator(trailing_separator), score_name, score);
     }
 
   if (opt_relabel_keep and
@@ -602,40 +612,26 @@ auto fasta_print_general(std::FILE * output_handle,
 
   if (seq != nullptr)
     {
-      fasta_print_sequence(output_handle, seq, len, opt_fasta_width);
+      fasta_print_sequence(output_handle, seq, static_cast<uint64_t>(len), static_cast<int>(opt_fasta_width));
     }
 }
 
 
+// A single uint64_t ordinal parameter: it is the widest unsigned type, so
+// every caller (passing int, size_t or uint64_t, all non-negative 1-based
+// counters) converts without narrowing or sign-change. Two overloads taking
+// int and size_t were ambiguous for a uint64_t argument on platforms where
+// uint64_t, size_t and int are all distinct types (e.g. macOS).
 auto fasta_print_db_relabel(std::FILE * output_handle,
                             uint64_t seqno,
-                            int ordinal) -> void
+                            uint64_t ordinal) -> void
 {
   fasta_print_general(output_handle,
                       nullptr,
                       db_getsequence(seqno),
-                      db_getsequencelen(seqno),
+                      static_cast<int>(db_getsequencelen(seqno)),
                       db_getheader(seqno),
-                      db_getheaderlen(seqno),
-                      db_getabundance(seqno),
-                      ordinal,
-                      -1.0,
-                      -1, -1,
-                      nullptr, 0.0,
-                      0);
-}
-
-
-auto fasta_print_db_relabel(std::FILE * output_handle,
-                            uint64_t seqno,
-                            std::size_t ordinal) -> void
-{
-  fasta_print_general(output_handle,
-                      nullptr,
-                      db_getsequence(seqno),
-                      db_getsequencelen(seqno),
-                      db_getheader(seqno),
-                      db_getheaderlen(seqno),
+                      static_cast<int>(db_getheaderlen(seqno)),
                       db_getabundance(seqno),
                       static_cast<int64_t>(ordinal),
                       -1.0,
@@ -650,9 +646,9 @@ auto fasta_print_db(std::FILE * output_handle, uint64_t seqno) -> void
   fasta_print_general(output_handle,
                       nullptr,
                       db_getsequence(seqno),
-                      db_getsequencelen(seqno),
+                      static_cast<int>(db_getsequencelen(seqno)),
                       db_getheader(seqno),
-                      db_getheaderlen(seqno),
+                      static_cast<int>(db_getheaderlen(seqno)),
                       db_getabundance(seqno),
                       0,
                       -1.0,

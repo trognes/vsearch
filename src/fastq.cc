@@ -259,7 +259,7 @@ auto buffer_filter_extend(fastx_handle input_handle,
   for (auto i = 0ULL; i < len; i++)
     {
       auto const c = *p++;
-      char const m = char_action[static_cast<unsigned char>(c)];
+      char const m = static_cast<char>(char_action[static_cast<unsigned char>(c)]);
 
       switch (m)
         {
@@ -271,7 +271,7 @@ auto buffer_filter_extend(fastx_handle input_handle,
 
         case 1:
           /* legal character */
-          *q++ = char_mapping[static_cast<unsigned char>(c)];
+          *q++ = static_cast<char>(char_mapping[static_cast<unsigned char>(c)]);
           break;
 
         case 2:
@@ -295,7 +295,7 @@ auto buffer_filter_extend(fastx_handle input_handle,
 
   /* add zero after sequence */
   *q = 0;
-  dest_buffer->length += q - d;
+  dest_buffer->length += static_cast<uint64_t>(q - d);
 }
 
 
@@ -381,7 +381,7 @@ auto fastq_next(fastx_handle input_handle,
       if (line_end != nullptr)
         {
           /* LF found, copy up to and including LF */
-          len = line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1;
+          len = static_cast<uint64_t>(line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1);
           input_handle->lineno++;
         }
       buffer_extend(&input_handle->header_buffer,
@@ -420,7 +420,7 @@ auto fastq_next(fastx_handle input_handle,
       if (line_end != nullptr)
         {
           /* LF found, copy up to and including LF */
-          len = line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1;
+          len = static_cast<uint64_t>(line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1);
           input_handle->lineno++;
         }
 
@@ -437,14 +437,14 @@ auto fastq_next(fastx_handle input_handle,
         {
           if ((illegal_char >= 32) && (illegal_char < 127))
             {
-              snprintf(message.data(),
+              std::snprintf(message.data(),
                        max_message_length,
                        "Illegal sequence character '%c'",
                        illegal_char);
             }
           else
             {
-              snprintf(message.data(),
+              std::snprintf(message.data(),
                        max_message_length,
                        "Illegal sequence character (unprintable, no %d)",
                        static_cast<unsigned char>(illegal_char));
@@ -482,7 +482,7 @@ auto fastq_next(fastx_handle input_handle,
       if (line_end != nullptr)
         {
           /* LF found, copy up to and including LF */
-          len = line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1;
+          len = static_cast<uint64_t>(line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1);
           input_handle->lineno++;
         }
       buffer_extend(&input_handle->plusline_buffer,
@@ -497,7 +497,7 @@ auto fastq_next(fastx_handle input_handle,
   auto plusline_invalid = false;
   if (input_handle->header_buffer.length == input_handle->plusline_buffer.length)
     {
-      if ((memcmp(input_handle->header_buffer.data,
+      if ((std::memcmp(input_handle->header_buffer.data,
                  input_handle->plusline_buffer.data,
                   input_handle->header_buffer.length) != 0))
         {
@@ -550,7 +550,7 @@ auto fastq_next(fastx_handle input_handle,
       if (line_end != nullptr)
         {
           /* LF found, copy up to and including LF */
-          len = line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1;
+          len = static_cast<uint64_t>(line_end - (input_handle->file_buffer.data + input_handle->file_buffer.position) + 1);
           input_handle->lineno++;
         }
 
@@ -573,14 +573,14 @@ auto fastq_next(fastx_handle input_handle,
         {
           if ((illegal_char >= 32) && (illegal_char < 127))
             {
-              snprintf(message.data(),
+              std::snprintf(message.data(),
                        max_message_length,
                        "Illegal quality character '%c'",
                        illegal_char);
             }
           else
             {
-              snprintf(message.data(),
+              std::snprintf(message.data(),
                        max_message_length,
                        "Illegal quality character (unprintable, no %d)",
                        static_cast<unsigned char>(illegal_char));
@@ -637,7 +637,7 @@ auto fastq_get_lineno(struct fastx_s const * input_handle) -> uint64_t
 
 auto fastq_get_seqno(struct fastx_s const * input_handle) -> uint64_t
 {
-  return input_handle->seqno;
+  return static_cast<uint64_t>(input_handle->seqno);
 }
 
 
@@ -669,7 +669,7 @@ auto fastq_get_abundance(struct fastx_s const * input_handle) -> int64_t
 {
   // return 1 if not present
   auto const size = header_get_size(input_handle->header_buffer.data,
-                                 input_handle->header_buffer.length);
+                                 static_cast<int>(input_handle->header_buffer.length));
   if (size > 0)
     {
       return size;
@@ -681,7 +681,7 @@ auto fastq_get_abundance(struct fastx_s const * input_handle) -> int64_t
 auto fastq_get_abundance_and_presence(struct fastx_s const * input_handle) -> int64_t
 {
   // return 0 if not present
-  return header_get_size(input_handle->header_buffer.data, input_handle->header_buffer.length);
+  return header_get_size(input_handle->header_buffer.data, static_cast<int>(input_handle->header_buffer.length));
 }
 
 
@@ -704,6 +704,11 @@ auto fastq_print_general(FILE * output_handle,
 {
   std::fprintf(output_handle, "@");
 
+  // track whether the text printed so far ends with the annotation
+  // separator ';', so that appended annotations are merged with a single
+  // separator instead of producing ";;" (see issue #271)
+  auto trailing_separator = false;
+
   if (opt_relabel_self)
     {
       fprint_seq_label(output_handle, seq, len);
@@ -725,57 +730,62 @@ auto fastq_print_general(FILE * output_handle,
       auto const xsize = opt_xsize || (opt_sizeout && (abundance > 0));
       auto const xee = opt_xee || ((opt_eeout || opt_fastq_eeout) && (expected_error >= 0.0));
       auto const xlength = opt_xlength || opt_lengthout;
-      header_fprint_strip(output_handle,
-                          header,
-                          header_len,
-                          xsize,
-                          xee,
-                          xlength);
+      trailing_separator = header_fprint_strip(output_handle,
+                                               header,
+                                               header_len,
+                                               xsize,
+                                               xee,
+                                               xlength);
     }
 
   if (opt_label_suffix != nullptr)
     {
       std::fprintf(output_handle, "%s", opt_label_suffix);
+      if (*opt_label_suffix != '\0')
+        {
+          trailing_separator = (opt_label_suffix[std::strlen(opt_label_suffix) - 1] == ';');
+        }
     }
 
   if (opt_sample != nullptr)
     {
-      std::fprintf(output_handle, ";sample=%s", opt_sample);
+      std::fprintf(output_handle, "%ssample=%s", annotation_separator(trailing_separator), opt_sample);
     }
 
   if (opt_sizeout && (abundance > 0))
     {
-      std::fprintf(output_handle, ";size=%" PRIu64, abundance);
+      std::fprintf(output_handle, "%ssize=%" PRIu64, annotation_separator(trailing_separator), abundance);
     }
 
   if ((opt_eeout || opt_fastq_eeout) && (expected_error >= 0.0))
     {
+      auto const * separator = annotation_separator(trailing_separator);
       if (expected_error < 0.000000001) {
-        std::fprintf(output_handle, ";ee=%.13lf", expected_error);
+        std::fprintf(output_handle, "%see=%.13lf", separator, expected_error);
       } else if (expected_error < 0.00000001) {
-        std::fprintf(output_handle, ";ee=%.12lf", expected_error);
+        std::fprintf(output_handle, "%see=%.12lf", separator, expected_error);
       } else if (expected_error < 0.0000001) {
-        std::fprintf(output_handle, ";ee=%.11lf", expected_error);
+        std::fprintf(output_handle, "%see=%.11lf", separator, expected_error);
       } else if (expected_error < 0.000001) {
-        std::fprintf(output_handle, ";ee=%.10lf", expected_error);
+        std::fprintf(output_handle, "%see=%.10lf", separator, expected_error);
       } else if (expected_error < 0.00001) {
-        std::fprintf(output_handle, ";ee=%.9lf", expected_error);
+        std::fprintf(output_handle, "%see=%.9lf", separator, expected_error);
       } else if (expected_error < 0.0001) {
-        std::fprintf(output_handle, ";ee=%.8lf", expected_error);
+        std::fprintf(output_handle, "%see=%.8lf", separator, expected_error);
       } else if (expected_error < 0.001) {
-        std::fprintf(output_handle, ";ee=%.7lf", expected_error);
+        std::fprintf(output_handle, "%see=%.7lf", separator, expected_error);
       } else if (expected_error < 0.01) {
-        std::fprintf(output_handle, ";ee=%.6lf", expected_error);
+        std::fprintf(output_handle, "%see=%.6lf", separator, expected_error);
       } else if (expected_error < 0.1) {
-        std::fprintf(output_handle, ";ee=%.5lf", expected_error);
+        std::fprintf(output_handle, "%see=%.5lf", separator, expected_error);
       } else {
-        std::fprintf(output_handle, ";ee=%.4lf", expected_error);
+        std::fprintf(output_handle, "%see=%.4lf", separator, expected_error);
       }
     }
 
   if (opt_lengthout)
     {
-      std::fprintf(output_handle, ";length=%d", len);
+      std::fprintf(output_handle, "%slength=%d", annotation_separator(trailing_separator), len);
     }
 
   if (opt_relabel_keep &&

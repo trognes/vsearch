@@ -151,13 +151,13 @@ namespace {
     auto const is_odd = ((num_used % 2) != 0U);
     if (is_odd) {
       // index is zero-based, so if size == 3, midpoint == 1
-      auto const index = midpoint.quot;
+      auto const index = static_cast<std::size_t>(midpoint.quot);
       return hashtable[index].size;
     }
     // pair number of elements:
     // index is zero-based, so if size == 4, midpoint == 2, lhs index == 1
-    auto const lhs_index = midpoint.quot - 1;
-    auto const rhs_index = midpoint.quot;
+    auto const lhs_index = static_cast<std::size_t>(midpoint.quot - 1);
+    auto const rhs_index = static_cast<std::size_t>(midpoint.quot);
     auto const lhs_size = hashtable[lhs_index].size;
     auto const rhs_size = hashtable[rhs_index].size;
     // sorted by decreasing abundance: lhs size > rhs size
@@ -386,8 +386,8 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
 
   show_rusage();
 
-  std::vector<char> seq_up(alloc_seqlen + 1);
-  std::vector<char> rc_seq_up(alloc_seqlen + 1);
+  std::vector<char> seq_up(static_cast<std::size_t>(alloc_seqlen) + 1);
+  std::vector<char> rc_seq_up(static_cast<std::size_t>(alloc_seqlen) + 1);
   std::string const prompt = std::string("Dereplicating file ") + input_filename;
 
   progress_init(prompt.c_str(), filesize);
@@ -405,7 +405,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
 
   while (fastx_next(input_handle, not parameters.opt_notrunclabels, chrmap_no_change_vector.data()))
     {
-      int64_t const seqlen = fastx_get_sequence_length(input_handle);
+      int64_t const seqlen = static_cast<int64_t>(fastx_get_sequence_length(input_handle));
 
       if (seqlen < parameters.opt_minseqlength)
         {
@@ -419,7 +419,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
           continue;
         }
 
-      nucleotidecount += seqlen;
+      nucleotidecount += static_cast<uint64_t>(seqlen);
       longest = std::max(seqlen, longest);
       shortest = std::min(seqlen, shortest);
 
@@ -428,8 +428,8 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
       if (seqlen > alloc_seqlen)
         {
           alloc_seqlen = seqlen;
-          seq_up.resize(alloc_seqlen + 1);
-          rc_seq_up.resize(alloc_seqlen + 1);
+          seq_up.resize(static_cast<std::size_t>(alloc_seqlen) + 1);
+          rc_seq_up.resize(static_cast<std::size_t>(alloc_seqlen) + 1);
 
           show_rusage();
         }
@@ -468,7 +468,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
       auto const * qual = fastx_get_quality(input_handle); // nullptr if FASTA
 
       /* normalize sequence: uppercase and replace U by T  */
-      string_normalize(seq_up.data(), seq, seqlen);
+      string_normalize(seq_up.data(), seq, static_cast<unsigned int>(seqlen));
 
       /* reverse complement if necessary */
       if (parameters.opt_strand)
@@ -486,7 +486,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
 
       auto const hash_header = use_header ? hash_function(header, headerlen) : uint64_t{0};
 
-      auto const hash = hash_function(seq_up.data(), seqlen) ^ hash_header;
+      auto const hash = hash_function(seq_up.data(), static_cast<uint64_t>(seqlen)) ^ hash_header;
       auto j = hash & hash_mask;
       auto * bp = &hashtable[j];  // refactoring: rename to "cluster"
 
@@ -504,7 +504,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
           /* no match on plus strand */
           /* check minus strand as well */
 
-          auto const rc_hash = hash_function(rc_seq_up.data(), seqlen) ^ hash_header;
+          auto const rc_hash = hash_function(rc_seq_up.data(), static_cast<uint64_t>(seqlen)) ^ hash_header;
           auto k = rc_hash & hash_mask;
           auto * rc_bp = &hashtable[k];
 
@@ -538,8 +538,8 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
           if (extra_info)
             {
               unsigned int const last = bp->seqno_last;
-              nextseqtab[last] = sequencecount;
-              bp->seqno_last = sequencecount;
+              nextseqtab[last] = static_cast<unsigned int>(sequencecount);
+              bp->seqno_last = static_cast<unsigned int>(sequencecount);
               headertab[sequencecount] = header;
             }
 
@@ -570,7 +570,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
                     {
                       // fastq_qout_avg
                       /* average, as in USEARCH */
-                      p3 = ((p1 * s1) + (p2 * s2)) / s3;
+                      p3 = ((p1 * static_cast<double>(s1)) + (p2 * static_cast<double>(s2))) / static_cast<double>(s3);
                     }
 
                   // fastq_qout_min
@@ -598,20 +598,20 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
                   // p3 = 0.0;
 
                   int const q3 = convert_probability_to_quality_symbol(p3, parameters);
-                  bp->qual[i] = q3;
+                  bp->qual[i] = static_cast<char>(q3);
                 }
             }
 
-          bp->size = s3;
+          bp->size = static_cast<unsigned int>(s3);
           ++bp->count;
         }
       else
         {
           /* no identical sequences yet */
-          bp->size = abundance;
+          bp->size = static_cast<unsigned int>(abundance);
           bp->hash = hash;
-          bp->seqno_first = sequencecount;
-          bp->seqno_last = sequencecount;
+          bp->seqno_first = static_cast<unsigned int>(sequencecount);
+          bp->seqno_last = static_cast<unsigned int>(sequencecount);
           bp->seq = xstrdup(seq);
           bp->header = xstrdup(header);
           bp->count = 1;
@@ -638,18 +638,18 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
     {
       if (sequencecount > 0)
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "%" PRIu64 " nt in %" PRIu64 " seqs, min %" PRIu64
                   ", max %" PRIu64 ", avg %.0f\n",
                   nucleotidecount,
                   sequencecount,
                   shortest,
                   longest,
-                  nucleotidecount * 1.0 / sequencecount);
+                  static_cast<double>(nucleotidecount) * 1.0 / static_cast<double>(sequencecount));
         }
       else
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "%" PRIu64 " nt in %" PRIu64 " seqs\n",
                   nucleotidecount,
                   sequencecount);
@@ -660,18 +660,18 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
     {
       if (sequencecount > 0)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%" PRIu64 " nt in %" PRIu64 " seqs, min %" PRIu64
                   ", max %" PRIu64 ", avg %.0f\n",
                   nucleotidecount,
                   sequencecount,
                   shortest,
                   longest,
-                  nucleotidecount * 1.0 / sequencecount);
+                  static_cast<double>(nucleotidecount) * 1.0 / static_cast<double>(sequencecount));
         }
       else
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%" PRIu64 " nt in %" PRIu64 " seqs\n",
                   nucleotidecount,
                   sequencecount);
@@ -680,7 +680,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
 
   if (discarded_short != 0U)
     {
-      fprintf(stderr,
+      std::fprintf(stderr,
               "minseqlength %" PRId64 ": %" PRId64 " %s discarded.\n",
               parameters.opt_minseqlength,
               discarded_short,
@@ -688,7 +688,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
 
       if (parameters.opt_log != nullptr)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "minseqlength %" PRId64 ": %" PRId64 " %s discarded.\n\n",
                   parameters.opt_minseqlength,
                   discarded_short,
@@ -698,7 +698,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
 
   if (discarded_long != 0U)
     {
-      fprintf(stderr,
+      std::fprintf(stderr,
               "maxseqlength %" PRId64 ": %" PRId64 " %s discarded.\n",
               parameters.opt_maxseqlength,
               discarded_long,
@@ -706,7 +706,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
 
       if (parameters.opt_log != nullptr)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "maxseqlength %" PRId64 ": %" PRId64 " %s discarded.\n\n",
                   parameters.opt_maxseqlength,
                   discarded_long,
@@ -717,25 +717,25 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
   show_rusage();
 
   progress_init("Sorting", 1);
-  qsort(hashtable.data(), hashtablesize, sizeof(struct bucket), derep_compare_full);
+  std::qsort(hashtable.data(), hashtablesize, sizeof(struct bucket), derep_compare_full);
   progress_done();
 
   show_rusage();
 
   auto const median = find_median_size(hashtable, clusters);
 
-  average = 1.0 * sumsize / clusters;
+  average = 1.0 * static_cast<double>(sumsize) / static_cast<double>(clusters);
 
   if (clusters < 1)
     {
       if (not parameters.opt_quiet)
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "0 unique sequences\n");
         }
       if (parameters.opt_log != nullptr)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "0 unique sequences\n\n");
         }
     }
@@ -743,7 +743,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
     {
       if (not parameters.opt_quiet)
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "%" PRId64
                   " unique sequences, avg cluster %.1lf, median %.0f, max %"
                   PRIu64 "\n",
@@ -751,7 +751,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
         }
       if (parameters.opt_log != nullptr)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%" PRId64
                   " unique sequences, avg cluster %.1lf, median %.0f, max %"
                   PRIu64 "\n\n",
@@ -782,10 +782,10 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
               fasta_print_general(fp_fastaout,
                                   nullptr,
                                   cluster.seq,
-                                  std::strlen(cluster.seq),
+                                  static_cast<int>(std::strlen(cluster.seq)),
                                   cluster.header,
-                                  std::strlen(cluster.header),
-                                  size,
+                                  static_cast<int>(std::strlen(cluster.header)),
+                                  static_cast<uint64_t>(size),
                                   relabel_count,
                                   -1.0,
                                   -1, -1, nullptr, 0.0,
@@ -799,7 +799,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
         }
 
       progress_done();
-      fclose(fp_fastaout);
+      std::fclose(fp_fastaout);
     }
 
   if (parameters.opt_fastqout != nullptr)
@@ -816,11 +816,11 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
               ++relabel_count;
               fastq_print_general(fp_fastqout,
                                   cluster.seq,
-                                  std::strlen(cluster.seq),
+                                  static_cast<int>(std::strlen(cluster.seq)),
                                   cluster.header,
-                                  std::strlen(cluster.header),
+                                  static_cast<int>(std::strlen(cluster.header)),
                                   cluster.qual,
-                                  size,
+                                  static_cast<uint64_t>(size),
                                   relabel_count,
                                   -1.0);
               if (relabel_count == parameters.opt_topn)
@@ -832,7 +832,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
         }
 
       progress_done();
-      fclose(fp_fastqout);
+      std::fclose(fp_fastqout);
     }
 
   show_rusage();
@@ -843,16 +843,16 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
       for (uint64_t i = 0; i < clusters; ++i)
         {
           auto const & cluster = hashtable[i];
-          int64_t const len = std::strlen(cluster.seq);
+          int64_t const len = static_cast<int64_t>(std::strlen(cluster.seq));
 
-          fprintf(fp_uc, "S\t%" PRId64 "\t%" PRId64 "\t*\t*\t*\t*\t*\t%s\t*\n",
+          std::fprintf(fp_uc, "S\t%" PRId64 "\t%" PRId64 "\t*\t*\t*\t*\t*\t%s\t*\n",
                   i, len, cluster.header);
 
           for (auto next = nextseqtab[cluster.seqno_first];
                next != terminal;
                next = nextseqtab[next])
             {
-              fprintf(fp_uc,
+              std::fprintf(fp_uc,
                       "H\t%" PRId64 "\t%" PRId64 "\t%.1f\t%s\t0\t0\t*\t%s\t%s\n",
                       i, len, 100.0,
                       ((match_strand[next] != 0) ? "-" : "+"),
@@ -867,11 +867,11 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
       for (uint64_t i = 0; i < clusters; ++i)
         {
           auto const & cluster = hashtable[i];
-          fprintf(fp_uc, "C\t%" PRId64 "\t%u\t*\t*\t*\t*\t*\t%s\t*\n",
+          std::fprintf(fp_uc, "C\t%" PRId64 "\t%u\t*\t*\t*\t*\t*\t%s\t*\n",
                   i, cluster.size, cluster.header);
           progress_update(i);
         }
-      fclose(fp_uc);
+      std::fclose(fp_uc);
       progress_done();
     }
 
@@ -883,11 +883,11 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
           auto const & cluster = hashtable[i];
 
           if (parameters.opt_relabel != nullptr) {
-            fprintf(fp_tabbedout,
+            std::fprintf(fp_tabbedout,
                     "%s\t%s%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%s\n",
                     cluster.header, parameters.opt_relabel, i + 1, i, static_cast<uint64_t>(0), cluster.count, cluster.header);
           } else {
-            fprintf(fp_tabbedout, "%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%u\t%s\n",
+            std::fprintf(fp_tabbedout, "%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%u\t%s\n",
                     cluster.header, cluster.header, i, static_cast<uint64_t>(0), cluster.count, cluster.header);
           }
 
@@ -897,11 +897,11 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
                next = nextseqtab[next])
             {
               if (parameters.opt_relabel != nullptr) {
-                fprintf(fp_tabbedout,
+                std::fprintf(fp_tabbedout,
                         "%s\t%s%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%s\n",
                         headertab[next].c_str(), parameters.opt_relabel, i + 1, i, j, cluster.count, cluster.header);
               } else {
-                fprintf(fp_tabbedout,
+                std::fprintf(fp_tabbedout,
                         "%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%u\t%s\n",
                         headertab[next].c_str(), cluster.header, i, j, cluster.count, cluster.header);
               }
@@ -910,7 +910,7 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
 
           progress_update(i);
         }
-      fclose(fp_tabbedout);
+      std::fclose(fp_tabbedout);
       progress_done();
     }
 
@@ -921,20 +921,20 @@ auto derep(struct Parameters const & parameters, char * input_filename, bool con
     {
       if (not parameters.opt_quiet)
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "%" PRId64 " uniques written, %"
                   PRId64 " clusters discarded (%.1f%%)\n",
                   selected, clusters - selected,
-                  100.0 * (clusters - selected) / clusters);
+                  100.0 * static_cast<double>(clusters - selected) / static_cast<double>(clusters));
         }
 
       if (parameters.opt_log != nullptr)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%" PRId64 " uniques written, %"
                   PRId64 " clusters discarded (%.1f%%)\n\n",
                   selected, clusters - selected,
-                  100.0 * (clusters - selected) / clusters);
+                  100.0 * static_cast<double>(clusters - selected) / static_cast<double>(clusters));
         }
     }
 
@@ -1019,11 +1019,11 @@ auto derep_add_sequence(struct derep_session_s * ds,
   /* Grow seq_up buffer if needed */
   if (seqlen + 1 > static_cast<int>(ds->seq_up.size()))
     {
-      ds->seq_up.resize(seqlen + 1);
+      ds->seq_up.resize(static_cast<std::size_t>(seqlen) + 1);
     }
 
   /* Normalize: uppercase, U→T */
-  string_normalize(ds->seq_up.data(), sequence, seqlen);
+  string_normalize(ds->seq_up.data(), sequence, static_cast<unsigned int>(seqlen));
 
   /* Rehash if needed */
   if (ds->clusters + 1 > ds->alloc_clusters)
@@ -1035,7 +1035,7 @@ auto derep_add_sequence(struct derep_session_s * ds,
     }
 
   /* Hash and probe */
-  auto const hash = hash_cityhash64(ds->seq_up.data(), seqlen);
+  auto const hash = hash_cityhash64(ds->seq_up.data(), static_cast<uint64_t>(seqlen));
   auto j = hash & ds->hash_mask;
   auto * bp = &ds->hashtable[j];
 
@@ -1050,18 +1050,18 @@ auto derep_add_sequence(struct derep_session_s * ds,
   if (bp->size != 0U)
     {
       /* Existing unique sequence — merge */
-      bp->size += abundance;
+      bp->size += static_cast<unsigned int>(abundance);
       ++bp->count;
     }
   else
     {
       /* New unique sequence */
-      bp->size = abundance;
+      bp->size = static_cast<unsigned int>(abundance);
       bp->hash = hash;
       bp->seq = xstrdup(ds->seq_up.data());
       bp->header = xstrdup(header);
       bp->count = 1;
-      bp->seqlen = seqlen;
+      bp->seqlen = static_cast<unsigned int>(seqlen);
       bp->qual = nullptr;
       bp->seqno_first = ds->next_seqno;
       bp->seqno_last = ds->next_seqno;
@@ -1096,7 +1096,7 @@ auto derep_get_results(struct derep_session_s * ds,
       results[count].sequence = b.seq;
       results[count].abundance = b.size;
       results[count].seqlen = b.seqlen;
-      results[count].count = b.count;
+      results[count].count = static_cast<int>(b.count);
       ++count;
     }
   *result_count = count;

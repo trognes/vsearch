@@ -127,7 +127,7 @@ namespace {
             break;
           }
 
-        offset = first_occurence - header;
+        offset = static_cast<int>(first_occurence - header);
 
         /* check for ';' in front */
         if ((offset > 0) and (header[offset - 1] != ';'))
@@ -176,8 +176,8 @@ namespace {
                                                             & start,
                                                             & end);
     if (not attribute_is_present) { return; }
-    attribute_start[nth_attribute] = start;
-    attribute_end[nth_attribute] = end;
+    attribute_start[static_cast<std::size_t>(nth_attribute)] = start;
+    attribute_end[static_cast<std::size_t>(nth_attribute)] = end;
     ++nth_attribute;
   }
 
@@ -215,12 +215,27 @@ auto header_get_size(char const * header, int const header_length) -> int64_t {
 }
 
 
+auto annotation_separator(bool & trailing_separator) -> char const * {
+  /*
+    Return the separator to prepend to the next annotation. When the text
+    printed so far already ends with the separator ';' (e.g. a header or a
+    label suffix ending with ';'), reuse it rather than emit a second one,
+    so that annotations are merged with a single ';' (see issue #271).
+  */
+  if (trailing_separator) {
+    trailing_separator = false;
+    return "";
+  }
+  return ";";
+}
+
+
 auto header_fprint_strip(std::FILE * output_handle,
                          char const * header,
                          int const header_length,
                          bool const strip_size,
                          bool const strip_ee,
-                         bool const strip_length) -> void
+                         bool const strip_length) -> bool
 {
   auto nth_attribute = 0;
   std::array<int, n_expected_attributes> attribute_start {{}};
@@ -258,10 +273,10 @@ auto header_fprint_strip(std::FILE * output_handle,
     {
       for (auto i = 0; i < limit; ++i)
         {
-          if (attribute_start[i] > attribute_start[i + 1])
+          if (attribute_start[static_cast<std::size_t>(i)] > attribute_start[static_cast<std::size_t>(i + 1)])
             {
-              std::swap(attribute_start[i], attribute_start[i + 1]);
-              std::swap(attribute_end[i], attribute_end[i + 1]);
+              std::swap(attribute_start[static_cast<std::size_t>(i)], attribute_start[static_cast<std::size_t>(i + 1)]);
+              std::swap(attribute_end[static_cast<std::size_t>(i)], attribute_end[static_cast<std::size_t>(i + 1)]);
               last_swap = i;
             }
         }
@@ -270,9 +285,12 @@ auto header_fprint_strip(std::FILE * output_handle,
 
   /* print */
 
+  auto last_index = -1;  // index in 'header' of the last emitted character
+
   if (nth_attribute == 0)
     {
       std::fprintf(output_handle, "%.*s", header_length, header);
+      if (header_length > 0) { last_index = header_length - 1; }
     }
   else
     {
@@ -280,13 +298,14 @@ auto header_fprint_strip(std::FILE * output_handle,
       for (auto i = 0; i < nth_attribute; ++i)
         {
           /* print part of header in front of this attribute */
-          if (attribute_start[i] > prev_end + 1)
+          if (attribute_start[static_cast<std::size_t>(i)] > prev_end + 1)
             {
               std::fprintf(output_handle, "%.*s",
-                      attribute_start[i] - prev_end - 1,
+                      attribute_start[static_cast<std::size_t>(i)] - prev_end - 1,
                       header + prev_end);
+              last_index = attribute_start[static_cast<std::size_t>(i)] - 2;
             }
-          prev_end = attribute_end[i];
+          prev_end = attribute_end[static_cast<std::size_t>(i)];
         }
 
       /* print the rest, if any */
@@ -295,6 +314,10 @@ auto header_fprint_strip(std::FILE * output_handle,
           std::fprintf(output_handle, "%.*s",
                   header_length - prev_end,
                   header + prev_end);
+          last_index = header_length - 1;
         }
     }
+
+  /* report whether the last emitted character is the annotation separator */
+  return (last_index >= 0) and (header[last_index] == ';');
 }

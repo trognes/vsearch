@@ -407,18 +407,6 @@ extern int64_t opt_topn;
 extern int64_t opt_uc_allhits;
 extern int64_t opt_wordlength;
 
-extern int64_t altivec_present;
-extern int64_t mmx_present;
-extern int64_t sse_present;
-extern int64_t sse2_present;
-extern int64_t sse3_present;
-extern int64_t ssse3_present;
-extern int64_t sse41_present;
-extern int64_t sse42_present;
-extern int64_t popcnt_present;
-extern int64_t avx_present;
-extern int64_t avx2_present;
-
 extern std::FILE * fp_log;
 
 constexpr int64_t default_fasta_width = 80;
@@ -456,6 +444,8 @@ struct Parameters {
   char * opt_fastaout_rev = nullptr;
   char * opt_fastaout_discarded = nullptr;
   char * opt_fastaout_discarded_rev = nullptr;
+  char * opt_fastaout_orphans = nullptr;
+  char * opt_fastaout_orphans_rev = nullptr;
   char * opt_fastq_chars = nullptr;
   char * opt_fastq_convert = nullptr;
   char * opt_fastq_eestats2 = nullptr;
@@ -468,6 +458,8 @@ struct Parameters {
   char * opt_fastqout_rev = nullptr;
   char * opt_fastqout_discarded = nullptr;
   char * opt_fastqout_discarded_rev = nullptr;
+  char * opt_fastqout_orphans = nullptr;
+  char * opt_fastqout_orphans_rev = nullptr;
   char * opt_fastx_filter = nullptr;
   char * opt_fastx_getseq = nullptr;
   char * opt_fastx_getseqs = nullptr;
@@ -475,6 +467,7 @@ struct Parameters {
   char * opt_fastx_mask = nullptr;
   char * opt_fastx_revcomp = nullptr;
   char * opt_fastx_subsample = nullptr;
+  char * opt_fastx_syncpairs = nullptr;
   char * opt_fastx_uniques = nullptr;
   std::string opt_join_padgap = default_sequence_padding;
   std::string opt_join_padgapq = default_quality_padding;
@@ -485,6 +478,7 @@ struct Parameters {
   char * opt_orient = nullptr;
   char * opt_output = nullptr;
   char * opt_relabel = nullptr;
+  char * opt_read_separators = nullptr;
   char * opt_rereplicate = nullptr;
   char * opt_reverse = nullptr;
   char * opt_sample = nullptr;

@@ -2,7 +2,7 @@
 
   VSEARCH: a versatile open source tool for metagenomics
 
-  Copyright (C) 2014-2026, Torbjorn Rognes, Frederic Mahe and Tomas Flouri
+  Copyright (C) 2014-2025, Torbjorn Rognes, Frederic Mahe and Tomas Flouri
   All rights reserved.
 
   Contact: Torbjorn Rognes <torognes@ifi.uio.no>,
@@ -58,21 +58,31 @@
 
 */
 
+// CPU feature discovery: detect at runtime which SIMD instruction sets the
+// host processor supports, and report them. Extracted from vsearch.cc so the
+// low-level detection stays decoupled from the main translation unit.
+
 #pragma once
 
-struct bitmap_s
-{
-  unsigned char * bitmap; /* the actual bitmap */
-  unsigned int size;      /* size in bits */
-};
+#include <cstdint>  // int64_t
 
 
-auto bitmap_init(unsigned int size) -> struct bitmap_s *;
+/* cpu features available */
 
-auto bitmap_get(struct bitmap_s * a_bitmap, unsigned int seed_value) -> unsigned char;
+extern int64_t altivec_present;
+extern int64_t neon_present;
+extern int64_t mmx_present;
+extern int64_t sse_present;
+extern int64_t sse2_present;
+extern int64_t sse3_present;
+extern int64_t ssse3_present;
+extern int64_t sse41_present;
+extern int64_t sse42_present;
+extern int64_t popcnt_present;
+extern int64_t avx_present;
+extern int64_t avx2_present;
 
-auto bitmap_reset_all(struct bitmap_s * a_bitmap) -> void;
 
-auto bitmap_set(struct bitmap_s * a_bitmap, unsigned int seed_value) -> void;
+auto cpu_features_detect() -> void;
 
-auto bitmap_free(struct bitmap_s * a_bitmap) -> void;
+auto cpu_features_show() -> void;

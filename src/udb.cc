@@ -129,7 +129,7 @@ auto largeread(int file_descriptor, void * buf, uint64_t nbyte, uint64_t offset)
         }
 
       auto const rem = std::min(blocksize, nbyte - i);
-      uint64_t const bytesread = read(file_descriptor, (static_cast<char *>(buf)) + i, rem);
+      uint64_t const bytesread = static_cast<uint64_t>(read(file_descriptor, (static_cast<char *>(buf)) + i, rem));
       if (bytesread != rem)
         {
           fatal("Unable to read from UDB file or invalid UDB file");
@@ -159,7 +159,7 @@ auto largewrite(int file_descriptor, void * buf, uint64_t nbyte, uint64_t offset
       }
 
       auto const rem = std::min(blocksize, nbyte - i);
-      uint64_t const byteswritten = write(file_descriptor, (static_cast<char *>(buf)) + i, rem);
+      uint64_t const byteswritten = static_cast<uint64_t>(write(file_descriptor, (static_cast<char *>(buf)) + i, rem));
       if (byteswritten != rem)
         {
           fatal("Unable to write to UDB file");
@@ -212,7 +212,7 @@ auto udb_detect_isudb(const char * filename) -> bool
     }
 
   unsigned int magic = 0;
-  uint64_t const bytesread = read(file_descriptor, & magic, expected_n_bytes);
+  uint64_t const bytesread = static_cast<uint64_t>(read(file_descriptor, & magic, expected_n_bytes));
   close(file_descriptor);
 
   if ((bytesread == expected_n_bytes) and (magic == udb_file_signature))
@@ -238,7 +238,7 @@ auto udb_info(struct Parameters const & parameters) -> void
       fatal("Unable to open UDB file for reading");
     }
 
-  uint64_t const bytesread = read(fd_udbinfo, buffer.data(), 4 * 50);
+  uint64_t const bytesread = static_cast<uint64_t>(read(fd_udbinfo, buffer.data(), 4 * 50));
   if (bytesread != 4 * 50)
     {
       fatal("Unable to read from UDB file or invalid UDB file");
@@ -257,30 +257,30 @@ auto udb_info(struct Parameters const & parameters) -> void
 
   if (not opt_quiet)
     {
-      fprintf(stderr, "           Seqs  %u\n", buffer[13]);
-      fprintf(stderr, "     SeqIx bits  %u\n", buffer[2]);
-      fprintf(stderr, "          Alpha  nt (4)\n");
-      fprintf(stderr, "     Word width  %u\n", buffer[4]);
-      fprintf(stderr, "          Slots  %u\n", buffer[11]);
-      fprintf(stderr, "      Dict size  %u (%.1fk)\n",
+      std::fprintf(stderr, "           Seqs  %u\n", buffer[13]);
+      std::fprintf(stderr, "     SeqIx bits  %u\n", buffer[2]);
+      std::fprintf(stderr, "          Alpha  nt (4)\n");
+      std::fprintf(stderr, "     Word width  %u\n", buffer[4]);
+      std::fprintf(stderr, "          Slots  %u\n", buffer[11]);
+      std::fprintf(stderr, "      Dict size  %u (%.1fk)\n",
               (1U << (2 * buffer[4])),
               (1U << (2 * buffer[4])) * 1.0 / 1000.0);
-      fprintf(stderr, "         DBstep  %u\n", buffer[5]);
-      fprintf(stderr, "        DBAccel  %u%%\n", buffer[6]);
+      std::fprintf(stderr, "         DBstep  %u\n", buffer[5]);
+      std::fprintf(stderr, "        DBAccel  %u%%\n", buffer[6]);
     }
 
   if (opt_log != nullptr)
     {
-      fprintf(fp_log, "           Seqs  %u\n", buffer[13]);
-      fprintf(fp_log, "     SeqIx bits  %u\n", buffer[2]);
-      fprintf(fp_log, "          Alpha  nt (4)\n");
-      fprintf(fp_log, "     Word width  %u\n", buffer[4]);
-      fprintf(fp_log, "          Slots  %u\n", buffer[11]);
-      fprintf(fp_log, "      Dict size  %u (%.1fk)\n",
+      std::fprintf(fp_log, "           Seqs  %u\n", buffer[13]);
+      std::fprintf(fp_log, "     SeqIx bits  %u\n", buffer[2]);
+      std::fprintf(fp_log, "          Alpha  nt (4)\n");
+      std::fprintf(fp_log, "     Word width  %u\n", buffer[4]);
+      std::fprintf(fp_log, "          Slots  %u\n", buffer[11]);
+      std::fprintf(fp_log, "      Dict size  %u (%.1fk)\n",
               (1U << (2 * buffer[4])),
               (1U << (2 * buffer[4])) * 1.0 / 1000.0);
-      fprintf(fp_log, "         DBstep  %u\n", buffer[5]);
-      fprintf(fp_log, "        DBAccel  %u%%\n", buffer[6]);
+      std::fprintf(fp_log, "         DBstep  %u\n", buffer[5]);
+      std::fprintf(fp_log, "        DBAccel  %u%%\n", buffer[6]);
     }
 
   close(fd_udbinfo);
@@ -311,7 +311,7 @@ auto udb_read(const char * filename,
 
   /* get file size */
 
-  uint64_t const filesize = fs.st_size;
+  uint64_t const filesize = static_cast<uint64_t>(fs.st_size);
 
   /* open UDB file */
 
@@ -355,7 +355,7 @@ auto udb_read(const char * filename,
 
   if (udb_wordlength != opt_wordlength)
     {
-      fprintf(stderr, "\nWARNING: Wordlength adjusted to %u as indicated in UDB file\n", udb_wordlength);
+      std::fprintf(stderr, "\nWARNING: Wordlength adjusted to %u as indicated in UDB file\n", udb_wordlength);
       opt_wordlength = udb_wordlength;
     }
 
@@ -411,11 +411,11 @@ auto udb_read(const char * filename,
 
   seqindex = static_cast<seqinfo_t *>(xmalloc(seqcount * sizeof(seqinfo_t)));
 
-  std::vector<int> header_index(seqcount + 1);
+  std::vector<unsigned int> header_index(seqcount + 1);
 
   pos += largeread(fd_udb, header_index.data(), 4 * seqcount, pos);
 
-  header_index[seqcount] = udb_headerchars;
+  header_index[seqcount] = static_cast<unsigned int>(udb_headerchars);
 
   auto last = 0U;
   for (auto i = 0U; i < seqcount; i++)
@@ -446,7 +446,7 @@ auto udb_read(const char * filename,
 
   /* sequence lengths */
 
-  std::vector<int> sequence_lengths(seqcount);
+  std::vector<unsigned int> sequence_lengths(seqcount);
 
   pos += largeread(fd_udb, sequence_lengths.data(), 4 * seqcount, pos);
 
@@ -541,10 +541,10 @@ auto udb_read(const char * filename,
       for (auto i = 0U; i < seqcount; i++)
         {
           auto const size = header_get_size(datap + seqindex[i].header_p,
-                                         seqindex[i].headerlen);
+                                         static_cast<int>(seqindex[i].headerlen));
           if (size > 0)
             {
-              seqindex[i].size = size;
+              seqindex[i].size = static_cast<uint64_t>(size);
             }
           else
             {
@@ -584,17 +584,17 @@ auto udb_read(const char * filename,
     {
       if (seqcount > 0)
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "%" PRIu64 " nt in %" PRIu64 " seqs, min %" PRIu64 ", max %" PRIu64 ", avg %.0f\n",
                   db_getnucleotidecount(),
                   db_getsequencecount(),
                   db_getshortestsequence(),
                   db_getlongestsequence(),
-                  db_getnucleotidecount() * 1.0 / db_getsequencecount());
+                  static_cast<double>(db_getnucleotidecount()) * 1.0 / static_cast<double>(db_getsequencecount()));
         }
       else
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "%" PRIu64 " nt in %" PRIu64 " seqs\n",
                   db_getnucleotidecount(),
                   db_getsequencecount());
@@ -605,17 +605,17 @@ auto udb_read(const char * filename,
     {
       if (seqcount > 0)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%" PRIu64 " nt in %" PRIu64 " seqs, min %" PRIu64 ", max %" PRIu64 ", avg %.0f\n\n",
                   db_getnucleotidecount(),
                   db_getsequencecount(),
                   db_getshortestsequence(),
                   db_getlongestsequence(),
-                  db_getnucleotidecount() * 1.0 / db_getsequencecount());
+                  static_cast<double>(db_getnucleotidecount()) * 1.0 / static_cast<double>(db_getsequencecount()));
         }
       else
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%" PRIu64 " nt in %" PRIu64 " seqs\n\n",
                   db_getnucleotidecount(),
                   db_getsequencecount());
@@ -652,7 +652,7 @@ auto udb_fasta(struct Parameters const & parameters) -> void
       progress_update(i + 1);
     }
   progress_done();
-  fclose(fp_output);
+  std::fclose(fp_output);
 
   dbindex_free();
   db_free();
@@ -677,70 +677,70 @@ auto udb_stats(struct Parameters const & parameters) -> void
       freqtable[i].count = kmercount[i];
     }
 
-  qsort(freqtable.data(), kmerhashsize, sizeof(wordfreq_t), wc_compare);
+  std::qsort(freqtable.data(), kmerhashsize, sizeof(wordfreq_t), wc_compare);
 
   auto const wcmax = freqtable[kmerhashsize-1].count;
   auto const wcmedian = ( freqtable[(kmerhashsize / 2) - 1].count +
                             freqtable[kmerhashsize / 2].count ) / 2;
 
-  unsigned int const seqcount = db_getsequencecount();
+  unsigned int const seqcount = static_cast<unsigned int>(db_getsequencecount());
   auto const nt = db_getnucleotidecount();
 
   /* show stats */
 
   if (opt_log != nullptr)
     {
-      fprintf(fp_log, "      Alphabet  nt\n");
-      fprintf(fp_log, "    Word width  %" PRIu64 "\n", opt_wordlength);
-      fprintf(fp_log, "     Word ones  %" PRIu64 "\n", opt_wordlength);
-      fprintf(fp_log, "        Spaced  No\n");
-      fprintf(fp_log, "        Hashed  No\n");
-      fprintf(fp_log, "         Coded  No\n");
-      fprintf(fp_log, "       Stepped  No\n");
-      fprintf(fp_log,
+      std::fprintf(fp_log, "      Alphabet  nt\n");
+      std::fprintf(fp_log, "    Word width  %" PRIu64 "\n", opt_wordlength);
+      std::fprintf(fp_log, "     Word ones  %" PRIu64 "\n", opt_wordlength);
+      std::fprintf(fp_log, "        Spaced  No\n");
+      std::fprintf(fp_log, "        Hashed  No\n");
+      std::fprintf(fp_log, "         Coded  No\n");
+      std::fprintf(fp_log, "       Stepped  No\n");
+      std::fprintf(fp_log,
               "         Slots  %u (%.1fk)\n",
               kmerhashsize,
               1.0 * kmerhashsize / 1000.0);
-      fprintf(fp_log, "       DBAccel  %u%%\n", udb_dbaccel);
-      fprintf(fp_log, "\n");
+      std::fprintf(fp_log, "       DBAccel  %u%%\n", udb_dbaccel);
+      std::fprintf(fp_log, "\n");
 
-      fprintf(fp_log,
+      std::fprintf(fp_log,
               "%10" PRIu64 "  DB size (%.1fk)\n",
               nt,
-              1.0 * nt / 1000.0);
-      fprintf(fp_log, "%10" PRIu64 "  Words\n", kmerindexsize);
-      fprintf(fp_log, "%10u  Median size\n", wcmedian);
-      fprintf(fp_log,
+              1.0 * static_cast<double>(nt) / 1000.0);
+      std::fprintf(fp_log, "%10" PRIu64 "  Words\n", kmerindexsize);
+      std::fprintf(fp_log, "%10u  Median size\n", wcmedian);
+      std::fprintf(fp_log,
               "%10.1f  Mean size\n",
-              1.0 * kmerindexsize / kmerhashsize);
-      fprintf(fp_log, "\n");
+              1.0 * static_cast<double>(kmerindexsize) / kmerhashsize);
+      std::fprintf(fp_log, "\n");
 
-      fprintf(fp_log,
+      std::fprintf(fp_log,
               "     iWord         sWord         Cap        Size  Row\n");
-      fprintf(fp_log,
+      std::fprintf(fp_log,
               "----------  ------------  ----------  ----------  ---\n");
 
       for (auto i = 0U; i < kmerhashsize; i++)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%10u  ",
                   freqtable[kmerhashsize - 1 - i].kmer);
 
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%.*s", std::max(12 - static_cast<int>(opt_wordlength), 0), "            ");
 
-          fprint_kmer(fp_log, opt_wordlength, freqtable[kmerhashsize - 1 - i].kmer);
+          fprint_kmer(fp_log, static_cast<unsigned int>(opt_wordlength), freqtable[kmerhashsize - 1 - i].kmer);
 
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "  %10u  %10u",
                   0U,
                   freqtable[kmerhashsize - 1 - i].count);
 
-          fprintf(fp_log, " ");
+          std::fprintf(fp_log, " ");
 
           for (auto j = 0U; j < freqtable[kmerhashsize - 1 - i].count; j++)
             {
-              fprintf(fp_log,
+              std::fprintf(fp_log,
                       " %u", kmerindex[kmerhash[freqtable[kmerhashsize - 1 - i].kmer] + j]);
 
               if (j == 7)
@@ -752,10 +752,10 @@ auto udb_stats(struct Parameters const & parameters) -> void
 
           if (freqtable[kmerhashsize-1-i].count > 8)
             {
-              fprintf(fp_log, "...");
+              std::fprintf(fp_log, "...");
             }
 
-          fprintf(fp_log, "\n");
+          std::fprintf(fp_log, "\n");
 
           if (i == 10)
             {
@@ -763,17 +763,17 @@ auto udb_stats(struct Parameters const & parameters) -> void
             }
         }
 
-      fprintf(fp_log, "\n\n");
+      std::fprintf(fp_log, "\n\n");
 
-      fprintf(fp_log, "Word width  %" PRIu64 "\n", opt_wordlength);
-      fprintf(fp_log, "Slots       %u\n", kmerhashsize);
-      fprintf(fp_log, "Words       %" PRIu64 "\n", kmerindexsize);
-      fprintf(fp_log, "Max size    %u (", wcmax);
-      fprint_kmer(fp_log, opt_wordlength, freqtable[kmerhashsize - 1].kmer);
-      fprintf(fp_log, ")\n\n");
+      std::fprintf(fp_log, "Word width  %" PRIu64 "\n", opt_wordlength);
+      std::fprintf(fp_log, "Slots       %u\n", kmerhashsize);
+      std::fprintf(fp_log, "Words       %" PRIu64 "\n", kmerindexsize);
+      std::fprintf(fp_log, "Max size    %u (", wcmax);
+      fprint_kmer(fp_log, static_cast<unsigned int>(opt_wordlength), freqtable[kmerhashsize - 1].kmer);
+      std::fprintf(fp_log, ")\n\n");
 
-      fprintf(fp_log, "   Size lo     Size hi  Total size   Nr. Words     Pct  TotPct\n");
-      fprintf(fp_log, "----------  ----------  ----------  ----------  ------  ------\n");
+      std::fprintf(fp_log, "   Size lo     Size hi  Total size   Nr. Words     Pct  TotPct\n");
+      std::fprintf(fp_log, "----------  ----------  ----------  ----------  ------  ------\n");
 
 
       auto size_lo = 0U;
@@ -785,7 +785,7 @@ auto udb_stats(struct Parameters const & parameters) -> void
         {
 
           auto count = 0;
-          auto size = 0;
+          auto size = 0U;
           while ((x < kmerhashsize) and (freqtable[x].count <= size_hi))
             {
               count++;
@@ -798,49 +798,49 @@ auto udb_stats(struct Parameters const & parameters) -> void
 
           if (size_lo < size_hi)
             {
-              fprintf(fp_log, "%10u", size_lo);
+              std::fprintf(fp_log, "%10u", size_lo);
             }
           else
             {
-              fprintf(fp_log, "          ");
+              std::fprintf(fp_log, "          ");
             }
 
-          fprintf(fp_log, "  %10u", size_hi);
+          std::fprintf(fp_log, "  %10u", size_hi);
 
           if (size >= 10000)
             {
-              fprintf(fp_log, "  %9.1fk", size * 0.001);
+              std::fprintf(fp_log, "  %9.1fk", size * 0.001);
             }
           else
             {
-              fprintf(fp_log, "  %10.1f", size * 1.0);
+              std::fprintf(fp_log, "  %10.1f", size * 1.0);
             }
 
           if (count >= 10000)
             {
-              fprintf(fp_log, "  %9.1fk", count * 0.001);
+              std::fprintf(fp_log, "  %9.1fk", count * 0.001);
             }
           else
             {
-              fprintf(fp_log, "  %10.1f", count * 1.0);
+              std::fprintf(fp_log, "  %10.1f", count * 1.0);
             }
 
-          fprintf(fp_log, "  %5.1f%%  %5.1f%%", pct, totpct);
+          std::fprintf(fp_log, "  %5.1f%%  %5.1f%%", pct, totpct);
 
           static constexpr auto divider = 3.0;
           const auto dots = std::lround(pct / divider);
 
           if (dots > 0)
             {
-              fprintf(fp_log, "  ");
+              std::fprintf(fp_log, "  ");
             }
 
           for (auto i = 0L; i < dots ; i++)
             {
-              fprintf(fp_log, "*");
+              std::fprintf(fp_log, "*");
             }
 
-          fprintf(fp_log, "\n");
+          std::fprintf(fp_log, "\n");
 
           size_lo = size_hi + 1;
           if (size_hi > 0)
@@ -854,33 +854,33 @@ auto udb_stats(struct Parameters const & parameters) -> void
           size_hi = std::min(size_hi, seqcount);
         }
 
-      fprintf(fp_log, "----------  ----------  ----------  ----------\n");
-      fprintf(fp_log, "                      ");
+      std::fprintf(fp_log, "----------  ----------  ----------  ----------\n");
+      std::fprintf(fp_log, "                      ");
 
       if (kmerindexsize >= 10000)
         {
-          fprintf(fp_log, "  %9.1fk", kmerindexsize * 0.001);
+          std::fprintf(fp_log, "  %9.1fk", static_cast<double>(kmerindexsize) * 0.001);
         }
       else
         {
-          fprintf(fp_log, "  %10.1f", kmerindexsize * 1.0);
+          std::fprintf(fp_log, "  %10.1f", static_cast<double>(kmerindexsize) * 1.0);
         }
 
       if (kmerhashsize >= 10000)
         {
-          fprintf(fp_log, "  %9.1fk", kmerhashsize * 0.001);
+          std::fprintf(fp_log, "  %9.1fk", kmerhashsize * 0.001);
         }
       else
         {
-          fprintf(fp_log, "  %10.1f", kmerhashsize * 1.0);
+          std::fprintf(fp_log, "  %10.1f", kmerhashsize * 1.0);
         }
 
-      fprintf(fp_log, "\n\n");
+      std::fprintf(fp_log, "\n\n");
 
-      fprintf(fp_log, "%10" PRIu64 "  Upper\n", nt);
-      fprintf(fp_log, "%10u  Lower (%.1f%%)\n", 0U, 0.0);
-      fprintf(fp_log, "%10" PRIu64 "  Total\n", nt);
-      fprintf(fp_log, "%10" PRIu64 "  Indexed words\n", kmerindexsize);
+      std::fprintf(fp_log, "%10" PRIu64 "  Upper\n", nt);
+      std::fprintf(fp_log, "%10u  Lower (%.1f%%)\n", 0U, 0.0);
+      std::fprintf(fp_log, "%10" PRIu64 "  Total\n", nt);
+      std::fprintf(fp_log, "%10" PRIu64 "  Indexed words\n", kmerindexsize);
     }
 
   dbindex_free();
@@ -913,10 +913,10 @@ auto udb_make(struct Parameters const & parameters) -> void
       hardmask_all();
     }
 
-  dbindex_prepare(1, opt_dbmask);
-  dbindex_addallsequences(opt_dbmask);
+  dbindex_prepare(1, static_cast<int>(opt_dbmask));
+  dbindex_addallsequences(static_cast<int>(opt_dbmask));
 
-  unsigned int const seqcount = db_getsequencecount();
+  unsigned int const seqcount = static_cast<unsigned int>(db_getsequencecount());
   auto const ntcount = db_getnucleotidecount();
 
   uint64_t header_characters = 0;
@@ -954,7 +954,7 @@ auto udb_make(struct Parameters const & parameters) -> void
   /* Header */
   buffer[0]  = 0x55444246; /* FBDU UDBF */
   buffer[2]  = 32; /* bits */
-  buffer[4]  = opt_wordlength; /* default 8 */
+  buffer[4]  = static_cast<unsigned int>(opt_wordlength); /* default 8 */
   buffer[5]  = 1; /* dbstep */
   buffer[6]  = 100; /* dbaccelpct % */
   buffer[11] = 0; /* slots */
@@ -1020,28 +1020,28 @@ auto udb_make(struct Parameters const & parameters) -> void
   for (auto i = 0U; i < seqcount; i++)
     {
       buffer[i] = sum;
-      sum += db_getheaderlen(i) + 1;
+      sum += static_cast<unsigned int>(db_getheaderlen(i) + 1);
     }
   pos += largewrite(fd_output, buffer.data(), 4 * seqcount, pos, false);
 
   /* headers (ascii, zero terminated, not padded) */
   for (auto i = 0U; i < seqcount; i++)
     {
-      unsigned int const len = db_getheaderlen(i);
+      unsigned int const len = static_cast<unsigned int>(db_getheaderlen(i));
       pos += largewrite(fd_output, db_getheader(i), len + 1, pos, false);
     }
 
   /* sequence lengths (uint32_t) */
   for (auto i = 0U; i < seqcount; i++)
     {
-      buffer[i] = db_getsequencelen(i);
+      buffer[i] = static_cast<unsigned int>(db_getsequencelen(i));
     }
   pos += largewrite(fd_output, buffer.data(), 4 * seqcount, pos, false);
 
   /* sequences (ascii, no term, no pad) */
   for (auto i = 0U; i < seqcount; i++)
     {
-      unsigned int const len = db_getsequencelen(i);
+      unsigned int const len = static_cast<unsigned int>(db_getsequencelen(i));
       pos += largewrite(fd_output, db_getsequence(i), len, pos, false);
     }
 

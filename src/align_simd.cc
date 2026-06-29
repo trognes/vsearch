@@ -67,6 +67,7 @@
 #include <cstdint>  // int64_t, uint64_t
 #include <cstdio>  // std::printf, std::snprintf
 #include <cstring>  // std::memcpy, std::memmove, std::memset, std::strcpy, std::strlen
+#include <iterator>  // std::next
 #include <limits>
 
 
@@ -154,10 +155,23 @@ constexpr __vector unsigned char perm_merge_long_high =
   {0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
 
-#define v_init(a,b,c,d,e,f,g,h) (const VECTOR_SHORT){a,b,c,d,e,f,g,h}
-#define v_load(a) vec_ld(0, (VECTOR_SHORT *)(a))
-#define v_store(a, b) vec_st((__vector unsigned char)(b), 0,    \
-                             (__vector unsigned char *)(a))
+inline auto v_init(std::array<short, CHANNELS> const & values) -> VECTOR_SHORT {
+  VECTOR_SHORT const result = {values[0], values[1], values[2], values[3],
+                               values[4], values[5], values[6], values[7]};
+  return result;
+}
+
+inline auto v_load(VECTOR_SHORT const * ptr) -> VECTOR_SHORT {
+  return vec_ld(0, ptr);
+}
+
+/* The dprofile merge pipeline yields wider-element vector types, so accept
+   any 128-bit vector and reinterpret it as bytes for the store, exactly as
+   the former v_store macro did. */
+template <typename VectorType>
+inline auto v_store(VECTOR_SHORT * ptr, VectorType vector) -> void {
+  vec_st((__vector unsigned char) vector, 0, (__vector unsigned char *) ptr);
+}
 inline auto v_add(VECTOR_SHORT lhs, VECTOR_SHORT rhs) -> VECTOR_SHORT {
   return vec_adds(lhs, rhs);
 }
@@ -206,10 +220,19 @@ using VECTOR_SHORT = int16x8_t;
 constexpr uint16x8_t neon_mask =
   {0x0003, 0x000c, 0x0030, 0x00c0, 0x0300, 0x0c00, 0x3000, 0xc000};
 
-// warning: ISO C++ forbids compound-literals [-Wpedantic] (line below) (clang specific?)
-#define v_init(a,b,c,d,e,f,g,h) (const VECTOR_SHORT){a,b,c,d,e,f,g,h}
-#define v_load(a) vld1q_s16((const int16_t *)(a))
-#define v_store(a, b) vst1q_s16((int16_t *)(a), (b))
+inline auto v_init(std::array<short, CHANNELS> const & values) -> VECTOR_SHORT {
+  VECTOR_SHORT const result = {values[0], values[1], values[2], values[3],
+                               values[4], values[5], values[6], values[7]};
+  return result;
+}
+
+inline auto v_load(VECTOR_SHORT const * ptr) -> VECTOR_SHORT {
+  return vld1q_s16(reinterpret_cast<int16_t const *>(ptr));
+}
+
+inline auto v_store(VECTOR_SHORT * ptr, VECTOR_SHORT vector) -> void {
+  vst1q_s16(reinterpret_cast<int16_t *>(ptr), vector);
+}
 inline auto v_merge_lo_16(VECTOR_SHORT lhs, VECTOR_SHORT rhs) -> VECTOR_SHORT {
   return vzip1q_s16(lhs, rhs);
 }
@@ -287,9 +310,17 @@ inline auto v_mask_gt(VECTOR_SHORT lhs, VECTOR_SHORT rhs) -> uint16_t {
 
 using VECTOR_SHORT = __m128i;
 
-#define v_init(a,b,c,d,e,f,g,h) _mm_set_epi16(h,g,f,e,d,c,b,a)
-#define v_load(a) _mm_load_si128(reinterpret_cast<VECTOR_SHORT *>(a))
-#define v_store(a, b) _mm_store_si128(reinterpret_cast<VECTOR_SHORT *>(a), (b))
+inline auto v_init(std::array<short, CHANNELS> const & values) -> VECTOR_SHORT {
+  return _mm_set_epi16(values[7], values[6], values[5], values[4],
+                       values[3], values[2], values[1], values[0]);
+}
+inline auto v_load(VECTOR_SHORT const * ptr) -> VECTOR_SHORT {
+  return _mm_load_si128(ptr);
+}
+
+inline auto v_store(VECTOR_SHORT * ptr, VECTOR_SHORT vector) -> void {
+  _mm_store_si128(ptr, vector);
+}
 inline auto v_merge_lo_16(VECTOR_SHORT lhs, VECTOR_SHORT rhs) -> VECTOR_SHORT {
   return _mm_unpacklo_epi16(lhs, rhs);
 }
@@ -354,8 +385,8 @@ inline auto v_shift_left(VECTOR_SHORT operand) -> VECTOR_SHORT {
   return _mm_slli_si128(operand, 2);
 }
 
-inline auto v_mask_gt(VECTOR_SHORT lhs, VECTOR_SHORT rhs) -> int {
-  return _mm_movemask_epi8(_mm_cmpgt_epi16(lhs, rhs));
+inline auto v_mask_gt(VECTOR_SHORT lhs, VECTOR_SHORT rhs) -> unsigned short {
+  return static_cast<unsigned short>(_mm_movemask_epi8(_mm_cmpgt_epi16(lhs, rhs)));
 }
 
 #else
@@ -363,6 +394,17 @@ inline auto v_mask_gt(VECTOR_SHORT lhs, VECTOR_SHORT rhs) -> int {
 #error Unknown Architecture
 
 #endif
+
+/* The score matrix and direction profile are stored as CELL (16-bit) arrays
+   but loaded and stored a whole vector at a time; cast_vector16 holds the
+   single reinterpret needed to view an aligned CELL address as a vector. */
+inline auto cast_vector16(CELL * ptr) -> VECTOR_SHORT * {
+  return reinterpret_cast<VECTOR_SHORT *>(ptr);
+}
+
+inline auto cast_vector16(CELL const * ptr) -> VECTOR_SHORT const * {
+  return reinterpret_cast<VECTOR_SHORT const *>(ptr);
+}
 
 struct s16info_s
 {
@@ -414,14 +456,14 @@ namespace {
   {
     CELL value = 0;
     std::memcpy(&value,
-                reinterpret_cast<char const *>(&vector) + (channel * sizeof(CELL)),
+                reinterpret_cast<char const *>(&vector) + (static_cast<size_t>(channel) * sizeof(CELL)),
                 sizeof(CELL));
     return value;
   }
 
   auto set_channel(VECTOR_SHORT & vector, int const channel, CELL const value) -> void
   {
-    std::memcpy(reinterpret_cast<char *>(&vector) + (channel * sizeof(CELL)),
+    std::memcpy(reinterpret_cast<char *>(&vector) + (static_cast<size_t>(channel) * sizeof(CELL)),
                 &value,
                 sizeof(CELL));
   }
@@ -434,7 +476,7 @@ auto _mm_print(VECTOR_SHORT const x) -> void
   auto const * y = reinterpret_cast<unsigned short const *>(&x);
   for (int i = 0; i < 8; i++)
     {
-      printf("%s%6d", (i > 0 ? " " : ""), y[7 - i]);
+      std::printf("%s%6d", (i > 0 ? " " : ""), y[7 - i]);
     }
 }
 
@@ -444,27 +486,27 @@ auto _mm_print2(VECTOR_SHORT const x) -> void
   auto const * y = reinterpret_cast<signed short const *>(&x);
   for (int i = 0; i < 8; i++)
     {
-      printf("%s%2d", (i > 0 ? " " : ""), y[7 - i]);
+      std::printf("%s%2d", (i > 0 ? " " : ""), y[7 - i]);
     }
 }
 
 
 auto dprofile_dump16(CELL const * dprofile) -> void
 {
-  printf("\ndprofile:\n");
+  std::printf("\ndprofile:\n");
   for (int i = 0; i < matrix_size; i++)
     {
-      printf("%c: ", sym_nt_4bit[i]);
+      std::printf("%c: ", sym_nt_4bit[static_cast<size_t>(i)]);
       for (int k = 0; k < CDEPTH; k++)
         {
-          printf("[");
+          std::printf("[");
           for (int j = 0; j < CHANNELS; j++)
             {
-              printf(" %3d", dprofile[(CHANNELS * CDEPTH * i) + (CHANNELS * k) + j]);
+              std::printf(" %3d", dprofile[(CHANNELS * CDEPTH * i) + (CHANNELS * k) + j]);
             }
-          printf("]");
+          std::printf("]");
         }
-      printf("\n");
+      std::printf("\n");
     }
 }
 
@@ -473,7 +515,7 @@ auto dumpscorematrix(CELL const * score_matrix) -> void
 {
   for (auto i = 0; i < matrix_size; ++i)
     {
-      std::printf("%2d %c", i, sym_nt_4bit[i]);
+      std::printf("%2d %c", i, sym_nt_4bit[static_cast<size_t>(i)]);
       for (auto j = 0; j < matrix_size; ++j)
         {
           std::printf(" %2d", score_matrix[(matrix_size * i) + j]);
@@ -484,7 +526,7 @@ auto dumpscorematrix(CELL const * score_matrix) -> void
 
 
 auto dprofile_fill16(CELL * dprofile_word,
-                     CELL * score_matrix_word,
+                     CELL const * score_matrix_word,
                      BYTE const * dseq) -> void
 {
 #if 0
@@ -503,7 +545,7 @@ auto dprofile_fill16(CELL * dprofile_word,
       std::array<int, CHANNELS> d {{}};
       for (int z = 0; z < CHANNELS; z++)
         {
-          d[z] = dseq[(j * CHANNELS) + z] << 4U;
+          d[static_cast<size_t>(z)] = dseq[(j * CHANNELS) + z] << 4U;
         }
 
       for (int i = 0; i < matrix_size; i += 8)
@@ -580,14 +622,14 @@ auto dprofile_fill16(CELL * dprofile_word,
           VECTOR_SHORT reg31;
 #endif
 
-          reg0 = v_load(score_matrix_word + d[0] + i);
-          reg1 = v_load(score_matrix_word + d[1] + i);
-          reg2 = v_load(score_matrix_word + d[2] + i);
-          reg3 = v_load(score_matrix_word + d[3] + i);
-          reg4 = v_load(score_matrix_word + d[4] + i);
-          reg5 = v_load(score_matrix_word + d[5] + i);
-          reg6 = v_load(score_matrix_word + d[6] + i);
-          reg7 = v_load(score_matrix_word + d[7] + i);
+          reg0 = v_load(cast_vector16(std::next(score_matrix_word, d[0] + i)));
+          reg1 = v_load(cast_vector16(std::next(score_matrix_word, d[1] + i)));
+          reg2 = v_load(cast_vector16(std::next(score_matrix_word, d[2] + i)));
+          reg3 = v_load(cast_vector16(std::next(score_matrix_word, d[3] + i)));
+          reg4 = v_load(cast_vector16(std::next(score_matrix_word, d[4] + i)));
+          reg5 = v_load(cast_vector16(std::next(score_matrix_word, d[5] + i)));
+          reg6 = v_load(cast_vector16(std::next(score_matrix_word, d[6] + i)));
+          reg7 = v_load(cast_vector16(std::next(score_matrix_word, d[7] + i)));
 
 #ifdef __PPC__
           reg8  = (__vector signed int) vec_mergeh(reg0, reg1);
@@ -608,22 +650,14 @@ auto dprofile_fill16(CELL * dprofile_word,
           reg22 = (__vector signed long long) vec_mergeh(reg13, reg15);
           reg23 = (__vector signed long long) vec_mergel(reg13, reg15);
 
-          reg24 = (__vector signed long long) vec_perm
-            (reg16, reg18, perm_merge_long_low);
-          reg25 = (__vector signed long long) vec_perm
-            (reg16, reg18, perm_merge_long_high);
-          reg26 = (__vector signed long long) vec_perm
-            (reg17, reg19, perm_merge_long_low);
-          reg27 = (__vector signed long long) vec_perm
-            (reg17, reg19, perm_merge_long_high);
-          reg28 = (__vector signed long long) vec_perm
-            (reg20, reg22, perm_merge_long_low);
-          reg29 = (__vector signed long long) vec_perm
-            (reg20, reg22, perm_merge_long_high);
-          reg30 = (__vector signed long long) vec_perm
-            (reg21, reg23, perm_merge_long_low);
-          reg31 = (__vector signed long long) vec_perm
-            (reg21, reg23, perm_merge_long_high);
+          reg24 = vec_perm(reg16, reg18, perm_merge_long_low);
+          reg25 = vec_perm(reg16, reg18, perm_merge_long_high);
+          reg26 = vec_perm(reg17, reg19, perm_merge_long_low);
+          reg27 = vec_perm(reg17, reg19, perm_merge_long_high);
+          reg28 = vec_perm(reg20, reg22, perm_merge_long_low);
+          reg29 = vec_perm(reg20, reg22, perm_merge_long_high);
+          reg30 = vec_perm(reg21, reg23, perm_merge_long_low);
+          reg31 = vec_perm(reg21, reg23, perm_merge_long_high);
 #else
           reg8  = v_merge_lo_16(reg0,  reg1);
           reg9  = v_merge_hi_16(reg0,  reg1);
@@ -653,14 +687,14 @@ auto dprofile_fill16(CELL * dprofile_word,
           reg31 = v_merge_hi_64(reg21, reg23);
 #endif
 
-          v_store(dprofile_word + (CDEPTH * CHANNELS * (i + 0)) + (CHANNELS * j), reg24);
-          v_store(dprofile_word + (CDEPTH * CHANNELS * (i + 1)) + (CHANNELS * j), reg25);
-          v_store(dprofile_word + (CDEPTH * CHANNELS * (i + 2)) + (CHANNELS * j), reg26);
-          v_store(dprofile_word + (CDEPTH * CHANNELS * (i + 3)) + (CHANNELS * j), reg27);
-          v_store(dprofile_word + (CDEPTH * CHANNELS * (i + 4)) + (CHANNELS * j), reg28);
-          v_store(dprofile_word + (CDEPTH * CHANNELS * (i + 5)) + (CHANNELS * j), reg29);
-          v_store(dprofile_word + (CDEPTH * CHANNELS * (i + 6)) + (CHANNELS * j), reg30);
-          v_store(dprofile_word + (CDEPTH * CHANNELS * (i + 7)) + (CHANNELS * j), reg31);
+          v_store(cast_vector16(std::next(dprofile_word, (CDEPTH * CHANNELS * (i + 0)) + (CHANNELS * j))), reg24);
+          v_store(cast_vector16(std::next(dprofile_word, (CDEPTH * CHANNELS * (i + 1)) + (CHANNELS * j))), reg25);
+          v_store(cast_vector16(std::next(dprofile_word, (CDEPTH * CHANNELS * (i + 2)) + (CHANNELS * j))), reg26);
+          v_store(cast_vector16(std::next(dprofile_word, (CDEPTH * CHANNELS * (i + 3)) + (CHANNELS * j))), reg27);
+          v_store(cast_vector16(std::next(dprofile_word, (CDEPTH * CHANNELS * (i + 4)) + (CHANNELS * j))), reg28);
+          v_store(cast_vector16(std::next(dprofile_word, (CDEPTH * CHANNELS * (i + 5)) + (CHANNELS * j))), reg29);
+          v_store(cast_vector16(std::next(dprofile_word, (CDEPTH * CHANNELS * (i + 6)) + (CHANNELS * j))), reg30);
+          v_store(cast_vector16(std::next(dprofile_word, (CDEPTH * CHANNELS * (i + 7)) + (CHANNELS * j))), reg31);
         }
     }
 #if 0
@@ -679,19 +713,14 @@ auto dprofile_fill16(CELL * dprofile_word,
 */
 
 /*
-  On PPC the fifth parameter is a vector for the result in the lower 64 bits.
-  On x86_64 the fifth parameter is the address to write the result to.
+  onestep() advances one block of DP cells. Its fifth parameter is a pointer
+  into the direction buffer where the four 16-bit direction masks for this
+  block are written, one per v_mask_gt comparison. On PPC v_mask_gt folds in
+  the byte-permute that x86_64/aarch64 obtain directly from movemask, so a
+  single onestep() serves every architecture.
 */
 
 #ifdef __PPC__
-
-/* Handle differences between GNU and IBM compilers */
-
-#ifdef __IBMCPP__
-#define VECTORBYTEPERMUTE vec_bperm
-#else
-#define VECTORBYTEPERMUTE vec_vbpermq
-#endif
 
 /* The VSX vec_bperm instruction puts the 16 selected bits of the first
    source into bits 48-63 of the destination. */
@@ -699,60 +728,53 @@ auto dprofile_fill16(CELL * dprofile_word,
 constexpr __vector unsigned char perm  = { 120, 112, 104,  96,  88,  80,  72,  64,
   56,  48,  40,  32,  24,  16,   8,   0 };
 
-#define ALIGNCORE(H, N, F, V, RES, QR_q, R_q, QR_t, R_t, H_MIN, H_MAX)  \
-  {                                                                     \
-    __vector unsigned short W, X, Y, Z;                                 \
-    __vector unsigned int WX, YZ;                                       \
-    __vector short VV;                                                  \
-    VV = v_load(&V);                                                    \
-    H = v_add(H, VV);                                                   \
-    W = (__vector unsigned short) VECTORBYTEPERMUTE                     \
-      ((__vector unsigned char) vec_cmpgt(F, H), perm);                 \
-    H = v_max(H, F);                                                    \
-    X = (__vector unsigned short) VECTORBYTEPERMUTE                     \
-      ((__vector unsigned char) vec_cmpgt(E, H), perm);                 \
-    H = v_max(H, E);                                                    \
-    H_MIN = v_min(H_MIN, H);                                            \
-    H_MAX = v_max(H_MAX, H);                                            \
-    N = H;                                                              \
-    HF = v_sub(H, QR_t);                                                \
-    F = v_sub(F, R_t);                                                  \
-    Y = (__vector unsigned short) VECTORBYTEPERMUTE                     \
-      ((__vector unsigned char) vec_cmpgt(F, HF), perm);                \
-    F = v_max(F, HF);                                                   \
-    HE = v_sub(H, QR_q);                                                \
-    E = v_sub(E, R_q);                                                  \
-    Z = (__vector unsigned short) VECTORBYTEPERMUTE                     \
-      ((__vector unsigned char) vec_cmpgt(E, HE), perm);                \
-    E = v_max(E, HE);                                                   \
-    WX = (__vector unsigned int) vec_mergel(W, X);                      \
-    YZ = (__vector unsigned int) vec_mergel(Y, Z);                      \
-    RES = (__vector unsigned long long) vec_mergeh(WX, YZ);             \
-  }
-
+inline auto v_mask_gt(VECTOR_SHORT lhs, VECTOR_SHORT rhs) -> unsigned short {
+  /* Build the same per-element greater-than bitmask that x86_64 and aarch64
+     obtain from movemask: compare, then gather one bit per byte with the
+     byte-permute. vec_bperm leaves the 16 gathered bits in lane 4. */
+  static constexpr unsigned int result_lane = 4U;
+  auto const comparison = (__vector unsigned char) vec_cmpgt(lhs, rhs);
+  /* Handle differences between GNU and IBM compilers */
+#ifdef __IBMCPP__
+  auto const bits = (__vector unsigned short) vec_bperm(comparison, perm);
 #else
-
-/* x86_64 & aarch64 */
-
-#define ALIGNCORE(H, N, F, V, PATH, QR_q, R_q, QR_t, R_t, H_MIN, H_MAX) \
-  H = v_add(H, V);                                                      \
-  *((PATH)+0) = v_mask_gt(F, H);                                        \
-  (H) = v_max(H, F);                                                    \
-  *((PATH)+1) = v_mask_gt(E, H);                                        \
-  (H) = v_max(H, E);                                                    \
-  (H_MIN) = v_min(H_MIN, H);                                            \
-  (H_MAX) = v_max(H_MAX, H);                                            \
-  (N) = H;                                                              \
-  HF = v_sub(H, QR_t);                                                  \
-  (F) = v_sub(F, R_t);                                                  \
-  *((PATH)+2) = v_mask_gt(F, HF);                                       \
-  (F) = v_max(F, HF);                                                   \
-  HE = v_sub(H, QR_q);                                                  \
-  E = v_sub(E, R_q);                                                    \
-  *((PATH)+3) = v_mask_gt(E, HE);                                       \
-  E = v_max(E, HE);
+  auto const bits = (__vector unsigned short) vec_vbpermq(comparison, perm);
+#endif
+  return bits[result_lane];
+}
 
 #endif
+
+inline auto onestep(VECTOR_SHORT & H,
+                    VECTOR_SHORT & N,
+                    VECTOR_SHORT & F,
+                    VECTOR_SHORT V,
+                    unsigned short * path,
+                    VECTOR_SHORT & E,
+                    VECTOR_SHORT QR_q,
+                    VECTOR_SHORT R_q,
+                    VECTOR_SHORT QR_t,
+                    VECTOR_SHORT R_t,
+                    VECTOR_SHORT & H_min,
+                    VECTOR_SHORT & H_max) -> void
+{
+  H = v_add(H, V);
+  path[0] = v_mask_gt(F, H);
+  H = v_max(H, F);
+  path[1] = v_mask_gt(E, H);
+  H = v_max(H, E);
+  H_min = v_min(H_min, H);
+  H_max = v_max(H_max, H);
+  N = H;
+  VECTOR_SHORT const HF = v_sub(H, QR_t);
+  F = v_sub(F, R_t);
+  path[2] = v_mask_gt(F, HF);
+  F = v_max(F, HF);
+  VECTOR_SHORT const HE = v_sub(H, QR_q);
+  E = v_sub(E, R_q);
+  path[3] = v_mask_gt(E, HE);
+  E = v_max(E, HE);
+}
 
 auto aligncolumns_first(VECTOR_SHORT * Sm,
                         VECTOR_SHORT * hep,
@@ -794,18 +816,10 @@ auto aligncolumns_first(VECTOR_SHORT * Sm,
   VECTOR_SHORT h7;
   VECTOR_SHORT h8;
   VECTOR_SHORT E;
-  VECTOR_SHORT HE;
-  VECTOR_SHORT HF;
   VECTOR_SHORT const * vp = nullptr;
 
   VECTOR_SHORT h_min = v_zero();
   VECTOR_SHORT h_max = v_zero();
-
-#ifdef __PPC__
-  __vector unsigned long long RES1;
-  __vector unsigned long long RES2;
-  __vector unsigned long long RES;
-#endif
 
   int64_t i = 0;
 
@@ -840,29 +854,14 @@ auto aligncolumns_first(VECTOR_SHORT * Sm,
 
       M_QR_t_left = v_add(M_QR_t_left, M_R_t_left);
 
-#ifdef __PPC__
-      ALIGNCORE(h0, h5, f0, vp[0], RES1,
-                QR_q_i, R_q_i, QR_t_0, R_t_0, h_min, h_max);
-      ALIGNCORE(h1, h6, f1, vp[1], RES2,
-                QR_q_i, R_q_i, QR_t_1, R_t_1, h_min, h_max);
-      RES = vec_perm(RES1, RES2, perm_merge_long_low);
-      v_store((dir + (16 * i) + 0), RES);
-      ALIGNCORE(h2, h7, f2, vp[2], RES1,
-                QR_q_i, R_q_i, QR_t_2, R_t_2, h_min, h_max);
-      ALIGNCORE(h3, h8, f3, vp[3], RES2,
-                QR_q_i, R_q_i, QR_t_3, R_t_3, h_min, h_max);
-      RES = vec_perm(RES1, RES2, perm_merge_long_low);
-      v_store((dir + (16 * i) + 8), RES);
-#else
-      ALIGNCORE(h0, h5, f0, vp[0], dir + (16 * i) + 0,
-                QR_q_i, R_q_i, QR_t_0, R_t_0, h_min, h_max);
-      ALIGNCORE(h1, h6, f1, vp[1], dir + (16 * i) + 4,
-                QR_q_i, R_q_i, QR_t_1, R_t_1, h_min, h_max);
-      ALIGNCORE(h2, h7, f2, vp[2], dir + (16 * i) + 8,
-                QR_q_i, R_q_i, QR_t_2, R_t_2, h_min, h_max);
-      ALIGNCORE(h3, h8, f3, vp[3], dir + (16 * i) + 12,
-                QR_q_i, R_q_i, QR_t_3, R_t_3, h_min, h_max);
-#endif
+      onestep(h0, h5, f0, vp[0], dir + (16 * i) + 0, E,
+              QR_q_i, R_q_i, QR_t_0, R_t_0, h_min, h_max);
+      onestep(h1, h6, f1, vp[1], dir + (16 * i) + 4, E,
+              QR_q_i, R_q_i, QR_t_1, R_t_1, h_min, h_max);
+      onestep(h2, h7, f2, vp[2], dir + (16 * i) + 8, E,
+              QR_q_i, R_q_i, QR_t_2, R_t_2, h_min, h_max);
+      onestep(h3, h8, f3, vp[3], dir + (16 * i) + 12, E,
+              QR_q_i, R_q_i, QR_t_3, R_t_3, h_min, h_max);
 
       hep[(2 * i) + 0] = h8;
       hep[(2 * i) + 1] = E;
@@ -884,29 +883,14 @@ auto aligncolumns_first(VECTOR_SHORT * Sm,
   E  = v_sub(E, M_QR_q_right);
 
 
-#ifdef __PPC__
-  ALIGNCORE(h0, h5, f0, vp[0], RES1,
-            QR_q_r, R_q_r, QR_t_0, R_t_0, h_min, h_max);
-  ALIGNCORE(h1, h6, f1, vp[1], RES2,
-            QR_q_r, R_q_r, QR_t_1, R_t_1, h_min, h_max);
-  RES = vec_perm(RES1, RES2, perm_merge_long_low);
-  v_store((dir + (16 * i) + 0), RES);
-  ALIGNCORE(h2, h7, f2, vp[2], RES1,
-            QR_q_r, R_q_r, QR_t_2, R_t_2, h_min, h_max);
-  ALIGNCORE(h3, h8, f3, vp[3], RES2,
-            QR_q_r, R_q_r, QR_t_3, R_t_3, h_min, h_max);
-  RES = vec_perm(RES1, RES2, perm_merge_long_low);
-  v_store((dir + (16 * i) + 8), RES);
-#else
-  ALIGNCORE(h0, h5, f0, vp[0], dir + (16 * i) + 0,
-            QR_q_r, R_q_r, QR_t_0, R_t_0, h_min, h_max);
-  ALIGNCORE(h1, h6, f1, vp[1], dir + (16 * i) + 4,
-            QR_q_r, R_q_r, QR_t_1, R_t_1, h_min, h_max);
-  ALIGNCORE(h2, h7, f2, vp[2], dir + (16 * i) + 8,
-            QR_q_r, R_q_r, QR_t_2, R_t_2, h_min, h_max);
-  ALIGNCORE(h3, h8, f3, vp[3], dir + (16 * i) + 12,
-            QR_q_r, R_q_r, QR_t_3, R_t_3, h_min, h_max);
-#endif
+  onestep(h0, h5, f0, vp[0], dir + (16 * i) + 0, E,
+          QR_q_r, R_q_r, QR_t_0, R_t_0, h_min, h_max);
+  onestep(h1, h6, f1, vp[1], dir + (16 * i) + 4, E,
+          QR_q_r, R_q_r, QR_t_1, R_t_1, h_min, h_max);
+  onestep(h2, h7, f2, vp[2], dir + (16 * i) + 8, E,
+          QR_q_r, R_q_r, QR_t_2, R_t_2, h_min, h_max);
+  onestep(h3, h8, f3, vp[3], dir + (16 * i) + 12, E,
+          QR_q_r, R_q_r, QR_t_3, R_t_3, h_min, h_max);
 
 
   hep[(2 * i) + 0] = h8;
@@ -956,18 +940,10 @@ auto aligncolumns_rest(VECTOR_SHORT * Sm,
   VECTOR_SHORT h7;
   VECTOR_SHORT h8;
   VECTOR_SHORT E;
-  VECTOR_SHORT HE;
-  VECTOR_SHORT HF;
   VECTOR_SHORT const * vp = nullptr;
 
   VECTOR_SHORT h_min = v_zero();
   VECTOR_SHORT h_max = v_zero();
-
-#ifdef __PPC__
-  __vector unsigned long long RES1;
-  __vector unsigned long long RES2;
-  __vector unsigned long long RES;
-#endif
 
   int64_t i = 0;
 
@@ -984,29 +960,14 @@ auto aligncolumns_rest(VECTOR_SHORT * Sm,
 
       E  = hep[(2 * i) + 1];
 
-#ifdef __PPC__
-      ALIGNCORE(h0, h5, f0, vp[0], RES1,
-                QR_q_i, R_q_i, QR_t_0, R_t_0, h_min, h_max);
-      ALIGNCORE(h1, h6, f1, vp[1], RES2,
-                QR_q_i, R_q_i, QR_t_1, R_t_1, h_min, h_max);
-      RES = vec_perm(RES1, RES2, perm_merge_long_low);
-      v_store((dir + (16 * i) + 0), RES);
-      ALIGNCORE(h2, h7, f2, vp[2], RES1,
-                QR_q_i, R_q_i, QR_t_2, R_t_2, h_min, h_max);
-      ALIGNCORE(h3, h8, f3, vp[3], RES2,
-                QR_q_i, R_q_i, QR_t_3, R_t_3, h_min, h_max);
-      RES = vec_perm(RES1, RES2, perm_merge_long_low);
-      v_store((dir + (16 * i) + 8), RES);
-#else
-      ALIGNCORE(h0, h5, f0, vp[0], dir + (16 * i) + 0,
-                QR_q_i, R_q_i, QR_t_0, R_t_0, h_min, h_max);
-      ALIGNCORE(h1, h6, f1, vp[1], dir + (16 * i) + 4,
-                QR_q_i, R_q_i, QR_t_1, R_t_1, h_min, h_max);
-      ALIGNCORE(h2, h7, f2, vp[2], dir + (16 * i) + 8,
-                QR_q_i, R_q_i, QR_t_2, R_t_2, h_min, h_max);
-      ALIGNCORE(h3, h8, f3, vp[3], dir + (16 * i) + 12,
-                QR_q_i, R_q_i, QR_t_3, R_t_3, h_min, h_max);
-#endif
+      onestep(h0, h5, f0, vp[0], dir + (16 * i) + 0, E,
+              QR_q_i, R_q_i, QR_t_0, R_t_0, h_min, h_max);
+      onestep(h1, h6, f1, vp[1], dir + (16 * i) + 4, E,
+              QR_q_i, R_q_i, QR_t_1, R_t_1, h_min, h_max);
+      onestep(h2, h7, f2, vp[2], dir + (16 * i) + 8, E,
+              QR_q_i, R_q_i, QR_t_2, R_t_2, h_min, h_max);
+      onestep(h3, h8, f3, vp[3], dir + (16 * i) + 12, E,
+              QR_q_i, R_q_i, QR_t_3, R_t_3, h_min, h_max);
 
       hep[(2 * i) + 0] = h8;
       hep[(2 * i) + 1] = E;
@@ -1023,29 +984,14 @@ auto aligncolumns_rest(VECTOR_SHORT * Sm,
 
   E  = hep[(2 * i) + 1];
 
-#ifdef __PPC__
-  ALIGNCORE(h0, h5, f0, vp[0], RES1,
-            QR_q_r, R_q_r, QR_t_0, R_t_0, h_min, h_max);
-  ALIGNCORE(h1, h6, f1, vp[1], RES2,
-            QR_q_r, R_q_r, QR_t_1, R_t_1, h_min, h_max);
-  RES = vec_perm(RES1, RES2, perm_merge_long_low);
-  v_store((dir + (16 * i) + 0), RES);
-  ALIGNCORE(h2, h7, f2, vp[2], RES1,
-            QR_q_r, R_q_r, QR_t_2, R_t_2, h_min, h_max);
-  ALIGNCORE(h3, h8, f3, vp[3], RES2,
-            QR_q_r, R_q_r, QR_t_3, R_t_3, h_min, h_max);
-  RES = vec_perm(RES1, RES2, perm_merge_long_low);
-  v_store((dir + (16 * i) + 8), RES);
-#else
-  ALIGNCORE(h0, h5, f0, vp[0], dir + (16 * i) + 0,
-            QR_q_r, R_q_r, QR_t_0, R_t_0, h_min, h_max);
-  ALIGNCORE(h1, h6, f1, vp[1], dir + (16 * i) + 4,
-            QR_q_r, R_q_r, QR_t_1, R_t_1, h_min, h_max);
-  ALIGNCORE(h2, h7, f2, vp[2], dir + (16 * i) + 8,
-            QR_q_r, R_q_r, QR_t_2, R_t_2, h_min, h_max);
-  ALIGNCORE(h3, h8, f3, vp[3], dir + (16 * i) + 12,
-            QR_q_r, R_q_r, QR_t_3, R_t_3, h_min, h_max);
-#endif
+  onestep(h0, h5, f0, vp[0], dir + (16 * i) + 0, E,
+          QR_q_r, R_q_r, QR_t_0, R_t_0, h_min, h_max);
+  onestep(h1, h6, f1, vp[1], dir + (16 * i) + 4, E,
+          QR_q_r, R_q_r, QR_t_1, R_t_1, h_min, h_max);
+  onestep(h2, h7, f2, vp[2], dir + (16 * i) + 8, E,
+          QR_q_r, R_q_r, QR_t_2, R_t_2, h_min, h_max);
+  onestep(h3, h8, f3, vp[3], dir + (16 * i) + 12, E,
+          QR_q_r, R_q_r, QR_t_3, R_t_3, h_min, h_max);
 
   hep[(2 * i) + 0] = h8;
   hep[(2 * i) + 1] = E;
@@ -1073,7 +1019,7 @@ inline auto pushop(s16info_s * s, char const newop) -> void
       std::array<char, size> buffer {{}};
       const auto length = std::snprintf(buffer.data(), size, "%d", s->opcount);
       s->cigarend -= length;
-      std::memcpy(s->cigarend, buffer.data(), length);
+      std::memcpy(s->cigarend, buffer.data(), static_cast<size_t>(length));
     }
   s->op = newop;
   s->opcount = 1;
@@ -1091,7 +1037,7 @@ inline auto finishop(s16info_s * s) -> void
           std::array<char, size> buffer {{}};
           const auto length = std::snprintf(buffer.data(), size, "%d", s->opcount);
           s->cigarend -= length;
-          std::memcpy(s->cigarend, buffer.data(), length);
+          std::memcpy(s->cigarend, buffer.data(), static_cast<size_t>(length));
         }
       s->op = 0;
       s->opcount = 0;
@@ -1110,8 +1056,8 @@ auto backtrack16(s16info_s * s,
                  unsigned short * pgaps) -> void
 {
   unsigned short * dirbuffer = s->dir;
-  uint64_t const dirbuffersize = static_cast<uint64_t>(s->qlen) * s->maxdlen * 4;
-  uint64_t const qlen = s->qlen;
+  uint64_t const dirbuffersize = static_cast<uint64_t>(s->qlen) * static_cast<uint64_t>(s->maxdlen) * 4;
+  uint64_t const qlen = static_cast<uint64_t>(s->qlen);
   char const * qseq = s->qseq;
 
   uint64_t const maskup      = 3ULL << ((2 * channel) + 0);
@@ -1121,7 +1067,7 @@ auto backtrack16(s16info_s * s,
 
 #if 0
 
-  printf("Dumping backtracking array\n");
+  std::printf("Dumping backtracking array\n");
 
   for (uint64_t i = 0; i < qlen; i++)
     {
@@ -1133,23 +1079,23 @@ auto backtrack16(s16info_s * s,
           if (d & maskup)
             {
               if (d & maskleft)
-                printf("+");
+                std::printf("+");
               else
-                printf("^");
+                std::printf("^");
             }
           else if (d & maskleft)
             {
-              printf("<");
+              std::printf("<");
             }
           else
             {
-              printf("\\");
+              std::printf("\\");
             }
         }
-      printf("\n");
+      std::printf("\n");
     }
 
-  printf("Dumping gap extension array\n");
+  std::printf("Dumping gap extension array\n");
 
   for (uint64_t i = 0; i < qlen; i++)
     {
@@ -1161,20 +1107,20 @@ auto backtrack16(s16info_s * s,
           if (d & maskextup)
             {
               if (d & maskextleft)
-                printf("+");
+                std::printf("+");
               else
-                printf("^");
+                std::printf("^");
             }
           else if (d & maskextleft)
             {
-              printf("<");
+              std::printf("<");
             }
           else
             {
-              printf("\\");
+              std::printf("\\");
             }
         }
-      printf("\n");
+      std::printf("\n");
     }
 
 #endif
@@ -1184,8 +1130,8 @@ auto backtrack16(s16info_s * s,
   unsigned short mismatches = 0;
   unsigned short gaps = 0;
 
-  int64_t i = qlen - 1;
-  int64_t j = dlen - 1;
+  int64_t i = static_cast<int64_t>(qlen) - 1;
+  int64_t j = static_cast<int64_t>(dlen) - 1;
 
   s->cigarend = s->cigar + s->qlen + s->maxdlen + 1;
   s->op = 0;
@@ -1203,8 +1149,8 @@ auto backtrack16(s16info_s * s,
       // block4 = 16 * i;
       // block5 = 4 * (j & 3);
       unsigned short const * const dir_word = dirbuffer +
-        ((offset + (matrix_size * qlen * (j / 4)) +
-          (matrix_size * i) + (4 * (j & 3))) % dirbuffersize);
+        ((offset + (matrix_size * qlen * static_cast<uint64_t>(j / 4)) +
+          (matrix_size * static_cast<uint64_t>(i)) + (4 * static_cast<uint64_t>(j & 3))) % dirbuffersize);
       uint64_t d = 0;
       std::memcpy(&d, dir_word, sizeof(d));
 
@@ -1285,8 +1231,8 @@ auto backtrack16(s16info_s * s,
   finishop(s);
 
   /* move cigar to beginning of allocated memory area */
-  int const cigarlen = s->cigar + s->qlen + s->maxdlen - s->cigarend;
-  std::memmove(s->cigar, s->cigarend, cigarlen + 1);
+  int const cigarlen = static_cast<int>(s->cigar + s->qlen + s->maxdlen - s->cigarend);
+  std::memmove(s->cigar, s->cigarend, static_cast<size_t>(cigarlen + 1));
 
   * paligned = aligned;
   * pmatches = matches;
@@ -1336,19 +1282,19 @@ auto search16_init(CELL score_match,
           CELL value = 0;
           if (opt_n_mismatch and ((i == 15U) or (j == 15U)))
             {
-              value = opt_mismatch;
+              value = static_cast<CELL>(opt_mismatch);
             }
-          else if (is_ambiguous_4bit(i) or is_ambiguous_4bit(j))
+          else if (is_ambiguous_4bit(static_cast<unsigned char>(i)) or is_ambiguous_4bit(static_cast<unsigned char>(j)))
             {
               value = 0;
             }
           else if (i == j)
             {
-              value = opt_match;
+              value = static_cast<CELL>(opt_match);
             }
           else
             {
-              value = opt_mismatch;
+              value = static_cast<CELL>(opt_mismatch);
             }
           (reinterpret_cast<CELL *>(s->matrix.data()))[(matrix_size * i) + j] = value;
         }
@@ -1430,7 +1376,7 @@ auto search16_qprep(s16info_s * s, char * qseq, int qlen) -> void
     {
       xfree(s->qtable);
     }
-  s->qtable = static_cast<VECTOR_SHORT **>(xmalloc(s->qlen * sizeof(VECTOR_SHORT*)));
+  s->qtable = static_cast<VECTOR_SHORT **>(xmalloc(static_cast<uint64_t>(s->qlen) * sizeof(VECTOR_SHORT*)));
 
   for (int i = 0; i < qlen; i++)
     {
@@ -1468,21 +1414,21 @@ auto search16(s16info_s * s,
   CELL ** q_start = reinterpret_cast<CELL **>(s->qtable);
   CELL * dprofile = reinterpret_cast<CELL *>(s->dprofile);
   CELL * hearray = reinterpret_cast<CELL *>(s->hearray);
-  uint64_t const qlen = s->qlen;
+  uint64_t const qlen = static_cast<uint64_t>(s->qlen);
 
   if (qlen == 0)
     {
       for (auto cand_id = 0U; cand_id < sequences; cand_id++)
         {
           auto const seqno = seqnos[cand_id];
-          int64_t const length = db_getsequencelen(seqno);
+          int64_t const length = static_cast<int64_t>(db_getsequencelen(seqno));
 
           /* An empty query aligns to the target as one insertion of 'length'
              residues, so aligned == gaps == length. When that exceeds the
              16-bit statistics counters (search16_fits), divert to the linear
              memory aligner via the SHRT_MAX sentinel, exactly as the
              product/sum guard does for non-empty queries. */
-          if (not search16_fits(qlen, length))
+          if (not search16_fits(qlen, static_cast<uint64_t>(length)))
             {
               pscores[cand_id] = std::numeric_limits<short>::max();
               paligned[cand_id] = 0;
@@ -1493,10 +1439,10 @@ auto search16(s16info_s * s,
               continue;
             }
 
-          paligned[cand_id] = length;
+          paligned[cand_id] = static_cast<unsigned short>(length);
           pmatches[cand_id] = 0;
           pmismatches[cand_id] = 0;
-          pgaps[cand_id] = length;
+          pgaps[cand_id] = static_cast<unsigned short>(length);
 
           if (length == 0)
             {
@@ -1504,11 +1450,11 @@ auto search16(s16info_s * s,
             }
           else
             {
-              pscores[cand_id] =
+              pscores[cand_id] = static_cast<CELL>(
                 std::max(- s->penalty_gap_open_target_left -
                     (length * s->penalty_gap_extension_target_left),
                     - s->penalty_gap_open_target_right -
-                    (length * s->penalty_gap_extension_target_right));
+                    (length * s->penalty_gap_extension_target_right)));
             }
 
           char * cigar = nullptr;
@@ -1536,14 +1482,14 @@ auto search16(s16info_s * s,
     {
       uint64_t const dlen = db_getsequencelen(seqnos[i]);
       /* skip sequences the SIMD aligner cannot handle (product/sum limits) */
-      if (search16_fits(s->qlen, dlen))
+      if (search16_fits(static_cast<uint64_t>(s->qlen), dlen))
         {
           maxdlen = std::max(dlen, maxdlen);
         }
     }
   maxdlen = 4 * ((maxdlen + 3) / 4);
-  s->maxdlen = maxdlen;
-  uint64_t const dirbuffersize = static_cast<uint64_t>(s->qlen) * s->maxdlen * 4;
+  s->maxdlen = static_cast<int>(maxdlen);
+  uint64_t const dirbuffersize = static_cast<uint64_t>(s->qlen) * static_cast<uint64_t>(s->maxdlen) * 4;
 
   if (dirbuffersize > s->diralloc)
     {
@@ -1565,7 +1511,7 @@ auto search16(s16info_s * s,
         {
           xfree(s->cigar);
         }
-      s->cigar = static_cast<char *>(xmalloc(s->cigaralloc));
+      s->cigar = static_cast<char *>(xmalloc(static_cast<size_t>(s->cigaralloc)));
     }
 
   VECTOR_SHORT M;
@@ -1616,7 +1562,7 @@ auto search16(s16info_s * s,
 #elif defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
-  T0 = v_init(-1, 0, 0, 0, 0, 0, 0, 0);
+  T0 = v_init({{-1, 0, 0, 0, 0, 0, 0, 0}});
 
   R_query_left = v_dup(s->penalty_gap_extension_query_left);
 
@@ -1644,7 +1590,7 @@ auto search16(s16info_s * s,
   hep = reinterpret_cast<VECTOR_SHORT *>(hearray);
   qp = reinterpret_cast<VECTOR_SHORT **>(q_start);
 
-  for (int c = 0; c < CHANNELS; c++)
+  for (size_t c = 0; c < CHANNELS; c++)
     {
       d_begin[c] = &zero;
       d_end[c] = d_begin[c];
@@ -1658,7 +1604,7 @@ auto search16(s16info_s * s,
   auto const score_min = compute_score_min(*s);
   auto const score_max = std::numeric_limits<short>::max();
 
-  for (int i = 0; i < 4; i++)
+  for (size_t i = 0; i < 4; i++)
     {
       S[i] = v_zero();
       dseqalloc[i] = v_zero();
@@ -1684,13 +1630,13 @@ auto search16(s16info_s * s,
         {
           /* fill all channels with symbols from the database sequences */
 
-          for (int c = 0; c < CHANNELS; c++)
+          for (size_t c = 0; c < CHANNELS; c++)
             {
-              for (int j = 0; j < CDEPTH; j++)
+              for (size_t j = 0; j < CDEPTH; j++)
                 {
                   if (d_begin[c] < d_end[c])
                     {
-                      dseq[(CHANNELS * j) + c] = map_4bit(*(d_begin[c]++));
+                      dseq[(CHANNELS * j) + c] = map_4bit(static_cast<char>(*(d_begin[c]++)));
                     }
                   else
                     {
@@ -1728,7 +1674,7 @@ auto search16(s16info_s * s,
                 {
                   VECTOR_SHORT MM = v_zero();
                   VECTOR_SHORT TT = T0;
-                  for (int c = 0; c < CHANNELS; c++)
+                  for (size_t c = 0; c < CHANNELS; c++)
                     {
                       if ((d_begin[c] == d_end[c]) and
                           (j >= ((d_length[c] + 3) % 4)))
@@ -1757,7 +1703,7 @@ auto search16(s16info_s * s,
                             H0, H1, H2, H3,
                             F0, F1, F2, F3,
                             & h_min, & h_max,
-                            qlen, dir);
+                            static_cast<int64_t>(qlen), dir);
 
           VECTOR_SHORT h_min_vector;
           VECTOR_SHORT h_max_vector;
@@ -1765,14 +1711,14 @@ auto search16(s16info_s * s,
           v_store(& h_max_vector, h_max);
           for (int c = 0; c < CHANNELS; c++)
             {
-              if (not overflow[c])
+              if (not overflow[static_cast<size_t>(c)])
                 {
                   signed short const h_min_c = get_channel(h_min_vector, c);
                   signed short const h_max_c = get_channel(h_max_vector, c);
                   if ((h_min_c <= score_min) or
                       (h_max_c >= score_max))
                     {
-                      overflow[c] = true;
+                      overflow[static_cast<size_t>(c)] = true;
                     }
                 }
             }
@@ -1789,22 +1735,23 @@ auto search16(s16info_s * s,
           VECTOR_SHORT T = T0;
           for (int c = 0; c < CHANNELS; c++)
             {
-              if (d_begin[c] < d_end[c])
+              size_t const cc = static_cast<size_t>(c);
+              if (d_begin[cc] < d_end[cc])
                 {
                   /* this channel has more sequence */
 
                   for (int j = 0; j < CDEPTH; j++)
                     {
-                      if (d_begin[c] < d_end[c])
+                      if (d_begin[cc] < d_end[cc])
                         {
-                          dseq[(CHANNELS * j) + c] = map_4bit(*(d_begin[c]++));
+                          dseq[(CHANNELS * j) + c] = map_4bit(static_cast<char>(*(d_begin[cc]++)));
                         }
                       else
                         {
                           dseq[(CHANNELS * j) + c] = 0;
                         }
                     }
-                  if (d_begin[c] == d_end[c])
+                  if (d_begin[cc] == d_end[cc])
                     {
                       easy = false;
                     }
@@ -1815,18 +1762,18 @@ auto search16(s16info_s * s,
 
                   M = v_xor(M, T);
 
-                  int64_t cand_id = seq_id[c];
+                  int64_t cand_id = seq_id[cc];
 
                   if (cand_id >= 0)
                     {
                       /* save score */
 
-                      char const * dbseq = reinterpret_cast<char const *>(d_address[c]);
-                      int64_t const dbseqlen = d_length[c];
+                      char const * dbseq = reinterpret_cast<char const *>(d_address[cc]);
+                      int64_t const dbseqlen = static_cast<int64_t>(d_length[cc]);
                       int64_t const z = (dbseqlen + 3) % 4;
-                      int64_t const score = get_channel(S[z], c);
+                      int64_t const score = get_channel(S[static_cast<size_t>(z)], c);
 
-                      if (overflow[c])
+                      if (overflow[cc])
                         {
                           pscores[cand_id] = std::numeric_limits<short>::max();
                           paligned[cand_id] = 0;
@@ -1837,15 +1784,15 @@ auto search16(s16info_s * s,
                         }
                       else
                         {
-                          pscores[cand_id] = score;
-                          backtrack16(s, dbseq, dbseqlen, d_offset[c], c,
+                          pscores[cand_id] = static_cast<CELL>(score);
+                          backtrack16(s, dbseq, static_cast<uint64_t>(dbseqlen), d_offset[cc], cc,
                                       paligned + cand_id,
                                       pmatches + cand_id,
                                       pmismatches + cand_id,
                                       pgaps + cand_id);
                           pcigar[cand_id] =
                             static_cast<char *>(xmalloc(std::strlen(s->cigar)+1));
-                          strcpy(pcigar[cand_id], s->cigar);
+                          std::strcpy(pcigar[cand_id], s->cigar);
                         }
 
                       done++;
@@ -1857,9 +1804,9 @@ auto search16(s16info_s * s,
 
                   while ((length == 0) and (next_id < sequences))
                     {
-                      cand_id = next_id++;
-                      length = db_getsequencelen(seqnos[cand_id]);
-                      if ((length == 0) or (not search16_fits(s->qlen, length)))
+                      cand_id = static_cast<int64_t>(next_id++);
+                      length = static_cast<int64_t>(db_getsequencelen(seqnos[cand_id]));
+                      if ((length == 0) or (not search16_fits(static_cast<uint64_t>(s->qlen), static_cast<uint64_t>(length))))
                         {
                           pscores[cand_id] = std::numeric_limits<short>::max();
                           paligned[cand_id] = 0;
@@ -1874,47 +1821,47 @@ auto search16(s16info_s * s,
 
                   if (length > 0)
                     {
-                      seq_id[c] = cand_id;
+                      seq_id[cc] = cand_id;
                       char * address = db_getsequence(seqnos[cand_id]);
-                      d_address[c] = reinterpret_cast<BYTE *>(address);
-                      d_length[c] = length;
-                      d_begin[c] = reinterpret_cast<unsigned char *>(address);
-                      d_end[c] = reinterpret_cast<unsigned char *>(address) + length;
-                      d_offset[c] = dir - dirbuffer;
-                      overflow[c] = false;
+                      d_address[cc] = reinterpret_cast<BYTE *>(address);
+                      d_length[cc] = static_cast<uint64_t>(length);
+                      d_begin[cc] = reinterpret_cast<unsigned char *>(address);
+                      d_end[cc] = reinterpret_cast<unsigned char *>(address) + length;
+                      d_offset[cc] = static_cast<uint64_t>(dir - dirbuffer);
+                      overflow[cc] = false;
 
                       set_channel(H0, c, 0);
-                      set_channel(H1, c, - s->penalty_gap_open_query_left
-                        - (1 * s->penalty_gap_extension_query_left));
-                      set_channel(H2, c, - s->penalty_gap_open_query_left
-                        - (2 * s->penalty_gap_extension_query_left));
-                      set_channel(H3, c, - s->penalty_gap_open_query_left
-                        - (3 * s->penalty_gap_extension_query_left));
+                      set_channel(H1, c, static_cast<CELL>(- s->penalty_gap_open_query_left
+                        - (1 * s->penalty_gap_extension_query_left)));
+                      set_channel(H2, c, static_cast<CELL>(- s->penalty_gap_open_query_left
+                        - (2 * s->penalty_gap_extension_query_left)));
+                      set_channel(H3, c, static_cast<CELL>(- s->penalty_gap_open_query_left
+                        - (3 * s->penalty_gap_extension_query_left)));
 
-                      set_channel(F0, c, - s->penalty_gap_open_query_left
-                        - (1 * s->penalty_gap_extension_query_left));
-                      set_channel(F1, c, - s->penalty_gap_open_query_left
-                        - (2 * s->penalty_gap_extension_query_left));
-                      set_channel(F2, c, - s->penalty_gap_open_query_left
-                        - (3 * s->penalty_gap_extension_query_left));
-                      set_channel(F3, c, - s->penalty_gap_open_query_left
-                        - (4 * s->penalty_gap_extension_query_left));
+                      set_channel(F0, c, static_cast<CELL>(- s->penalty_gap_open_query_left
+                        - (1 * s->penalty_gap_extension_query_left)));
+                      set_channel(F1, c, static_cast<CELL>(- s->penalty_gap_open_query_left
+                        - (2 * s->penalty_gap_extension_query_left)));
+                      set_channel(F2, c, static_cast<CELL>(- s->penalty_gap_open_query_left
+                        - (3 * s->penalty_gap_extension_query_left)));
+                      set_channel(F3, c, static_cast<CELL>(- s->penalty_gap_open_query_left
+                        - (4 * s->penalty_gap_extension_query_left)));
 
                       /* fill channel */
 
                       for (int j = 0; j < CDEPTH; j++)
                         {
-                          if (d_begin[c] < d_end[c])
+                          if (d_begin[cc] < d_end[cc])
                             {
                               dseq[(CHANNELS * j) + c] =
-                                map_4bit(*(d_begin[c]++));
+                                map_4bit(static_cast<char>(*(d_begin[cc]++)));
                             }
                           else
                             {
                               dseq[(CHANNELS * j) + c] = 0;
                             }
                         }
-                      if (d_begin[c] == d_end[c])
+                      if (d_begin[cc] == d_end[cc])
                         {
                           easy = false;
                         }
@@ -1923,12 +1870,12 @@ auto search16(s16info_s * s,
                     {
                       /* no more sequences, empty channel */
 
-                      seq_id[c] = -1;
-                      d_address[c] = nullptr;
-                      d_begin[c] = &zero;
-                      d_end[c] = d_begin[c];
-                      d_length[c] = 0;
-                      d_offset[c] = 0;
+                      seq_id[cc] = -1;
+                      d_address[cc] = nullptr;
+                      d_begin[cc] = &zero;
+                      d_end[cc] = d_begin[cc];
+                      d_length[cc] = 0;
+                      d_offset[cc] = 0;
                       for (int j = 0; j < CDEPTH; j++)
                         {
                           dseq[(CHANNELS * j) + c] = 0;
@@ -1978,7 +1925,7 @@ auto search16(s16info_s * s,
                 {
                   VECTOR_SHORT MM = v_zero();
                   VECTOR_SHORT TT = T0;
-                  for (int c = 0; c < CHANNELS; c++)
+                  for (size_t c = 0; c < CHANNELS; c++)
                     {
                       if ((d_begin[c] == d_end[c]) and
                           (j >= ((d_length[c] + 3) % 4)))
@@ -2011,7 +1958,7 @@ auto search16(s16info_s * s,
                              M_QR_target_left, M_R_target_left,
                              M_QR_query_interior,
                              M_QR_query_right,
-                             qlen, dir);
+                             static_cast<int64_t>(qlen), dir);
 
           VECTOR_SHORT h_min_vector;
           VECTOR_SHORT h_max_vector;
@@ -2019,13 +1966,13 @@ auto search16(s16info_s * s,
           v_store(& h_max_vector, h_max);
           for (int c = 0; c < CHANNELS; c++)
             {
-              if (not overflow[c])
+              if (not overflow[static_cast<size_t>(c)])
                 {
                   signed short const h_min_c = get_channel(h_min_vector, c);
                   signed short const h_max_c = get_channel(h_max_vector, c);
                   if ((h_min_c <= score_min) or (h_max_c >= score_max))
                     {
-                      overflow[c] = true;
+                      overflow[static_cast<size_t>(c)] = true;
                     }
                 }
             }

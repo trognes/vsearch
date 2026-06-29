@@ -204,12 +204,12 @@ auto db_add(bool const is_fastq_record,
 
   /* update index */
   seqinfo_t * seqindex_p = seqindex + sequences;
-  seqindex_p->headerlen = headerlength;
-  seqindex_p->seqlen = sequencelength;
+  seqindex_p->headerlen = static_cast<unsigned int>(headerlength);
+  seqindex_p->seqlen = static_cast<unsigned int>(sequencelength);
   seqindex_p->header_p = header_p;
   seqindex_p->seq_p = sequence_p;
   seqindex_p->qual_p = quality_p;
-  seqindex_p->size = abundance;
+  seqindex_p->size = static_cast<uint64_t>(abundance);
 
   /* update statistics */
   ++sequences;
@@ -226,7 +226,7 @@ auto db_read(const char * filename, int upcase) -> void
 
   is_fastq = fastx_is_fastq(h);
 
-  int64_t const filesize = fastx_get_size(h);
+  int64_t const filesize = static_cast<int64_t>(fastx_get_size(h));
 
   char * prompt = nullptr;
   if (xsprintf(&prompt, "Reading file %s", filename) == -1)
@@ -234,7 +234,7 @@ auto db_read(const char * filename, int upcase) -> void
       fatal("Out of memory");
     }
 
-  progress_init(prompt, filesize);
+  progress_init(prompt, static_cast<uint64_t>(filesize));
 
   longest = 0;
   shortest = std::numeric_limits<uint64_t>::max();  // refactoring: direct initialization
@@ -295,18 +295,18 @@ auto db_read(const char * filename, int upcase) -> void
     {
       if (sequences > 0)
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "%" PRIu64 " nt in %" PRIu64 " seqs, "
                   "min %" PRIu64 ", max %" PRIu64 ", avg %.0f\n",
                   db_getnucleotidecount(),
                   db_getsequencecount(),
                   db_getshortestsequence(),
                   db_getlongestsequence(),
-                  db_getnucleotidecount() * 1.0 / db_getsequencecount());
+                  static_cast<double>(db_getnucleotidecount()) / static_cast<double>(db_getsequencecount()));
         }
       else
         {
-          fprintf(stderr,
+          std::fprintf(stderr,
                   "%" PRIu64 " nt in %" PRIu64 " seqs\n",
                   db_getnucleotidecount(),
                   db_getsequencecount());
@@ -317,18 +317,18 @@ auto db_read(const char * filename, int upcase) -> void
     {
       if (sequences > 0)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%" PRIu64 " nt in %" PRIu64 " seqs, "
                   "min %" PRIu64 ", max %" PRIu64 ", avg %.0f\n\n",
                   db_getnucleotidecount(),
                   db_getsequencecount(),
                   db_getshortestsequence(),
                   db_getlongestsequence(),
-                  db_getnucleotidecount() * 1.0 / db_getsequencecount());
+                  static_cast<double>(db_getnucleotidecount()) / static_cast<double>(db_getsequencecount()));
         }
       else
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "%" PRIu64 " nt in %" PRIu64 " seqs\n\n",
                   db_getnucleotidecount(),
                   db_getsequencecount());
@@ -339,7 +339,7 @@ auto db_read(const char * filename, int upcase) -> void
 
   if (discarded_short != 0)
     {
-      fprintf(stderr,
+      std::fprintf(stderr,
               "minseqlength %" PRId64 ": %" PRId64 " %s discarded.\n",
               opt_minseqlength,
               discarded_short,
@@ -347,7 +347,7 @@ auto db_read(const char * filename, int upcase) -> void
 
       if (opt_log != nullptr)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "minseqlength %" PRId64 ": %" PRId64 " %s discarded.\n\n",
                   opt_minseqlength,
                   discarded_short,
@@ -357,7 +357,7 @@ auto db_read(const char * filename, int upcase) -> void
 
   if (discarded_long != 0)
     {
-      fprintf(stderr,
+      std::fprintf(stderr,
               "maxseqlength %" PRId64 ": %" PRId64 " %s discarded.\n",
               opt_maxseqlength,
               discarded_long,
@@ -365,7 +365,7 @@ auto db_read(const char * filename, int upcase) -> void
 
       if (opt_log != nullptr)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "maxseqlength %" PRId64 ": %" PRId64 " %s discarded.\n\n",
                   opt_maxseqlength,
                   discarded_long,
@@ -375,7 +375,7 @@ auto db_read(const char * filename, int upcase) -> void
 
     if (discarded_unoise != 0)
     {
-      fprintf(stderr,
+      std::fprintf(stderr,
               "minsize %" PRId64 ": %" PRId64 " %s discarded.\n",
               opt_minsize,
               discarded_unoise,
@@ -383,7 +383,7 @@ auto db_read(const char * filename, int upcase) -> void
 
       if (opt_log != nullptr)
         {
-          fprintf(fp_log,
+          std::fprintf(fp_log,
                   "minsize %" PRId64 ": %" PRId64 " %s discarded.\n",
                   opt_minsize,
                   discarded_unoise,
@@ -573,7 +573,7 @@ auto db_sortbylength() -> void
   progress_init("Sorting by length", 100);
   if (sequences > 0)  // qsort requires a non-null pointer even for zero elements
     {
-      qsort(seqindex,
+      std::qsort(seqindex,
             sequences,
             sizeof(seqinfo_t),
             compare_bylength);
@@ -587,7 +587,7 @@ auto db_sortbylength_shortest_first() -> void
   progress_init("Sorting by length", 100);
   if (sequences > 0)  // qsort requires a non-null pointer even for zero elements
     {
-      qsort(seqindex,
+      std::qsort(seqindex,
             sequences,
             sizeof(seqinfo_t),
             compare_bylength_shortest_first);
@@ -601,7 +601,7 @@ auto db_sortbyabundance() -> void
   progress_init("Sorting by abundance", 100);
   if (sequences > 0)  // qsort requires a non-null pointer even for zero elements
     {
-      qsort(seqindex,
+      std::qsort(seqindex,
             sequences,
             sizeof(seqinfo_t),
             compare_byabundance);
