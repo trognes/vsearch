@@ -277,11 +277,20 @@ jobs:
           # stops growing at the hang and its tail is the stuck command. Absolute
           # path because the test scripts cd around. Quoted heredoc keeps PS4's
           # expansions literal in the file (deferred to trace time).
-          # ${BASHPID} tags each traced line with the *subshell* pid (unlike $$,
-          # it updates in subshells), so a leaked `<()` writer blocked in fifoow
-          # can be mapped from the ps dump back to the exact line it forked at.
+          # PS4 carries three things needed to pinpoint the deadlocking <():
+          #   rc=$?      exit status of the PREVIOUS command in this shell, so
+          #              the line right after a `vsearch ... <()` shows whether
+          #              that vsearch exited nonzero (option rejection -> it never
+          #              opened the FIFO -> the <() producer leaks in fifoow).
+          #   p=BASHPID  the subshell pid, so per-shell command order can be
+          #              reconstructed from the globally-interleaved trace.
+          #   file:LINENO of the command itself.
+          # The host-side "Analyze" step parses this to list the exact <() sites
+          # whose vsearch then failed. (A leaked producer never traces under its
+          # own pid — it blocks before running any command — so it can't be named
+          # directly; this consumer-side rc signal is how we find it.)
           cat > /tmp/xtrace_init.sh <<'XTRACE_INIT'
-          PS4='+ [${BASHPID}] ${BASH_SOURCE##*/}:${LINENO}: '
+          PS4='+ [rc=$? p=${BASHPID}] ${BASH_SOURCE##*/}:${LINENO}: '
           set -x
           XTRACE_INIT
           chmod a+r /tmp/xtrace_init.sh
@@ -337,24 +346,12 @@ jobs:
           tail -n 80 vsearch-tests/test.log
           echo "===== last 50 lines of xtrace.log (last shell command before hang) ====="
           tail -n 50 vsearch-tests/xtrace.log 2>/dev/null || echo "(no xtrace.log)"
-          # Parent-side site finder. A leaked fifoow producer never traces (it
-          # blocks in the FIFO open before running any command), but the PARENT
-          # traces the consumer line, and bash's expanded <() argument is a named
-          # FIFO whose path contains 'sh-np' (the same FIFO whose open-wait is the
-          # fifoow state). So every vsearch call fed by a <() shows up here as a
-          # '+ [pid] file:line: ...vsearch... <tmp>/sh-np...' line. Group by
-          # file:line with an execution count: the site whose count matches a
-          # script's fifoow leak tally above is the deadlocking <().
-          echo "===== <() sites feeding vsearch (file:line  x count) — match counts to the fifoow tally ====="
-          grep -aE '\[[0-9]+\] [^ ]+:[0-9]+:.*vsearch.*sh-np' vsearch-tests/xtrace.log 2>/dev/null \
-            | sed -E 's/.*\[[0-9]+\] ([^ ]+:[0-9]+):.*/\1/' \
-            | sort | uniq -c | sort -rn | sed 's/^/    /' \
-            || echo "    (none found — check the sh-np FIFO naming in the xtrace artifact)"
-          # Fallback sample in case the FIFO token differs in this environment:
-          # show a few raw vsearch lines that carry a temp/pipe path argument.
-          echo "    --- sample raw vsearch-with-temp-path lines (token check) ---"
-          grep -aE '\[[0-9]+\] [^ ]+:[0-9]+:.*vsearch.*(sh-np|/tmp/|/dev/fd|/var/)' vsearch-tests/xtrace.log 2>/dev/null \
-            | head -n 5 | sed 's/^/    /' || true
+          # The exact deadlocking-<() list is produced host-side (python3) from
+          # the copied-back xtrace.log; see the "Analyze" step below. Here we just
+          # report how many <()-into-vsearch sites exist (the grouped-by-count
+          # view is unhelpful — every site runs once — so only the total is shown).
+          fifo_sites=$(grep -acE '\[rc=[0-9]+ p=[0-9]+\] [^ ]+:[0-9]+:.*vsearch.*sh-np' vsearch-tests/xtrace.log 2>/dev/null || echo 0)
+          echo "===== <()-into-vsearch consumer lines in trace: ${fifo_sites} (host Analyze step finds the leaking subset) ====="
           # Record the status and exit 0 so vmactions runs its copyback: it
           # SKIPS copyback when the run script exits non-zero, which is why the
           # test.log artifact kept coming up empty. The host-side "Report" step
@@ -375,6 +372,53 @@ jobs:
           vsearch-tests/test.log
           vsearch-tests/xtrace.log
         if-no-files-found: warn
+
+    # Host-side analysis (Ubuntu has python3) of the copied-back xtrace.log:
+    # find the exact <() sites that deadlock. A leaked fifoow producer never
+    # traces under its own pid (it blocks in the FIFO open before running any
+    # command), so we identify it from the CONSUMER side: a `vsearch ... <()`
+    # call (its expanded arg is a bash process-sub FIFO, path contains 'sh-np')
+    # that is immediately followed, in the SAME shell (same BASHPID), by a
+    # nonzero rc means that vsearch exited without opening the FIFO — so its
+    # producer is the one left blocked. PS4 carries rc/pid/file:line for this.
+    - name: Analyze deadlocking <() sites
+      if: always()
+      run: |
+        python3 - <<'PY'
+        import re, collections, sys, os
+        path = "vsearch-tests/xtrace.log"
+        if not os.path.exists(path):
+            print("no xtrace.log copied back"); sys.exit(0)
+        line_re = re.compile(r'\[rc=(\d+) p=(\d+)\] ([^ ]+:\d+): (.*)')
+        prev = {}                       # pid -> <()-fed vsearch site of its last command
+        leaks = collections.Counter()   # site -> times its vsearch then failed
+        allfifo = collections.Counter() # site -> times used as a <()-fed vsearch consumer
+        for raw in open(path, errors='replace'):
+            m = line_re.search(raw)
+            if not m:
+                continue
+            rc, pid, site, cmd = int(m.group(1)), m.group(2), m.group(3), m.group(4)
+            if pid in prev and rc != 0:          # rc is the PREVIOUS cmd's status
+                leaks[prev[pid]] += 1
+            if 'vsearch' in cmd and 'sh-np' in cmd:
+                prev[pid] = site; allfifo[site] += 1
+            else:
+                prev.pop(pid, None)
+        print("=== Deadlocking <() sites: vsearch fed by a process-sub FIFO that then exited nonzero ===")
+        print("    (cross-check the per-script totals against the fifoow ps tally in the VM log:")
+        print("     sintax 10, fixed_bugs 4, fastq_mergepairs 2, fastx_syncpairs 2, google_forum_issues 2)")
+        if not leaks:
+            print("    (none detected)")
+        for site, c in sorted(leaks.items(), key=lambda kv: (kv[0].split(':')[0], int(kv[0].split(':')[1]))):
+            print(f"    {site}   (failed x{c})")
+        per_script = collections.Counter()
+        for site, c in leaks.items():
+            per_script[site.split(':')[0]] += c
+        print("    --- per-script leak totals ---")
+        for s, c in per_script.most_common():
+            print(f"    {s}: {c}")
+        print(f"    total leaking-site executions: {sum(leaks.values())} ; total <()-into-vsearch sites: {len(allfifo)}")
+        PY
 
     # The VM script exits 0 so vmactions copies test.log / test.status back to
     # the host; the real suite status is recorded in test.status. Re-assert it
