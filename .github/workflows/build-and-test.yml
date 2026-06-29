@@ -227,15 +227,20 @@ jobs:
           # first ~30 s with no new output the watcher dumps the test process
           # tree with each process's state and wait channel (wchan) — showing
           # what the suite is blocked on (a pipe read, a child wait, disk I/O,
-          # ...) and the exact command — then **terminates the suite** rather
-          # than waiting any longer: more silence adds nothing, and finishing
-          # cleanly (instead of being cancelled at the job timeout) lets the
-          # summary and the test.log artifact upload run. The per-suite timeout
-          # remains a backstop.
+          # ...) and the exact command — then stops waiting: more silence adds
+          # nothing. It does NOT kill the wedged processes — killing the runner's
+          # processes also tore down the vmactions SSH session (ssh exited 143),
+          # ending the step abnormally and skipping copyback. Instead it abandons
+          # them to the VM teardown and lets the script finish cleanly, so the
+          # summary runs and vmactions copies test.log back for the artifact. The
+          # background suite is detached from the SSH stdio (</dev/null >/dev/null
+          # 2>&1) so the session closes promptly on exit instead of waiting on a
+          # backgrounded process that still holds the channel. The per-suite
+          # timeout remains a backstop.
           echo "========== Running tests... =========="
           suite_timeout=720
           rm -f vsearch-tests/test.log
-          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2>&1" &
+          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2>&1" </dev/null >/dev/null 2>&1 &
           suite_pid=$!
           last_sig=""
           stall=0
@@ -253,18 +258,19 @@ jobs:
                 ps -U runner -o pid,ppid,stat,wchan,command 2>/dev/null | head -n 25 | sed 's/^/    /'
                 echo "    --- su/wrapper ---"
                 ps -axww -o pid,ppid,stat,wchan,command 2>/dev/null | grep -E 'run_all_tests|[t]imeout -k' | sed 's/^/    /'
-                echo "[$(date -u +%H:%M:%S)] suite stalled — terminating now instead of waiting for more silence."
+                echo "[$(date -u +%H:%M:%S)] suite stalled — abandoning the wedged suite and finishing so the summary and test.log are captured."
                 hung=1
-                kill -TERM "$suite_pid" 2>/dev/null
-                pkill -U runner 2>/dev/null
                 break
               fi
             fi
             sleep 1
           done
-          wait "$suite_pid" 2>/dev/null
-          status=$?
-          if [ "$hung" -eq 1 ]; then status=124; fi
+          if [ "$hung" -eq 1 ]; then
+            status=124
+          else
+            wait "$suite_pid" 2>/dev/null
+            status=$?
+          fi
           echo "========== Tests finished (exit status $status) =========="
           if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
             echo "!!! Test suite stalled or timed out and was terminated — the hang is"
