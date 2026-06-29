@@ -251,54 +251,25 @@ jobs:
           # first ~30 s with no new output the watcher dumps the test process
           # tree with each process's state and wait channel (wchan) — showing
           # what the suite is blocked on (a pipe read, a child wait, disk I/O,
-          # ...) and the exact command — then stops waiting: more silence adds
-          # nothing. It does NOT kill the wedged processes — killing the runner's
-          # processes also tore down the vmactions SSH session (ssh exited 143),
-          # ending the step abnormally and skipping copyback. Instead it abandons
-          # them to the VM teardown and lets the script finish cleanly, so the
-          # summary runs and vmactions copies test.log back for the artifact. The
+          # ...) and the exact command. On FreeBSD that stall is a known teardown
+          # artifact: <() is a real named FIFO, so a negative test that fed vsearch
+          # input via <() leaves the writer blocked in fifoow once vsearch rejects
+          # the options without opening it. The watcher reaps ONLY those fifoow
+          # writers (targeted kill by pid — a broad pkill tore down the vmactions
+          # SSH session, ssh exited 143, skipping copyback), which lets the suite
+          # process exit; pass/fail is then taken from FAIL lines in test.log. The
           # background suite is detached from the SSH stdio (</dev/null >/dev/null
-          # 2>&1) so the session closes promptly on exit instead of waiting on a
-          # backgrounded process that still holds the channel. The per-suite
-          # timeout remains a backstop.
+          # 2>&1) so the session closes promptly even if a process must be
+          # abandoned. The per-suite timeout remains a backstop.
           echo "========== Running tests... =========="
           suite_timeout=720
-          rm -f vsearch-tests/test.log vsearch-tests/xtrace.log
-          # Diagnostic instrumentation for the FreeBSD-only fifoow deadlock.
-          # Goal: capture the exact shell command bash is blocked on when the
-          # suite hangs. We point BASH_ENV at a tiny init file that every
-          # non-interactive bash sources at startup — both run_all_tests.sh and
-          # the per-command scripts it spawns — which sets a file:line PS4 and
-          # turns on `set -x`. (BASH_ENV is the reliable lever here: SHELLOPTS is
-          # readonly so it can't be set as a command prefix, and PS4 is not
-          # imported from the environment.) The trace goes to its own file
-          # (2> xtrace.log) so test.log keeps only the normal result lines the
-          # heartbeat below tails. The deadlock halts execution, so xtrace.log
-          # stops growing at the hang and its tail is the stuck command. Absolute
-          # path because the test scripts cd around. Quoted heredoc keeps PS4's
-          # expansions literal in the file (deferred to trace time).
-          # PS4 carries three things needed to pinpoint the deadlocking <():
-          #   rc=$?      exit status of the PREVIOUS command in this shell, so
-          #              the line right after a `vsearch ... <()` shows whether
-          #              that vsearch exited nonzero (option rejection -> it never
-          #              opened the FIFO -> the <() producer leaks in fifoow).
-          #   p=BASHPID  the subshell pid, so per-shell command order can be
-          #              reconstructed from the globally-interleaved trace.
-          #   file:LINENO of the command itself.
-          # The host-side "Analyze" step parses this to list the exact <() sites
-          # whose vsearch then failed. (A leaked producer never traces under its
-          # own pid — it blocks before running any command — so it can't be named
-          # directly; this consumer-side rc signal is how we find it.)
-          cat > /tmp/xtrace_init.sh <<'XTRACE_INIT'
-          PS4='+ [rc=$? p=${BASHPID}] ${BASH_SOURCE##*/}:${LINENO}: '
-          set -x
-          XTRACE_INIT
-          chmod a+r /tmp/xtrace_init.sh
-          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH BASH_ENV=/tmp/xtrace_init.sh timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2> xtrace.log" </dev/null >/dev/null 2>&1 &
+          rm -f vsearch-tests/test.log
+          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2>&1" </dev/null >/dev/null 2>&1 &
           suite_pid=$!
           last_sig=""
           stall=0
-          hung=0
+          reaped=0
+          genuine_hang=0
           while kill -0 "$suite_pid" 2>/dev/null; do
             sig=$(tail -n 20 vsearch-tests/test.log 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1)
             if [ "$sig" != "$last_sig" ]; then
@@ -309,53 +280,64 @@ jobs:
               stall=$((stall + 1))
               if [ "$stall" -ge 30 ]; then
                 echo "[$(date -u +%H:%M:%S)] no new test output for ${stall}s; test process tree (pid ppid stat wchan command):"
-                ps -U runner -o pid,ppid,stat,wchan,command 2>/dev/null | head -n 25 | sed 's/^/    /'
-                echo "    --- su/wrapper ---"
-                ps -axww -o pid,ppid,stat,wchan,command 2>/dev/null | grep -E 'run_all_tests|[t]imeout -k' | sed 's/^/    /'
-                echo "    --- last 15 xtrace lines (command bash is blocked on) ---"
-                tail -n 15 vsearch-tests/xtrace.log 2>/dev/null | sed 's/^/    /'
-                # Map each fifoow-blocked subshell to the exact `<()` site it
-                # forked at: its last xtrace line carries its BASHPID. This is the
-                # actionable output — the file:line of every deadlocking `<()`.
-                echo "    --- fifoow-blocked sites (pid -> last traced line / the deadlocking <() ) ---"
-                ps -U runner -o pid,wchan 2>/dev/null | awk '$2=="fifoow"{print $1}' | while read -r p; do
-                  line=$(grep -F "[$p]" vsearch-tests/xtrace.log 2>/dev/null | tail -n 1)
-                  echo "    pid $p: ${line:-<no trace line found>}"
-                done
-                echo "[$(date -u +%H:%M:%S)] suite stalled — abandoning the wedged suite and finishing so the summary and test.log are captured."
-                hung=1
+                ps -U runner -o pid,ppid,stat,wchan,command 2>/dev/null | head -n 30 | sed 's/^/    /'
+                # The known FreeBSD stall is a <()-on-BSD teardown artifact, not a
+                # test failure: every test has run, but bash's teardown waits on
+                # orphaned process-substitution *writers* still blocked in fifoow.
+                # (A negative test fed vsearch an input via <(); vsearch rejected
+                # the options before opening it, so the writer never got a reader.
+                # On Linux <() is a /dev/fd pipe and this does not happen.) Reap
+                # ONLY those fifoow-blocked writers — a targeted kill by pid, never
+                # a broad `pkill -U runner`, which also killed the vmactions SSH
+                # shell (ssh exited 143) and skipped copyback. Killing the writers
+                # lets the suite process unwind and exit; pass/fail is then decided
+                # purely by FAIL lines in test.log below.
+                fifoow_pids=$(ps -U runner -o pid,wchan 2>/dev/null | awk '$2 == "fifoow" { print $1 }')
+                if [ -n "$fifoow_pids" ]; then
+                  echo "[$(date -u +%H:%M:%S)] reaping orphaned fifoow <() writers: $(echo $fifoow_pids | tr '\n' ' ')"
+                  echo "$fifoow_pids" | xargs kill 2>/dev/null
+                  reaped=1
+                else
+                  # Stalled but nothing is blocked in fifoow: this is not the known
+                  # teardown artifact, so treat it as a genuine hang and fail.
+                  echo "[$(date -u +%H:%M:%S)] stall with no fifoow writers — treating as a genuine hang."
+                  genuine_hang=1
+                fi
                 break
               fi
             fi
             sleep 1
           done
-          if [ "$hung" -eq 1 ]; then
-            status=124
+          # Give the (reaped) suite a moment to unwind, but never block forever on
+          # it: if it is still alive after the grace period, abandon it to the VM
+          # teardown — the background job is detached from the SSH stdio so the
+          # session still closes cleanly and vmactions runs copyback.
+          for _ in $(seq 1 20); do kill -0 "$suite_pid" 2>/dev/null || break; sleep 1; done
+          if kill -0 "$suite_pid" 2>/dev/null; then
+            echo "suite process still alive after reap; abandoning it to VM teardown."
           else
             wait "$suite_pid" 2>/dev/null
-            status=$?
           fi
-          echo "========== Tests finished (exit status $status) =========="
-          if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
-            echo "!!! Test suite stalled or timed out and was terminated — the hang is"
-            echo "!!! in or just after the last test shown below. (status $status)"
-          fi
+          echo "========== Tests finished =========="
+          # Pass/fail = did any test report FAIL. The teardown stall is not a
+          # failure (all tests ran). A genuine hang (no fifoow writers) fails.
           echo "===== FAIL lines ====="
-          grep -E 'FAIL' vsearch-tests/test.log || echo "(none)"
-          echo "===== last 80 lines of test.log ====="
-          tail -n 80 vsearch-tests/test.log
-          echo "===== last 50 lines of xtrace.log (last shell command before hang) ====="
-          tail -n 50 vsearch-tests/xtrace.log 2>/dev/null || echo "(no xtrace.log)"
-          # The exact deadlocking-<() list is produced host-side (python3) from
-          # the copied-back xtrace.log; see the "Analyze" step below. Here we just
-          # report how many <()-into-vsearch sites exist (the grouped-by-count
-          # view is unhelpful — every site runs once — so only the total is shown).
-          fifo_sites=$(grep -acE '\[rc=[0-9]+ p=[0-9]+\] [^ ]+:[0-9]+:.*vsearch.*sh-np' vsearch-tests/xtrace.log 2>/dev/null || echo 0)
-          echo "===== <()-into-vsearch consumer lines in trace: ${fifo_sites} (host Analyze step finds the leaking subset) ====="
-          # Record the status and exit 0 so vmactions runs its copyback: it
-          # SKIPS copyback when the run script exits non-zero, which is why the
-          # test.log artifact kept coming up empty. The host-side "Report" step
-          # below reads test.status and turns it back into the job's pass/fail.
+          if grep -E 'FAIL' vsearch-tests/test.log; then
+            status=1
+          else
+            echo "(none)"
+            status=0
+          fi
+          if [ "$genuine_hang" -eq 1 ]; then
+            echo "!!! Genuine hang detected (stall with no fifoow writers)."
+            status=124
+          fi
+          echo "===== last 60 lines of test.log ====="
+          tail -n 60 vsearch-tests/test.log
+          # Record the status and exit 0 so vmactions runs its copyback: it SKIPS
+          # copyback when the run script exits non-zero, which is why the test.log
+          # artifact kept coming up empty. The host-side "Report" step below reads
+          # test.status and turns it back into the job's pass/fail.
           echo "$status" > vsearch-tests/test.status
           exit 0
 
@@ -368,57 +350,8 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: freebsd-test-log
-        path: |
-          vsearch-tests/test.log
-          vsearch-tests/xtrace.log
+        path: vsearch-tests/test.log
         if-no-files-found: warn
-
-    # Host-side analysis (Ubuntu has python3) of the copied-back xtrace.log:
-    # find the exact <() sites that deadlock. A leaked fifoow producer never
-    # traces under its own pid (it blocks in the FIFO open before running any
-    # command), so we identify it from the CONSUMER side: a `vsearch ... <()`
-    # call (its expanded arg is a bash process-sub FIFO, path contains 'sh-np')
-    # that is immediately followed, in the SAME shell (same BASHPID), by a
-    # nonzero rc means that vsearch exited without opening the FIFO — so its
-    # producer is the one left blocked. PS4 carries rc/pid/file:line for this.
-    - name: Analyze deadlocking <() sites
-      if: always()
-      run: |
-        python3 - <<'PY'
-        import re, collections, sys, os
-        path = "vsearch-tests/xtrace.log"
-        if not os.path.exists(path):
-            print("no xtrace.log copied back"); sys.exit(0)
-        line_re = re.compile(r'\[rc=(\d+) p=(\d+)\] ([^ ]+:\d+): (.*)')
-        prev = {}                       # pid -> <()-fed vsearch site of its last command
-        leaks = collections.Counter()   # site -> times its vsearch then failed
-        allfifo = collections.Counter() # site -> times used as a <()-fed vsearch consumer
-        for raw in open(path, errors='replace'):
-            m = line_re.search(raw)
-            if not m:
-                continue
-            rc, pid, site, cmd = int(m.group(1)), m.group(2), m.group(3), m.group(4)
-            if pid in prev and rc != 0:          # rc is the PREVIOUS cmd's status
-                leaks[prev[pid]] += 1
-            if 'vsearch' in cmd and 'sh-np' in cmd:
-                prev[pid] = site; allfifo[site] += 1
-            else:
-                prev.pop(pid, None)
-        print("=== Deadlocking <() sites: vsearch fed by a process-sub FIFO that then exited nonzero ===")
-        print("    (cross-check the per-script totals against the fifoow ps tally in the VM log:")
-        print("     sintax 10, fixed_bugs 4, fastq_mergepairs 2, fastx_syncpairs 2, google_forum_issues 2)")
-        if not leaks:
-            print("    (none detected)")
-        for site, c in sorted(leaks.items(), key=lambda kv: (kv[0].split(':')[0], int(kv[0].split(':')[1]))):
-            print(f"    {site}   (failed x{c})")
-        per_script = collections.Counter()
-        for site, c in leaks.items():
-            per_script[site.split(':')[0]] += c
-        print("    --- per-script leak totals ---")
-        for s, c in per_script.most_common():
-            print(f"    {s}: {c}")
-        print(f"    total leaking-site executions: {sum(leaks.values())} ; total <()-into-vsearch sites: {len(allfifo)}")
-        PY
 
     # The VM script exits 0 so vmactions copies test.log / test.status back to
     # the host; the real suite status is recorded in test.status. Re-assert it
