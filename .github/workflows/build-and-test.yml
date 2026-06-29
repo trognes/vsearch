@@ -277,8 +277,11 @@ jobs:
           # stops growing at the hang and its tail is the stuck command. Absolute
           # path because the test scripts cd around. Quoted heredoc keeps PS4's
           # expansions literal in the file (deferred to trace time).
+          # ${BASHPID} tags each traced line with the *subshell* pid (unlike $$,
+          # it updates in subshells), so a leaked `<()` writer blocked in fifoow
+          # can be mapped from the ps dump back to the exact line it forked at.
           cat > /tmp/xtrace_init.sh <<'XTRACE_INIT'
-          PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+          PS4='+ [${BASHPID}] ${BASH_SOURCE##*/}:${LINENO}: '
           set -x
           XTRACE_INIT
           chmod a+r /tmp/xtrace_init.sh
@@ -302,6 +305,14 @@ jobs:
                 ps -axww -o pid,ppid,stat,wchan,command 2>/dev/null | grep -E 'run_all_tests|[t]imeout -k' | sed 's/^/    /'
                 echo "    --- last 15 xtrace lines (command bash is blocked on) ---"
                 tail -n 15 vsearch-tests/xtrace.log 2>/dev/null | sed 's/^/    /'
+                # Map each fifoow-blocked subshell to the exact `<()` site it
+                # forked at: its last xtrace line carries its BASHPID. This is the
+                # actionable output — the file:line of every deadlocking `<()`.
+                echo "    --- fifoow-blocked sites (pid -> last traced line / the deadlocking <() ) ---"
+                ps -U runner -o pid,wchan 2>/dev/null | awk '$2=="fifoow"{print $1}' | while read -r p; do
+                  line=$(grep -F "[$p]" vsearch-tests/xtrace.log 2>/dev/null | tail -n 1)
+                  echo "    pid $p: ${line:-<no trace line found>}"
+                done
                 echo "[$(date -u +%H:%M:%S)] suite stalled — abandoning the wedged suite and finishing so the summary and test.log are captured."
                 hung=1
                 break
