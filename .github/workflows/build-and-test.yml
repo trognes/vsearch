@@ -280,7 +280,12 @@ jobs:
           grep -E 'FAIL' vsearch-tests/test.log || echo "(none)"
           echo "===== last 80 lines of test.log ====="
           tail -n 80 vsearch-tests/test.log
-          exit $status
+          # Record the status and exit 0 so vmactions runs its copyback: it
+          # SKIPS copyback when the run script exits non-zero, which is why the
+          # test.log artifact kept coming up empty. The host-side "Report" step
+          # below reads test.status and turns it back into the job's pass/fail.
+          echo "$status" > vsearch-tests/test.status
+          exit 0
 
     # vmactions copies the workspace back to the host, so the full in-VM test
     # log (all ~7,700 result lines, not just the tail above) is available here.
@@ -293,3 +298,15 @@ jobs:
         name: freebsd-test-log
         path: vsearch-tests/test.log
         if-no-files-found: warn
+
+    # The VM script exits 0 so vmactions copies test.log / test.status back to
+    # the host; the real suite status is recorded in test.status. Re-assert it
+    # here so the job's pass/fail reflects the actual result. The job is
+    # continue-on-error, so this stays non-gating but goes visibly red on a real
+    # failure or hang. Missing test.status (copyback failed) defaults to failure.
+    - name: Report FreeBSD test result
+      if: always()
+      run: |
+        status=$(cat vsearch-tests/test.status 2>/dev/null || echo 1)
+        echo "FreeBSD test suite exit status: ${status}"
+        exit "${status}"
