@@ -263,8 +263,26 @@ jobs:
           # timeout remains a backstop.
           echo "========== Running tests... =========="
           suite_timeout=720
-          rm -f vsearch-tests/test.log
-          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2>&1" </dev/null >/dev/null 2>&1 &
+          rm -f vsearch-tests/test.log vsearch-tests/xtrace.log
+          # Diagnostic instrumentation for the FreeBSD-only fifoow deadlock.
+          # Goal: capture the exact shell command bash is blocked on when the
+          # suite hangs. We point BASH_ENV at a tiny init file that every
+          # non-interactive bash sources at startup — both run_all_tests.sh and
+          # the per-command scripts it spawns — which sets a file:line PS4 and
+          # turns on `set -x`. (BASH_ENV is the reliable lever here: SHELLOPTS is
+          # readonly so it can't be set as a command prefix, and PS4 is not
+          # imported from the environment.) The trace goes to its own file
+          # (2> xtrace.log) so test.log keeps only the normal result lines the
+          # heartbeat below tails. The deadlock halts execution, so xtrace.log
+          # stops growing at the hang and its tail is the stuck command. Absolute
+          # path because the test scripts cd around. Quoted heredoc keeps PS4's
+          # expansions literal in the file (deferred to trace time).
+          cat > /tmp/xtrace_init.sh <<'XTRACE_INIT'
+          PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+          set -x
+          XTRACE_INIT
+          chmod a+r /tmp/xtrace_init.sh
+          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH BASH_ENV=/tmp/xtrace_init.sh timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2> xtrace.log" </dev/null >/dev/null 2>&1 &
           suite_pid=$!
           last_sig=""
           stall=0
@@ -282,6 +300,8 @@ jobs:
                 ps -U runner -o pid,ppid,stat,wchan,command 2>/dev/null | head -n 25 | sed 's/^/    /'
                 echo "    --- su/wrapper ---"
                 ps -axww -o pid,ppid,stat,wchan,command 2>/dev/null | grep -E 'run_all_tests|[t]imeout -k' | sed 's/^/    /'
+                echo "    --- last 15 xtrace lines (command bash is blocked on) ---"
+                tail -n 15 vsearch-tests/xtrace.log 2>/dev/null | sed 's/^/    /'
                 echo "[$(date -u +%H:%M:%S)] suite stalled — abandoning the wedged suite and finishing so the summary and test.log are captured."
                 hung=1
                 break
@@ -304,6 +324,8 @@ jobs:
           grep -E 'FAIL' vsearch-tests/test.log || echo "(none)"
           echo "===== last 80 lines of test.log ====="
           tail -n 80 vsearch-tests/test.log
+          echo "===== last 50 lines of xtrace.log (last shell command before hang) ====="
+          tail -n 50 vsearch-tests/xtrace.log 2>/dev/null || echo "(no xtrace.log)"
           # Record the status and exit 0 so vmactions runs its copyback: it
           # SKIPS copyback when the run script exits non-zero, which is why the
           # test.log artifact kept coming up empty. The host-side "Report" step
@@ -320,7 +342,9 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: freebsd-test-log
-        path: vsearch-tests/test.log
+        path: |
+          vsearch-tests/test.log
+          vsearch-tests/xtrace.log
         if-no-files-found: warn
 
     # The VM script exits 0 so vmactions copies test.log / test.status back to
