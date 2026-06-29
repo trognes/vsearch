@@ -1,10 +1,10 @@
 name: Sanitizers (ASan/UBSan)
 
 on:
-  push:
-    branches: [ "master", "dev" ]
-  pull_request:
-    branches: [ "master", "dev" ]
+  # Non-gating ASan/UBSan inventory: a full instrumented build + test suite is
+  # slow, so run it weekly (Mon 04:09 UTC) and on demand rather than per push/PR.
+  schedule:
+    - cron: "9 4 * * 1"
   workflow_dispatch:
 
 concurrency:

@@ -1,10 +1,26 @@
 name: Build and test
 
 on:
+  # Skip documentation-only changes (paths-ignore). All jobs run on push and
+  # pull_request EXCEPT macos-x86_64, which runs only on the weekly schedule /
+  # manual dispatch (see its job-level if:) to save the 10x-billed macOS minutes.
   push:
     branches: [ "master", "dev" ]
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
     branches: [ "master", "dev" ]
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+  schedule:
+    - cron: "19 4 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,6 +30,7 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
 
     steps:
     - name: Checkout
@@ -43,6 +60,7 @@ jobs:
   cross-build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
 
     strategy:
       fail-fast: false
@@ -76,6 +94,7 @@ jobs:
   macos-arm64:
     runs-on: macos-latest
     timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
 
     steps:
     - name: Checkout
@@ -117,6 +136,10 @@ jobs:
   macos-x86_64:
     runs-on: macos-15-intel
     timeout-minutes: 20
+    # macOS is billed at 10x, and macos-arm64 already covers the macOS
+    # toolchain per push/PR while linux-x86_64 covers the x86 SIMD path. So run
+    # the x86_64 macOS build only on the weekly schedule and on manual dispatch.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
 
     steps:
     - name: Checkout
@@ -158,6 +181,7 @@ jobs:
   freebsd-x86_64:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
     # The FreeBSD VM (vmactions / nested QEMU) intermittently hangs during the
     # test run — roughly half the time the suite stalls after "Running tests..."
     # and the job is cancelled at the 20-minute limit. Until that is understood
