@@ -241,26 +241,26 @@ jobs:
           # failures. root bypasses POSIX permission checks, so the "file
           # not readable/writable" tests need an unprivileged user.
           #
-          # Diagnostics for the intermittent FreeBSD hang: the suite runs in
-          # the background under its own timeout (so a hung test cannot eat the
-          # whole 20-minute job budget and skip the summary below). A watcher
-          # polls the log once a second but prints only when the last non-blank
-          # line changes — near-real-time progress without flooding the vmactions
-          # SSH channel (high output volume wedges the guest, which is why the
-          # suite output is redirected to a file in the first place). On the
-          # first ~30 s with no new output the watcher dumps the test process
-          # tree with each process's state and wait channel (wchan) — showing
-          # what the suite is blocked on (a pipe read, a child wait, disk I/O,
-          # ...) and the exact command. On FreeBSD that stall is a known teardown
-          # artifact: <() is a real named FIFO, so a negative test that fed vsearch
-          # input via <() leaves the writer blocked in fifoow once vsearch rejects
-          # the options without opening it. The watcher reaps ONLY those fifoow
-          # writers (targeted kill by pid — a broad pkill tore down the vmactions
-          # SSH session, ssh exited 143, skipping copyback), which lets the suite
-          # process exit; pass/fail is then taken from FAIL lines in test.log. The
-          # background suite is detached from the SSH stdio (</dev/null >/dev/null
-          # 2>&1) so the session closes promptly even if a process must be
-          # abandoned. The per-suite timeout remains a backstop.
+          # The suite runs in the background under its own timeout (so a hung
+          # test cannot eat the whole 20-minute job budget and skip the summary
+          # below). A watcher polls the log once a second but prints only when
+          # the last non-blank line changes — near-real-time progress without
+          # flooding the vmactions SSH channel (high output volume wedges the
+          # guest, which is why the suite output is redirected to a file in the
+          # first place). After ~30 s with no new output it dumps the test
+          # process tree with each process's state and wait channel (wchan).
+          #
+          # On FreeBSD the suite reaches its end but teardown stalls: <() is a
+          # real named FIFO there, so a negative test that fed vsearch an input
+          # via <() leaves the FIFO writer blocked in fifoow once vsearch
+          # rejects the options *before opening* the input (no reader ever
+          # appears). On Linux <() is a /dev/fd pipe, so this never happens. The
+          # watcher reaps ONLY those fifoow-blocked writers — a targeted kill by
+          # pid, never a broad `pkill -U runner`, which also kills the vmactions
+          # SSH shell (ssh exits 143) and skips copyback — which lets the suite
+          # process exit. Pass/fail is then decided purely by FAIL lines in
+          # test.log; the teardown stall is not a failure. A stall with no
+          # fifoow writers is treated as a genuine hang and fails.
           echo "========== Running tests... =========="
           suite_timeout=720
           rm -f vsearch-tests/test.log
@@ -281,24 +281,16 @@ jobs:
               if [ "$stall" -ge 30 ]; then
                 echo "[$(date -u +%H:%M:%S)] no new test output for ${stall}s; test process tree (pid ppid stat wchan command):"
                 ps -U runner -o pid,ppid,stat,wchan,command 2>/dev/null | head -n 30 | sed 's/^/    /'
-                # The known FreeBSD stall is a <()-on-BSD teardown artifact, not a
-                # test failure: every test has run, but bash's teardown waits on
-                # orphaned process-substitution *writers* still blocked in fifoow.
-                # (A negative test fed vsearch an input via <(); vsearch rejected
-                # the options before opening it, so the writer never got a reader.
-                # On Linux <() is a /dev/fd pipe and this does not happen.) Reap
-                # ONLY those fifoow-blocked writers — a targeted kill by pid, never
-                # a broad `pkill -U runner`, which also killed the vmactions SSH
-                # shell (ssh exited 143) and skipped copyback. Killing the writers
-                # lets the suite process unwind and exit; pass/fail is then decided
-                # purely by FAIL lines in test.log below.
+                # Reap ONLY the fifoow-blocked <() writers (see the note above):
+                # a targeted kill by pid, never a broad pkill. This lets the
+                # suite process unwind and exit; pass/fail comes from FAIL lines.
                 fifoow_pids=$(ps -U runner -o pid,wchan 2>/dev/null | awk '$2 == "fifoow" { print $1 }')
                 if [ -n "$fifoow_pids" ]; then
                   echo "[$(date -u +%H:%M:%S)] reaping orphaned fifoow <() writers: $(echo $fifoow_pids | tr '\n' ' ')"
                   echo "$fifoow_pids" | xargs kill 2>/dev/null
                   reaped=1
                 else
-                  # Stalled but nothing is blocked in fifoow: this is not the known
+                  # Stalled but nothing is blocked in fifoow: not the known
                   # teardown artifact, so treat it as a genuine hang and fail.
                   echo "[$(date -u +%H:%M:%S)] stall with no fifoow writers — treating as a genuine hang."
                   genuine_hang=1
@@ -308,9 +300,9 @@ jobs:
             fi
             sleep 1
           done
-          # Give the (reaped) suite a moment to unwind, but never block forever on
-          # it: if it is still alive after the grace period, abandon it to the VM
-          # teardown — the background job is detached from the SSH stdio so the
+          # Give the (reaped) suite a moment to unwind, but never block forever
+          # on it: if it is still alive after the grace period, abandon it to the
+          # VM teardown — the background job is detached from the SSH stdio so the
           # session still closes cleanly and vmactions runs copyback.
           for _ in $(seq 1 20); do kill -0 "$suite_pid" 2>/dev/null || break; sleep 1; done
           if kill -0 "$suite_pid" 2>/dev/null; then
@@ -343,8 +335,7 @@ jobs:
 
     # vmactions copies the workspace back to the host, so the full in-VM test
     # log (all ~7,700 result lines, not just the tail above) is available here.
-    # Upload it for offline inspection of which test hung. Runs even when the
-    # suite times out or fails.
+    # Upload it for offline inspection. Runs even when the suite fails.
     - name: Upload FreeBSD test log
       if: always()
       uses: actions/upload-artifact@v7
@@ -355,9 +346,7 @@ jobs:
 
     # The VM script exits 0 so vmactions copies test.log / test.status back to
     # the host; the real suite status is recorded in test.status. Re-assert it
-    # here so the job's pass/fail reflects the actual result. The job is
-    # continue-on-error, so this stays non-gating but goes visibly red on a real
-    # failure or hang. Missing test.status (copyback failed) defaults to failure.
+    # here so the job's pass/fail reflects the actual result.
     - name: Report FreeBSD test result
       if: always()
       run: |
