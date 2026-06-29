@@ -12,6 +12,18 @@ Issues are split into two groups:
 
 Line numbers are approximate and refer to the tree at commit `6157fc3`.
 
+> **Note (post-weekend upstream refactor).** A large batch of upstream changes
+> has since landed: the CLI/option parser was extracted from `vsearch.cc` into
+> **`cli.cc`**, CPU detection into **`utils/cpu_features`**, a new
+> `--fastx_syncpairs` command was added, a repo-wide `std::`-qualification sweep
+> ran, and **`-Wconversion`/`-Wsign-conversion` were enabled in `--enable-debug`
+> builds** (with the warnings fixed). This shifted essentially every line number
+> below and relocated the CLI code, so treat `vsearch.cc` line refs as
+> pre-refactor and CLI-table refs as now living in `cli.cc`. The items materially
+> affected are annotated inline (E2, E3, P1); the `-Wconversion` fixes were mostly
+> warning-silencing casts, so they do **not** by themselves close the S5-class
+> truncation (see P1).
+
 Effort / Impact / Criticality are rated **Low / Medium / High**:
 - **Effort** — estimated work to implement.
 - **Impact** — value gained (maintainability, correctness, performance, safety).
@@ -35,10 +47,16 @@ tier (one PR per tier). Status legend: **audited** = read in full against the
 | **5 — CLI/dispatch & infra** | `vsearch.cc`, `util`, `arch`, `cpu`, `attributes`, `dynlibs`, `bitmap`, `minheap`, `city`, `md5`, `sha1` | **audited** (this pass → S26, N3, C1(d)/(e); folded into S7/S8/A1/I1/P1/E1/E2/E9; F-C1 ruled safe) |
 | **6 — headers & `utils/`** | all `*.h`, `src/utils/*.hpp` | **audited** (this pass → corrected A1's round_up cite; U5→I1, U4/U7→P1, cigar/span asserts→A1, H1→E1; output structs verified bounded) |
 
-**The file-by-file sweep is complete — all six tiers audited.** What remains is
-not unreviewed code but a few analysis *methods* a source read cannot substitute
-for (ThreadSanitizer for the data-race surface CC1, parser fuzzing, a big-endian
-build) — see **"Analysis methods not yet applied"** at the end of this document.
+**The file-by-file sweep was complete — all six tiers audited** — but a large
+post-weekend upstream refactor has since added or substantially rewritten several
+files that have **not** been re-audited in their new form: **`cli.cc`** (extracted
+from `vsearch.cc`), **`utils/cpu_features.cpp/.hpp`** (extracted CPU detection),
+**`fastx_syncpairs.cc`** (new command), and a heavily macro→function-rewritten
+**`align_simd.cc`**, plus the tree-wide `std::`/`-Wconversion` sweep. Re-sweeping
+those deltas is pending. Beyond that, what remains is not unreviewed code but a few
+analysis *methods* a source read cannot substitute for (ThreadSanitizer for the
+data-race surface CC1, parser fuzzing, a big-endian build) — see **"Analysis
+methods not yet applied"** at the end of this document.
 
 ---
 
@@ -865,8 +883,18 @@ out to be **already handled** so no effort is spent re-checking them.
 
 #### Active issues
 
-**(a) Integer width-narrowing is wholesale, not isolated.** A `-Wconversion
--Wsign-conversion` syntax pass over three files alone reports many narrowings:
+**(a) Integer width-narrowing is wholesale, not isolated.** *Update (weekend
+refactor): the warning class is swept, the underlying truncation is not.*
+`-Wconversion -Wsign-conversion` are now **enabled in `--enable-debug` builds**
+(`src/Makefile.am`) and the warnings were fixed across the tree, so the build now
+guards against new narrowings. **But most fixes added explicit narrowing casts
+(e.g. `static_cast<int>`) that silence the warning without changing behavior** —
+so the S5-class >2 GB truncation is *not* fixed: `fasta_print_general` /
+`fastq_print_general` still take `int` length parameters and
+`fasta_print_sequence` casts `uint64_t len → int` (`fasta.cc:446`), and the
+`%ldI` LLP64 item below still stands. The original (pre-sweep) survey follows. A
+`-Wconversion -Wsign-conversion` syntax pass over three files alone reported many
+narrowings:
 
 | File | `-Wconversion`/`-Wsign-conversion` warnings |
 |------|---------------------------------------------|
@@ -879,14 +907,18 @@ fasta/fastq print interface recurs well beyond those sites — e.g. chimera outp
 casts header lengths to `int` for `%.*s` in at least eight places
 (`chimera.cc:983, 985, 990, 995, 1580, 1582, …`, `(int)db_getheaderlen(...)`).
 Most warnings are benign sign-conversions, but they are the same family that
-produced S5 and S12, and there is no width-narrowing guard in the build.
+produced S5 and S12, and there was no width-narrowing guard in the build (one was
+since added in `--enable-debug` builds — see the update above).
 
 - **Tooling:** `-Wconversion`/`-Wsign-conversion` flags the narrowing at compile
-  time (not currently enabled — the build uses `-Wall -Wextra -Wpedantic`,
-  `src/Makefile.am:3`); UBSan catches the signed-overflow subset at runtime
-  (already wired up, and it found S12).
-- **`"%ldI"` with an `int64_t` argument is non-portable on LLP64 (Tier-2).**
-  `align_simd.cc:1324` (`search16`, the `qlen == 0` path) does
+  time — **now enabled in `--enable-debug` builds** (`src/Makefile.am`; the
+  default/release build still uses `-Wall -Wextra -Wpedantic`), so the debug lane
+  now catches new narrowings (this is the realization of the "non-gating
+  `-Wconversion` lane" the sequencing recommended). UBSan catches the
+  signed-overflow subset at runtime (already wired up, and it found S12).
+- **`"%ldI"` with an `int64_t` argument is non-portable on LLP64 (Tier-2; still
+  open post-refactor, now at `align_simd.cc:1463`).**
+  `align_simd.cc:1463` (`search16`, the `qlen == 0` path) does
   `xsprintf(&cigar, "%ldI", length)` with `int64_t length`. `%ld` consumes a
   `long`; on LP64 (Linux/macOS) `long == int64_t` and it is fine, but on LLP64
   (64-bit Windows / MinGW) `long` is 32-bit → format/argument width mismatch
@@ -2108,6 +2140,15 @@ bug source. Breadcrumbs in the struct confirm the in-progress state
 
 ### E2. Parallel option-metadata tables (five places to edit per option)
 
+**Status (post-weekend refactor): unchanged — relocated, not deduplicated.** The
+parser was extracted into `cli.cc` (`a98b085`), so four of the five tables now
+live there: the `option_*` enum (`cli.cc:409`), `long_options[]` (`:666`), the
+`switch (options_index)` (`:939`), and the `command_options[]`/`valid_options[][]`
+matrices (`:2135`, `:2197`); `cmd_help` stayed in `vsearch.cc:751`. There are now
+**254** options / **51** commands, and adding one still edits all five in
+lockstep — now across *two* files. The latent matrix-scan OOB noted below is now
+in `cli.cc` (`~:4129`). Pre-refactor line refs follow.
+
 Each of ~248 CLI options is declared in five separate, manually-synchronized
 places inside `args_init`: the `option_*` enum (~line 1125), the
 `long_options[]` getopt table (~1376), the `switch (options_index)` handler
@@ -2117,7 +2158,8 @@ option means editing all five in lockstep with nothing enforcing consistency
 (enum order must match the array; `valid_options` is a hand-maintained ~50×100
 integer matrix). This is the main source of the file's bulk.
 
-- **Location:** `src/vsearch.cc`, `args_init` / `cmd_help`
+- **Location:** `src/cli.cc` (`args_init` + the four tables) and `src/vsearch.cc`
+  (`cmd_help`)
 - **Effort:** High · **Impact:** High · **Criticality:** Medium
 - **Direction:** single declarative option table (name, arg type, target field,
   owning commands, help string) consumed by parser, validator, and help printer.
@@ -2141,6 +2183,14 @@ integer matrix). This is the main source of the file's bulk.
   the loop with `j < max_number_of_options_per_command`.
 
 ### E3. `vsearch.cc` monolith dominated by one ~4,000-line function
+
+**Status (post-weekend refactor): partially addressed (`a98b085`, `ce82a59`).** The
+CLI was extracted from `vsearch.cc` into `cli.cc` (~4,500 lines; `args_init` is
+almost all of it) and CPU detection into `utils/cpu_features`. `vsearch.cc` is now
+~1,900 lines (`main`, `cmd_help`, command dispatch, globals). But `cli.cc` is
+itself now a ~4,500-line monolith dominated by `args_init`, so the split
+*relocated* the monolith rather than decomposing it; the substantive win — dedup
+the option tables (E2) — is still open. Original analysis below.
 
 `src/vsearch.cc` is ~6,340 lines; `args_init` alone runs ~1106–5187 (~4,000
 lines), and `cmd_help` adds ~490 more. The file also mixes CPU detection,
@@ -2539,7 +2589,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | B1 | `--log` qmin message → `stderr` not `fp_log` (3 sites `310e7de`+`6dbba98`; `rereplicate.cc` sibling `273c40d`) | Bug | Low | Low–Med | Medium | Fixed |
 | B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`, `bb45598`) | Bug | Low | Low | Low | Fixed |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med | Pending |
-| P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med | Latent |
+| P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med | Partially fixed (`-Wconversion` enabled + swept; S5/`%ldI`/endianness remain) |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium | Pending |
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
 | CC1 | Threaded commands' data-race surface unaudited (no TSan coverage) | Concurrency | Medium | Med–High | Medium | Addressed (TSan lane PR #30; CC4/CC5) |
@@ -2555,7 +2605,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium | Pending |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium | Pending |
-| E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med | Pending |
+| E3 | Split `vsearch.cc` monolith | Enhancement | High | High | Low–Med | Partially fixed (`a98b085`: CLI → `cli.cc`; `cli.cc`/E2 remain) |
 | E4 | Remove module-scope global state (reentrancy) | Enhancement | High | High | Med–High | Pending |
 | E5 | Deduplicate output-file open/close boilerplate | Enhancement | Low–Med | Medium | Low | Pending |
 | E6 | Decompose oversized functions | Enhancement | Med–High | Medium | Low | Pending |
@@ -2694,9 +2744,13 @@ one direction, closing the **C1(b)** drift trap; then eliminate global state). *
 directly improves library reentrancy and is the foundation under **CC1**'s
 thread-safety. **L1(a)** rides this — a recoverable error channel instead of
 `fatal()`→`exit()` only becomes tractable once E4 removes the global state it would
-unwind. Then **E3/E6/E7** structural decomposition. For **P1**, the cheap first step
-is a non-gating `-Wconversion`/`-Wsign-conversion` CI lane to size the width-narrowing
-backlog before touching code.
+unwind. Then **E3/E6/E7** structural decomposition (**E3** is now partly done — the CLI
+moved to `cli.cc`, so the remaining decomposition is splitting `cli.cc` itself and
+finishing E2). For **P1**, the cheap first step — a `-Wconversion`/`-Wsign-conversion`
+pass to size and clear the width-narrowing backlog — is **done** (now enforced in
+`--enable-debug` builds); what remains is the *real* fixes the warning-silencing
+casts skipped: widen the print interfaces (S5) and the `%ldI` LLP64 site, plus the
+endianness items.
 
 ### Band 8 — Different methods, not more reading
 
