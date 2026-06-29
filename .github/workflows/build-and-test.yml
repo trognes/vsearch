@@ -223,20 +223,28 @@ jobs:
           # polls the log once a second but prints only when the last non-blank
           # line changes — near-real-time progress without flooding the vmactions
           # SSH channel (high output volume wedges the guest, which is why the
-          # suite output is redirected to a file in the first place). On a stall
-          # it ticks every ~30 s and dumps the test process tree with each
-          # process's state and wait channel (wchan) — that shows what the suite
-          # is blocked on (a pipe read, a child wait, disk I/O, ...) and the
-          # exact command, since the hang has been seen with no vsearch process
-          # running at all. The per-suite timeout guarantees the FAIL grep /
-          # tail / log upload still run.
+          # suite output is redirected to a file in the first place). On the
+          # first ~30 s with no new output the watcher dumps the test process
+          # tree with each process's state and wait channel (wchan) — showing
+          # what the suite is blocked on (a pipe read, a child wait, disk I/O,
+          # ...) and the exact command — then stops waiting: more silence adds
+          # nothing. It does NOT kill the wedged processes — killing the runner's
+          # processes also tore down the vmactions SSH session (ssh exited 143),
+          # ending the step abnormally and skipping copyback. Instead it abandons
+          # them to the VM teardown and lets the script finish cleanly, so the
+          # summary runs and vmactions copies test.log back for the artifact. The
+          # background suite is detached from the SSH stdio (</dev/null >/dev/null
+          # 2>&1) so the session closes promptly on exit instead of waiting on a
+          # backgrounded process that still holds the channel. The per-suite
+          # timeout remains a backstop.
           echo "========== Running tests... =========="
           suite_timeout=720
           rm -f vsearch-tests/test.log
-          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2>&1" &
+          su -m runner -c "cd vsearch-tests && PATH=$PWD/bin:\$PATH timeout -k 30 ${suite_timeout} bash ./run_all_tests.sh > test.log 2>&1" </dev/null >/dev/null 2>&1 &
           suite_pid=$!
           last_sig=""
           stall=0
+          hung=0
           while kill -0 "$suite_pid" 2>/dev/null; do
             sig=$(tail -n 20 vsearch-tests/test.log 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1)
             if [ "$sig" != "$last_sig" ]; then
@@ -250,23 +258,34 @@ jobs:
                 ps -U runner -o pid,ppid,stat,wchan,command 2>/dev/null | head -n 25 | sed 's/^/    /'
                 echo "    --- su/wrapper ---"
                 ps -axww -o pid,ppid,stat,wchan,command 2>/dev/null | grep -E 'run_all_tests|[t]imeout -k' | sed 's/^/    /'
-                stall=0
+                echo "[$(date -u +%H:%M:%S)] suite stalled — abandoning the wedged suite and finishing so the summary and test.log are captured."
+                hung=1
+                break
               fi
             fi
             sleep 1
           done
-          wait "$suite_pid"
-          status=$?
+          if [ "$hung" -eq 1 ]; then
+            status=124
+          else
+            wait "$suite_pid" 2>/dev/null
+            status=$?
+          fi
           echo "========== Tests finished (exit status $status) =========="
           if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
-            echo "!!! Test suite TIMED OUT after ${suite_timeout}s — the hang is in or just"
-            echo "!!! after the last test shown below. (status $status)"
+            echo "!!! Test suite stalled or timed out and was terminated — the hang is"
+            echo "!!! in or just after the last test shown below. (status $status)"
           fi
           echo "===== FAIL lines ====="
           grep -E 'FAIL' vsearch-tests/test.log || echo "(none)"
           echo "===== last 80 lines of test.log ====="
           tail -n 80 vsearch-tests/test.log
-          exit $status
+          # Record the status and exit 0 so vmactions runs its copyback: it
+          # SKIPS copyback when the run script exits non-zero, which is why the
+          # test.log artifact kept coming up empty. The host-side "Report" step
+          # below reads test.status and turns it back into the job's pass/fail.
+          echo "$status" > vsearch-tests/test.status
+          exit 0
 
     # vmactions copies the workspace back to the host, so the full in-VM test
     # log (all ~7,700 result lines, not just the tail above) is available here.
@@ -274,8 +293,20 @@ jobs:
     # suite times out or fails.
     - name: Upload FreeBSD test log
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: freebsd-test-log
         path: vsearch-tests/test.log
         if-no-files-found: warn
+
+    # The VM script exits 0 so vmactions copies test.log / test.status back to
+    # the host; the real suite status is recorded in test.status. Re-assert it
+    # here so the job's pass/fail reflects the actual result. The job is
+    # continue-on-error, so this stays non-gating but goes visibly red on a real
+    # failure or hang. Missing test.status (copyback failed) defaults to failure.
+    - name: Report FreeBSD test result
+      if: always()
+      run: |
+        status=$(cat vsearch-tests/test.status 2>/dev/null || echo 1)
+        echo "FreeBSD test suite exit status: ${status}"
+        exit "${status}"
