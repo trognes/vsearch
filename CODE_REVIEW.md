@@ -2812,6 +2812,36 @@ for. Each is scoped as separate, tool-driven effort, not part of this review.
    big-endian platform is actually supported, but it is the only way to validate
    the portability the build matrix advertises.
 
+4. **Run the cross-build targets, not just compile them.** `build-and-test.yml`'s
+   `cross-build` matrix (windows-x86_64 via mingw; linux aarch64/ppc64le/mips64el/
+   riscv64) only *compiles* — it never executes the binaries, so SIMDe miscompiles,
+   ABI/calling-convention breaks, and byte-order bugs in the UDB/SFF/`os_byteswap`
+   paths pass CI silently. Add execution, tiered by value vs. cost:
+   - **Native arm64 (do first).** GitHub now offers free native ARM64 Linux
+     runners for public repos (`ubuntu-24.04-arm`); a real aarch64 job can build
+     and run the **full** vsearch-tests suite, exercising the genuine **Neon** path
+     (aarch64 has a native SIMD path, not SIMDe) on real hardware — fast and
+     reliable enough to gate. Best coverage-per-minute here.
+   - **ppc64le / mips64el / riscv64 — QEMU user-mode smoke.** Install
+     `qemu-user-static` and run a small **curated set of functional commands** (not
+     the whole suite — full-suite-under-QEMU is ~10–30 min/arch) via
+     `qemu-<arch>-static bin/vsearch ...` right after each cross-build. Catches
+     gross SIMDe/runtime breakage cheaply.
+   - **Windows — Wine smoke.** `wine bin/vsearch.exe ...` (plus the mingw runtime
+     DLLs) in the existing mingw job catches link/startup breakage in place; add a
+     native `windows-latest` (msys2) job only if Windows becomes a first-class
+     target (2× billing, separate build setup).
+   - **Big-endian (s390x) — the same gap as item 3.** Every current target,
+     including ppc64**le**/mips64**el**, is little-endian, so the byte-swap paths
+     are never run; an emulated s390x functional run is the only way to exercise
+     them (see 3 — this and the s390x/musl additions are the same lane).
+   Caveats: prefer a tiny end-to-end command (e.g. a 2-sequence `--derep_fulllength`
+   or `--fastx_uniques`) over `--version`, which exercises only CPU-feature
+   detection and dispatch, not the aligner. Emulation and Windows are slow and can
+   be flaky: put those lanes on the **weekly schedule** (like sanitizers) and start
+   them **`continue-on-error`** until proven; native arm64 is the exception (cheap,
+   reliable, per-PR and safe to gate).
+
 These are **method gaps, not unreviewed code** — the source itself has been read
 in full. Treat them as the next tier of effort (separate PRs / CI lanes), to be
 scheduled when the static backlog above is being worked, not as an extension of
