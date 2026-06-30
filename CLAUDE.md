@@ -91,16 +91,22 @@ bash ./scripts/cluster_fast.sh /abs/path/to/vsearch   # or pass the binary as $1
   output against ground-truth files in `api_examples/data/`).
 
 CI workflows (`.github/workflows/`): `build-and-test` (default gate),
-`sanitizers` (ASan/UBSan, non-gating inventory), `threadsanitizer` (TSan,
-non-gating inventory; mutually exclusive with ASan, so a separate lane),
+`sanitizers` (ASan/UBSan, non-gating inventory, weekly + dispatch),
+`threadsanitizer` (TSan, non-gating inventory, weekly + dispatch; mutually
+exclusive with ASan, so a separate lane),
 `valgrind` (Memcheck, gating), `static-analysis` (cppcheck, per-PR non-gating
 inventory) and `static-analysis-clang-tidy` (clang-tidy, weekly; scoped to
 bug-finding checks via the repo `.clang-tidy` — split into its own file because
 its `clang-analyzer-*` checks are slow), `codeql` (C/C++ `security-extended`),
 `build-all` (cross-platform matrix, manual dispatch), plus `jekyll-gh-pages` and
 `prune-pages-deployments` (docs-site build and weekly deployment housekeeping).
-Note: the `build-and-test` FreeBSD lane is `continue-on-error` (non-gating) while
-the intermittent vmactions hang is sorted out.
+Note: the `build-and-test` FreeBSD lane is `continue-on-error` (non-gating). The
+FreeBSD-only test-suite hang — orphaned `<()` FIFO writers left blocked in
+`fifoow` when a negative test's vsearch rejects its options before opening the
+`<()` input (on Linux `<()` is a `/dev/fd` pipe, so it does not occur) — is
+handled in-lane: the watcher reaps those writers and pass/fail is taken from
+FAIL lines in the log. Non-gating now only guards residual vmactions/QEMU infra
+flakiness.
 
 ## Architecture
 
