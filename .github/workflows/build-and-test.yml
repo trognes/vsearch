@@ -57,6 +57,40 @@ jobs:
         bash ./run_all_tests.sh
 
 
+  # Native ARM64 Linux runner (free for public repos). Unlike the cross-build
+  # matrix, which only compiles, this builds AND runs the full test suite on real
+  # aarch64 hardware, exercising the native Neon SIMD path (not the SIMDe
+  # fallback). Reliable enough to run per push/PR and gate.
+  linux-aarch64-native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ghostscript groff libbz2-dev zlib1g-dev
+
+    - name: Configure and build
+      run: |
+        ./autogen.sh
+        ./configure CFLAGS="-O2" CXXFLAGS="-O2"
+        make clean
+        make ARFLAGS="cr" -j$(nproc)
+        bin/vsearch -v
+
+    - name: Run tests
+      run: |
+        export PATH=$PWD/bin:$PATH
+        git clone --depth 1 --branch ${{ github.event_name == 'pull_request' && github.base_ref || github.ref_name }} https://github.com/frederic-mahe/vsearch-tests
+        cd vsearch-tests
+        bash ./run_all_tests.sh
+
+
   cross-build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -89,6 +123,55 @@ jobs:
         ./configure CFLAGS="-O2" CXXFLAGS="-O2" --host=${{ matrix.target.host }}
         make clean
         make ARFLAGS="cr" -j$(nproc)
+
+
+  # Prototype: actually RUN a cross-compiled target under QEMU user-mode
+  # emulation, to catch the runtime bugs a build-only matrix misses (SIMDe
+  # miscompiles, ABI/calling-convention breaks, byte-order bugs). ppc64le is the
+  # template for the other emulated targets (mips64el, riscv64, and a big-endian
+  # s390x — see CODE_REVIEW.md "Analysis methods not yet applied", item 4).
+  # Non-gating while it proves out; emulation is slow, so this is a candidate to
+  # move to the weekly schedule later.
+  qemu-smoke-ppc64le:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
+    continue-on-error: true
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Install cross toolchain and QEMU
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ghostscript groff libbz2-dev zlib1g-dev \
+          g++-powerpc64le-linux-gnu libsimde-dev qemu-user-static
+
+    - name: Cross-build for ppc64le
+      run: |
+        ./autogen.sh
+        ./configure CFLAGS="-O2" CXXFLAGS="-O2" --host=powerpc64le-linux-gnu
+        make clean
+        make ARFLAGS="cr" -j$(nproc)
+
+    - name: Smoke-run under QEMU (qemu-ppc64le-static)
+      run: |
+        # qemu-user needs the target's shared libraries (ld.so, libc, libstdc++
+        # from the cross toolchain); QEMU_LD_PREFIX points it at them.
+        export QEMU_LD_PREFIX=/usr/powerpc64le-linux-gnu
+        echo "===== version / CPU-feature dispatch ====="
+        qemu-ppc64le-static bin/vsearch --version
+        echo "===== functional smoke: dereplicate ====="
+        # 3 sequences (32 bp, >= default minseqlength), two identical -> expect 2
+        # unique. Exercises hashing, dedup and FASTA I/O under emulation, not just
+        # process startup (which is all --version proves).
+        printf '>a\nACGTACGTACGTACGTACGTACGTACGTACGT\n>b\nACGTACGTACGTACGTACGTACGTACGTACGT\n>c\nTTTTGGGGTTTTGGGGTTTTGGGGTTTTGGGG\n' > smoke.fasta
+        qemu-ppc64le-static bin/vsearch --derep_fulllength smoke.fasta --output smoke.out --quiet
+        got=$(grep -c '^>' smoke.out || true)
+        echo "unique sequences: ${got} (expected 2)"
+        test "${got}" -eq 2
+        echo "ppc64le QEMU smoke test passed."
 
 
   macos-arm64:
