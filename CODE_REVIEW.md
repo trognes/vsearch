@@ -2560,8 +2560,8 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S1 | UDB `kmerindex` seqno → OOB heap write (`bitmap_set`) | Security | Low | High | High | Pending |
 | S2 | SFF clip-offset underflow → OOB read (`--sff_clip`) | Security | Low | Med–High | Med–High | Pending |
 | S3 | UDB header-length underflow → ~4 GB `headerlen` | Security | Low | Medium | Medium | Pending |
-| S4 | `--subseq_start` unbounded → OOB read | Bug | Low | Medium | Medium | Pending |
-| S10 | Hit-list alloc vs. index-bound mismatch (cluster/search) | Bug | Low | High | Medium | Pending |
+| S4 | `--subseq_start` unbounded → OOB read | Bug | Low | Medium | Medium | Fixed (`1592fcb`) |
+| S10 | Hit-list alloc vs. index-bound mismatch (cluster/search) | Bug | Low | High | Medium | Fixed (`60cfb40`) |
 | S5 | 64-bit length → `int` truncation in print path | Security | Medium | Medium | Low | Latent |
 | S6 | UDB additive allocation size unchecked | Security | Low | Medium | Low | Needs-confirm |
 | S7 | `xmalloc`/`xrealloc` no overflow check; `count*size` callers | Security | Low | Medium | Low | Needs-confirm |
@@ -2576,7 +2576,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium | Pending |
 | S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium | Pending |
 | S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium | Needs-confirm |
-| S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Bug | Low | Low–Med | Medium | Pending |
+| S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Bug | Low | Low–Med | Medium | Fixed (`cb12ba7`) |
 | S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Latent |
 | S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Pending |
 | S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Bug | Low | High | High | Fixed (`94ed5fe`) |
@@ -2669,15 +2669,20 @@ Reachable with normal data or a sensible option choice — no crafted file:
   the per-position quality-row over-write when **`--fastq_qmin ≥ 2`** (an ordinary
   option). `ee_start` now computes in 64-bit; the quality rows are sized by `qmax`.
   Both verified under ASan.
-- **S10** — the hit-list buffer overflows when `--maxaccepts + --maxrejects` exceeds
-  a small `seqcount` — a **legitimate option combination on small datasets**, not an
-  attack. Size the buffer by the same bound used for indexing; confirm with the
-  small-seqcount / large-`maxaccepts` ASan repro.
-- **S4** — `--subseq_start` past a sequence's length (trivially hit on a
-  **mixed-length file**) reads out of bounds. Clamp/skip; fix the quality pointer
-  twin too.
-- **S20** — `random_subsampling` reads one element past `seqindex` on `--sizein`.
-  ASan-detectable; Low effort.
+- **S10** — *FIXED* (`60cfb40`). The hit-list buffer overflowed when
+  `--maxaccepts + --maxrejects` exceeded a small `seqcount` — a **legitimate
+  option combination on small datasets**, not an attack. `evaluate_extra_hits`
+  now clamps its insertion bound to the `tophits`-sized buffer capacity, so
+  hit_count can never exceed the allocation.
+- **S4** — *FIXED* (`1592fcb`). `--subseq_start` past a sequence's length
+  (trivially hit on a **mixed-length file**) read out of bounds. The guard now
+  precedes the offset of **both** the sequence and quality pointers and emits an
+  empty subsequence when `start > end`.
+- **S20** — *FIXED* (`cb12ba7`). `random_subsampling` read one element past
+  `seqindex` on `--sizein` (the next amplicon's mass is now fetched only while
+  one remains). Note: not ASan-flagged in practice — `seqindex` is over-allocated
+  by one (`db.cc`, `(sequences + 1)`), so the over-read lands inside the
+  allocation; the fix is a correctness improvement regardless.
 - **S12** — *FIXED* (`3946769`). DUST `int` left-shift UB (UBSan-confirmed, fired on
   the **first masking command** of normal data); the accumulator is now `unsigned`
   (`mask.cc:97`), making the shift well-defined.
