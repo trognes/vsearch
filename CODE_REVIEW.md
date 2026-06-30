@@ -854,8 +854,10 @@ compile-time warning.
   than per write. Overlaps with **E5** (the open/close boilerplate is already a
   dedup target — the checked-close logic should land in that shared helper).
 - **Effort:** Medium · **Impact:** Medium–High · **Criticality:** Low–Medium
-- **Status:** *verified (call-site counts and absence of checks); failure-mode
-  is by construction, not yet reproduced with a forced ENOSPC/`SIGPIPE` run*
+- **Status:** *FIXED (`e9405c6`)* — checked close on all output streams plus a
+  final `fflush(stdout)`/`ferror` guard; verified against `/dev/full` (ENOSPC)
+  on both the `fopen_output` and RAII paths, and the full vsearch-tests suite
+  passes with no regressions.
 - **Tier-4 sites:** `otutable.cc` (~40 `fprintf` + the `strftime` at `:408`),
   `eestats.cc` (the whole table dump), `msa.cc`, `showalign.cc`, `fastq_join.cc`,
   `fastqops.cc` — all unchecked. The `fastq_eestats`/`fastq_eestats2` commands
@@ -2588,7 +2590,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low | Latent |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (3 sites `310e7de`+`6dbba98`; `rereplicate.cc` sibling `273c40d`) | Bug | Low | Low–Med | Medium | Fixed |
 | B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`, `bb45598`) | Bug | Low | Low | Low | Fixed |
-| I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med | Pending |
+| I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med | Fixed (`e9405c6`) |
 | P1 | Width narrowing (wholesale) + little-endian-only SFF/UDB | Portability/UB | Med–High | Medium | Low–Med | Partially fixed (`-Wconversion` enabled + swept; S5/`%ldI`/endianness remain) |
 | L1 | Library-API lifecycle leaks (fatal=exit, session-lock deadlock, re-init leak) | Resource/lifecycle | High | High | Medium | Pending |
 | L2 | Index-side re-init lacks free-then-null (`dbindex`/`dbhash`/`userfields`) → double-free / leak | Resource/lifecycle | Low | Medium | Low–Med | Pending |
@@ -2692,10 +2694,13 @@ Reachable with normal data or a sensible option choice — no crafted file:
 Real files get truncated by failed downloads or full disks; real pipelines lose
 disks mid-run. Not adversarial, but they corrupt science silently:
 
-- **I1** — every textual output goes through unchecked `fprintf`/`fclose`, so a full
-  disk / quota / broken pipe (`vsearch … | head`) yields a **truncated output that
-  still exits 0**. Add a checked-close helper (fold into the **E5** dedup so it lands
-  once, at `utils/open_file.hpp`).
+- **I1** — *FIXED* (`e9405c6`). Every textual output went through unchecked
+  `fprintf`/`fclose`, so a full disk / quota yielded a **truncated output that
+  still exited 0**. A checked close (`fclose_output()` + an `OutputFileHandle`
+  whose deleter checks, + an `fflush(stdout)`/`ferror` guard at exit) now fatals
+  on any deferred write error. A broken pipe is still delivered as SIGPIPE
+  (non-zero exit). The **E5** open/close-boilerplate dedup is left as a separate
+  item.
 - **S2** + **S15** + **A1** — the SFF reader against a **truncated/corrupt** SFF
   (incomplete download): clip-offset underflow (S2), wrong flowgram-skip threshold
   (S15), and the four overflow `assert()`s that vanish under the default `-DNDEBUG`
