@@ -298,6 +298,57 @@ itself is correct; only the print interface narrows.
   (`otutable.cc:181–262`) narrows `regoff_t`/`size_t` match lengths to `int`
   before `vector.resize(len+1)` — a >2 GB header yields a negative/overflowed
   resize. Both gated on >2 GB; carry as `size_t`/`int64_t`.
+- **Scoping pass (verified 2026-06, current line numbers).** A four-agent
+  re-audit confirmed every site below is still narrowing (none incidentally
+  fixed). Reachability for all of S5: a single sequence/header > `INT_MAX`
+  (~2 GB) — not default-reachable (needs `--maxseqlength` raised well above its
+  default *and* a genuine 2 GB+ record, e.g. large assemblies / deeply pooled
+  data); the library-entry case needs a >2 GB header via the C API. The sites
+  split into three risk tiers:
+  - **Tier 1 — heap-write (corruption), the only sites that corrupt memory.**
+    A narrowed `int` both *sizes a buffer* and *drives a copy/walk*:
+    - `getseq.cc` `test_label_match`: `field_buffer_size` computed in `int`
+      (`getseq.cc:186–196`) → `resize()` then `strcpy`/`std::copy`
+      (`:234, :282`).
+    - `results.cc` `results_show_alnout` with `--rowlen 0`:
+      `int rowlen = (int)(qseqlen + dseqlen)` (`results.cc:730`) sizes the
+      `showalign` line buffers while `putop` walks the full `int64_t` width
+      (`showalign.cc`); also the `int alignwidth` parameter.
+    - `otutable.cc` `otutable_add`: regex/`size_t` lengths → `int`
+      (`otutable.cc:192,199,206,221,232,239,246`) → `resize()` + `std::copy`
+      (`:214, :250`).
+    - `search.cc` `search_session_single` (`:1065`) / `search_batch_worker_fn`
+      (`:1221`) — **library API only**: `int head_len = (int)strlen(...)` goes
+      negative, the `populate_si()` realloc decision is skipped, and the
+      following `strcpy` overflows `query_head`.
+  - **Tier 2 — read-only (wrong/garbled output, no corruption).** Lengths flow
+    only into `%.*s`/`%d`. The print interface and its callers must change
+    together: `fasta.cc` `fasta_print_sequence` (`:446` cast),
+    `fasta_print_general` (`:479`), `fprint_seq_label` (`:472`); `fastq.cc`
+    `fastq_print_general` (`:695`), `fprint_seq_label` (`:688`), `fastq_print`
+    (`:803–804`); `attributes.cc` `header_get_size` (`:188`),
+    `header_fprint_strip` (`:233`); `util.h` `fprint_seq_digest_sha1`/`_md5`
+    (`:176–177`); callers `fasta2fastq.cc:110,112,114` and
+    `fastqops.cc:175,177,189,191,296,299`.
+  - **Tier 3 — storage (N1(c)), latent and currently unreachable: DOCUMENTED
+    AND SKIPPED.** `seqinfo_s.headerlen`/`seqlen` are `unsigned int`
+    (`db.h:72–73`), assigned with narrowing casts at `db.cc:207–208`; accessors
+    already return `uint64_t`. Because `--maxseqlength` is capped at exactly
+    `UINT32_MAX` (`cli.cc`), no accepted record can overflow these fields, so
+    the storage path is **not reachable today**. Widening both to `uint64_t`
+    would grow `seqinfo_s` from 40 → 48 bytes (**+8 bytes per sequence** in
+    `seqindex`; alignment padding makes widening just one cost the same as both)
+    for **no current benefit** — e.g. +760 MB on a 100 M-sequence DB. Decision:
+    **do not widen**; the `--maxseqlength ≤ UINT32_MAX` cap is the documented
+    guard, recorded in a comment at `db.h:72–73`. If that cap is ever raised
+    above `UINT32_MAX`, widen both fields then (and drop the `db_add()` casts).
+  - **Suggested commit decomposition** (one fix = one atomic, cherry-pickable
+    commit): Tier 1 as four small per-file commits (getseq; results+showalign;
+    otutable; search-lib); Tier 2 as one cohesive commit (interfaces + callers,
+    `int` → `int64_t`/`size_t`); Tier 3 = the `db.h` comment only (done).
+    **Testing caveat:** the bug only manifests at >2 GB single records, which is
+    impractical to exercise in CI — verification is code review + clean build +
+    the normal-size regression suite proving no behaviour change.
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
@@ -2713,6 +2764,11 @@ disks mid-run. Not adversarial, but they corrupt science silently:
 - **S5** / **N1(c)** — 64-bit sequence/header length → `int` truncation (>2 GB single
   record) and abundance/length truncation at `>UINT_MAX` — reachable on **genuinely
   large real datasets** (large assemblies, deeply pooled `;size=`), not crafted.
+  The N1(c) **abundance** half (a/b) is *FIXED* (`4dbf556`). The S5 length sweep
+  is *scoped, not yet implemented* — see the verified three-tier plan in the S5
+  entry above (Tier 1 heap-write fixes; Tier 2 read-only print path; Tier 3
+  storage *documented and skipped* — the `--maxseqlength ≤ UINT32_MAX` cap is the
+  guard, noted in a `db.h` comment).
 
 ### Band 4 — Crafted-/malicious-input hardening (deprioritized)
 
