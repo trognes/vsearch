@@ -2548,6 +2548,17 @@ len 300, ~16 GB at len 2000, ~400 GB at len 10000 — so `--fastq_eestats` OOMs 
 PacBio/Nanopore/merged-amplicon data. (`fastq_eestats2` is unaffected; it uses a
 small fixed `count_table`.)
 
+> Related, now **FIXED** (`ec0f760`, found by CodeQL
+> `cpp/integer-multiplication-cast-to-long`): `fastq_eestats2` sized and indexed
+> that `count_table` with `new_len_steps * opt_ee_cutoffs_count` and
+> `(x * opt_ee_cutoffs_count) + y` computed in `int` before widening to `size_t`.
+> A large `--length_cutoffs` range combined with many `--ee_cutoffs` values could
+> overflow the `int` product, wrapping the `resize()` to a small/huge value and
+> the indices independently → out-of-bounds writes. Both the sizing and the five
+> index sites now widen each operand to `size_t` before multiplying; behaviour is
+> unchanged for realistic inputs. (Distinct from the E12 *memory* enhancement,
+> which remains pending.)
+
 **Crash mode on OOM (verified).** The table is a raw `std::vector<uint64_t>`, not
 an `xmalloc` allocation, so it bypasses vsearch's clean
 `fatal("Unable to allocate enough memory")` path. What happens when the
