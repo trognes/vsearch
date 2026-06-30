@@ -2560,7 +2560,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | ID | Title | Type | Effort | Impact | Criticality | Status |
 |----|-------|------|--------|--------|-------------|--------|
 | S1 | UDB `kmerindex` seqno → OOB heap write (`bitmap_set`) | Security | Low | High | High | Pending |
-| S2 | SFF clip-offset underflow → OOB read (`--sff_clip`) | Security | Low | Med–High | Med–High | Pending |
+| S2 | SFF clip-offset underflow → OOB read (`--sff_clip`) | Security | Low | Med–High | Med–High | Fixed (`9d7f242`) |
 | S3 | UDB header-length underflow → ~4 GB `headerlen` | Security | Low | Medium | Medium | Pending |
 | S4 | `--subseq_start` unbounded → OOB read | Bug | Low | Medium | Medium | Fixed (`1592fcb`) |
 | S10 | Hit-list alloc vs. index-bound mismatch (cluster/search) | Bug | Low | High | Medium | Fixed (`60cfb40`) |
@@ -2573,7 +2573,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Bug | Low | Low | Low | Fixed (`3946769`) |
 | S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium | Pending |
 | S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Pending |
-| S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med | Pending |
+| S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med | Fixed (`9d7f242`) |
 | S16 | UDB `kmerindexsize` summed from unchecked file counts, no consistency check | Security | Low | Medium | Low–Med | Needs-confirm |
 | S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium | Pending |
 | S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium | Pending |
@@ -2603,7 +2603,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | N2 | SIMD alignment counters (`aligned`/`matches`/…) are `unsigned short` → wrap on long alignment paths (sum guard + `qlen==0` fix + 64-bit widening, `3b1ee82`/`677b2ee`/`be53758`/`54d18f6`) | Numerical | Low | Medium | Low–Med | Fixed |
 | N3 | RNG quality/reproducibility/reentrancy (weak `random_ulong`, 32-bit seed, global state) | Numerical | Low–Med | Low–Med | Low | Fixed (`3b762eb`/`853b87a`/`f00510b`/`976069c`/`a64929c`): in-house cross-platform RNG; legacy path removed |
 | N4 | `opt_maxqsize` default `int_max` drops queries >2.1e9; abskew/size-ratio comparison loses precision above 2⁵³ (entangled; exact 128-bit cmp + int64_max default, `4dbf556`) | Numerical | Low/Med | Medium | Low–Med | Fixed |
-| A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Pending |
+| A1 | Input validation via `assert()` compiled out under NDEBUG (SFF overflow guards) | Assert/NDEBUG | Low | Medium | Medium | Fixed (`9d7f242`) (SFF subset) |
 | C1 | Library config: `init_defaults` misses globals (incl. `opt_notmatchedfq`, confirmed); non-idempotent fixups; CLI-only validation gap | Library lifecycle | Low | Med–High | Medium | Pending |
 | E1 | Finish `opt_*` → `Parameters` migration | Enhancement | High | High | Medium | Pending |
 | E2 | Single source of truth for option metadata | Enhancement | High | High | Medium | Pending |
@@ -2701,11 +2701,15 @@ disks mid-run. Not adversarial, but they corrupt science silently:
   on any deferred write error. A broken pipe is still delivered as SIGPIPE
   (non-zero exit). The **E5** open/close-boilerplate dedup is left as a separate
   item.
-- **S2** + **S15** + **A1** — the SFF reader against a **truncated/corrupt** SFF
-  (incomplete download): clip-offset underflow (S2), wrong flowgram-skip threshold
-  (S15), and the four overflow `assert()`s that vanish under the default `-DNDEBUG`
-  (A1) → convert to `fatal()`. One SFF pass; also fold the SFF char-signedness fixes
-  (P1 checked-safe (i)/(ii)) here.
+- **S2** + **S15** + **A1** — *FIXED* (`9d7f242`). SFF reader hardened against a
+  **truncated/corrupt** SFF: the clip-offset underflow now rejects an inverted
+  clip region (S2); the flowgram skip routes through `skip_sff_section` so a
+  partial flowgram is caught instead of desyncing later offsets (S15); the four
+  file-derived overflow `assert()`s (which vanish under the default `-DNDEBUG`)
+  are now `fatal()` (A1); and the SFF char-signedness sites (P1 (i)/(ii)) —
+  `tolower`/`toupper` on a `char` and the signed-`char` quality clamp — are fixed.
+  Crafted inverted-clip and truncated-flowgram files now fail with a clear error;
+  valid SFFs convert unchanged.
 - **S5** / **N1(c)** — 64-bit sequence/header length → `int` truncation (>2 GB single
   record) and abundance/length truncation at `>UINT_MAX` — reachable on **genuinely
   large real datasets** (large assemblies, deeply pooled `;size=`), not crafted.
