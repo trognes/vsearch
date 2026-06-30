@@ -57,6 +57,40 @@ jobs:
         bash ./run_all_tests.sh
 
 
+  # Native ARM64 Linux runner (free for public repos). Unlike the cross-build
+  # matrix, which only compiles, this builds AND runs the full test suite on real
+  # aarch64 hardware, exercising the native Neon SIMD path (not the SIMDe
+  # fallback). Reliable enough to run per push/PR and gate.
+  linux-aarch64-native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ghostscript groff libbz2-dev zlib1g-dev
+
+    - name: Configure and build
+      run: |
+        ./autogen.sh
+        ./configure CFLAGS="-O2" CXXFLAGS="-O2"
+        make clean
+        make ARFLAGS="cr" -j$(nproc)
+        bin/vsearch -v
+
+    - name: Run tests
+      run: |
+        export PATH=$PWD/bin:$PATH
+        git clone --depth 1 --branch ${{ github.event_name == 'pull_request' && github.base_ref || github.ref_name }} https://github.com/frederic-mahe/vsearch-tests
+        cd vsearch-tests
+        bash ./run_all_tests.sh
+
+
   cross-build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -89,6 +123,158 @@ jobs:
         ./configure CFLAGS="-O2" CXXFLAGS="-O2" --host=${{ matrix.target.host }}
         make clean
         make ARFLAGS="cr" -j$(nproc)
+
+
+  # Actually RUN the cross-compiled little-endian targets under QEMU user-mode
+  # emulation, to catch the runtime bugs a build-only matrix misses (SIMDe
+  # miscompiles, ABI/calling-convention breaks). See CODE_REVIEW.md "Analysis
+  # methods not yet applied", item 4. Non-gating while it proves out; emulation
+  # is slow, so this is a candidate to move to the weekly schedule later.
+  qemu-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
+    continue-on-error: true
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { name: ppc64le,  host: powerpc64le-linux-gnu,    pkg: g++-powerpc64le-linux-gnu,   qemu: qemu-ppc64le-static,  prefix: /usr/powerpc64le-linux-gnu }
+          - { name: mips64el, host: mips64el-linux-gnuabi64,   pkg: g++-mips64el-linux-gnuabi64, qemu: qemu-mips64el-static, prefix: /usr/mips64el-linux-gnuabi64 }
+          - { name: riscv64,  host: riscv64-linux-gnu,         pkg: g++-riscv64-linux-gnu,       qemu: qemu-riscv64-static,  prefix: /usr/riscv64-linux-gnu }
+
+    name: qemu-smoke (${{ matrix.target.name }})
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Install cross toolchain and QEMU
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ghostscript groff libbz2-dev zlib1g-dev \
+          ${{ matrix.target.pkg }} libsimde-dev qemu-user-static
+
+    - name: Cross-build for ${{ matrix.target.name }}
+      run: |
+        ./autogen.sh
+        ./configure CFLAGS="-O2" CXXFLAGS="-O2" --host=${{ matrix.target.host }}
+        make clean
+        make ARFLAGS="cr" -j$(nproc)
+
+    - name: Provide target zlib/bzip2 for runtime gz/bz2
+      run: |
+        # vsearch dlopens libz.so.1 / libbz2.so.1 at runtime; the target-arch
+        # builds are not packaged for cross use, so build them from source with
+        # the cross toolchain and drop them into the QEMU sysroot's lib dir (the
+        # target ld.so searches <prefix>/lib). bzip2's soname is libbz2.so.1.0,
+        # so add the libbz2.so.1 name vsearch dlopens.
+        sysroot=${{ matrix.target.prefix }}
+        cc=${{ matrix.target.host }}-gcc
+        mkdir -p zlib bzip2
+        curl -fsSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz --strip-components=1 -C zlib
+        curl -fsSL https://github.com/libarchive/bzip2/archive/refs/tags/bzip2-1.0.8.tar.gz | tar xz --strip-components=1 -C bzip2
+        ( cd zlib && CC="$cc" CHOST=${{ matrix.target.host }} ./configure && make -j"$(nproc)" )
+        sudo cp -a zlib/libz.so.1* "$sysroot/lib/"
+        ( cd bzip2 && make -f Makefile-libbz2_so CC="$cc" -j"$(nproc)" )
+        sudo cp -a bzip2/libbz2.so.1.0* "$sysroot/lib/"
+        sudo ln -sf libbz2.so.1.0 "$sysroot/lib/libbz2.so.1"
+
+    - name: Smoke-run under QEMU (${{ matrix.target.qemu }})
+      run: |
+        # qemu-user needs the target's shared libraries (ld.so, libc, libstdc++,
+        # and now libz/libbz2); QEMU_LD_PREFIX points it at the cross sysroot.
+        export QEMU_LD_PREFIX=${{ matrix.target.prefix }}
+        q=${{ matrix.target.qemu }}
+        echo "===== version (expect zlib AND bzip2 loaded) ====="
+        $q bin/vsearch --version
+        # 3 sequences (32 bp, >= default minseqlength), two identical -> expect 2
+        # unique. Run it plain, gzip'd and bzip2'd: reading the compressed inputs
+        # exercises the dlopen'd libz/libbz2 (would error if they were missing),
+        # plus hashing/dedup/FASTA-I/O under emulation — not just startup.
+        printf '>a\nACGTACGTACGTACGTACGTACGTACGTACGT\n>b\nACGTACGTACGTACGTACGTACGTACGTACGT\n>c\nTTTTGGGGTTTTGGGGTTTTGGGGTTTTGGGG\n' > smoke.fasta
+        gzip  -c smoke.fasta > smoke.fasta.gz
+        bzip2 -c smoke.fasta > smoke.fasta.bz2
+        for f in smoke.fasta smoke.fasta.gz smoke.fasta.bz2; do
+          echo "===== dereplicate ${f} ====="
+          $q bin/vsearch --derep_fulllength "$f" --output out --quiet
+          got=$(grep -c '^>' out || true)
+          echo "  unique sequences: ${got} (expected 2)"
+          test "${got}" -eq 2
+        done
+        echo "${{ matrix.target.name }} QEMU smoke (plain/gz/bz2) passed."
+
+
+  # Actually RUN the Windows (mingw) cross-build under Wine, to catch
+  # link/startup breakage the build-only cross-build job cannot. Built with
+  # LDFLAGS=-static so the .exe is self-contained (no libstdc++/libgcc/winpthread
+  # DLLs to stage). Non-gating while it proves out.
+  wine-smoke-windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
+    continue-on-error: true
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Install mingw toolchain and Wine
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ghostscript groff mingw-w64 libz-mingw-w64-dev wine
+
+    - name: Build Windows zlib/bzip2 DLLs and install bzlib.h for configure
+      run: |
+        # vsearch dlopens zlib1.dll / libbz2.dll at runtime, but enables gz/bz2 at
+        # COMPILE time only if zlib.h / bzlib.h are visible (AC_CHECK_HEADERS).
+        # libz-mingw-w64-dev supplies zlib.h to the mingw include dir, but there
+        # is no mingw bzip2 package — so build both libs from source AND drop
+        # bzlib.h into the mingw include dir BEFORE configure runs, or bz2 support
+        # is silently compiled out. Must run before the cross-build step below.
+        mkdir -p zlib bzip2
+        curl -fsSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz --strip-components=1 -C zlib
+        curl -fsSL https://github.com/libarchive/bzip2/archive/refs/tags/bzip2-1.0.8.tar.gz | tar xz --strip-components=1 -C bzip2
+        sudo cp bzip2/bzlib.h /usr/x86_64-w64-mingw32/include/
+        make -C zlib -f win32/Makefile.gcc PREFIX=x86_64-w64-mingw32- zlib1.dll
+        # bzip2 has no mingw makefile; compile its sources and link a DLL by hand.
+        ( cd bzip2 && x86_64-w64-mingw32-gcc -O2 -D_FILE_OFFSET_BITS=64 \
+            -c blocksort.c huffman.c crctable.c randtable.c compress.c decompress.c bzlib.c && \
+          x86_64-w64-mingw32-gcc -shared -o libbz2.dll *.o )
+
+    - name: Cross-build for windows-x86_64 (static)
+      run: |
+        ./autogen.sh
+        ./configure CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-static" --host=x86_64-w64-mingw32
+        make clean
+        make ARFLAGS="cr" -j$(nproc)
+        # Stage the runtime DLLs next to the freshly built .exe (Wine searches the
+        # exe's directory); after the build so `make clean` cannot remove them.
+        cp zlib/zlib1.dll bzip2/libbz2.dll bin/
+
+    - name: Smoke-run under Wine
+      run: |
+        export WINEDEBUG=-all
+        # mingw may name the binary with or without the .exe suffix.
+        exe=bin/vsearch.exe; [ -f "$exe" ] || exe=bin/vsearch
+        echo "===== version (expect zlib AND bzip2 loaded) ====="
+        wine "$exe" --version
+        # 3 sequences, two identical -> expect 2 unique. Run plain, gzip'd and
+        # bzip2'd: reading the compressed inputs exercises the DLLs we staged
+        # (would error if missing). grep '^>' is line-ending agnostic, so Windows
+        # CRLF output still counts.
+        printf '>a\nACGTACGTACGTACGTACGTACGTACGTACGT\n>b\nACGTACGTACGTACGTACGTACGTACGTACGT\n>c\nTTTTGGGGTTTTGGGGTTTTGGGGTTTTGGGG\n' > smoke.fasta
+        gzip  -c smoke.fasta > smoke.fasta.gz
+        bzip2 -c smoke.fasta > smoke.fasta.bz2
+        for f in smoke.fasta smoke.fasta.gz smoke.fasta.bz2; do
+          echo "===== dereplicate ${f} ====="
+          wine "$exe" --derep_fulllength "$f" --output out --quiet
+          got=$(grep -c '^>' out || true)
+          echo "  unique sequences: ${got} (expected 2)"
+          test "${got}" -eq 2
+        done
+        echo "windows-x86_64 Wine smoke (plain/gz/bz2) passed."
 
 
   macos-arm64:
