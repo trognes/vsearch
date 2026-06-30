@@ -225,28 +225,33 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y ghostscript groff mingw-w64 libz-mingw-w64-dev wine
 
+    - name: Build Windows zlib/bzip2 DLLs and install bzlib.h for configure
+      run: |
+        # vsearch dlopens zlib1.dll / libbz2.dll at runtime, but enables gz/bz2 at
+        # COMPILE time only if zlib.h / bzlib.h are visible (AC_CHECK_HEADERS).
+        # libz-mingw-w64-dev supplies zlib.h to the mingw include dir, but there
+        # is no mingw bzip2 package — so build both libs from source AND drop
+        # bzlib.h into the mingw include dir BEFORE configure runs, or bz2 support
+        # is silently compiled out. Must run before the cross-build step below.
+        mkdir -p zlib bzip2
+        curl -fsSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz --strip-components=1 -C zlib
+        curl -fsSL https://github.com/libarchive/bzip2/archive/refs/tags/bzip2-1.0.8.tar.gz | tar xz --strip-components=1 -C bzip2
+        sudo cp bzip2/bzlib.h /usr/x86_64-w64-mingw32/include/
+        make -C zlib -f win32/Makefile.gcc PREFIX=x86_64-w64-mingw32- zlib1.dll
+        # bzip2 has no mingw makefile; compile its sources and link a DLL by hand.
+        ( cd bzip2 && x86_64-w64-mingw32-gcc -O2 -D_FILE_OFFSET_BITS=64 \
+            -c blocksort.c huffman.c crctable.c randtable.c compress.c decompress.c bzlib.c && \
+          x86_64-w64-mingw32-gcc -shared -o libbz2.dll *.o )
+
     - name: Cross-build for windows-x86_64 (static)
       run: |
         ./autogen.sh
         ./configure CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-static" --host=x86_64-w64-mingw32
         make clean
         make ARFLAGS="cr" -j$(nproc)
-
-    - name: Provide Windows zlib/bzip2 DLLs for runtime gz/bz2
-      run: |
-        # vsearch dlopens zlib1.dll / libbz2.dll at runtime. Neither is packaged
-        # for mingw on Ubuntu, so build both from source with the mingw toolchain
-        # and place them next to the .exe (Wine searches the exe's directory).
-        mkdir -p zlib bzip2
-        curl -fsSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz --strip-components=1 -C zlib
-        curl -fsSL https://github.com/libarchive/bzip2/archive/refs/tags/bzip2-1.0.8.tar.gz | tar xz --strip-components=1 -C bzip2
-        make -C zlib -f win32/Makefile.gcc PREFIX=x86_64-w64-mingw32- zlib1.dll
-        cp zlib/zlib1.dll bin/
-        # bzip2 has no mingw makefile; compile its sources and link a DLL by hand.
-        ( cd bzip2 && x86_64-w64-mingw32-gcc -O2 -D_FILE_OFFSET_BITS=64 \
-            -c blocksort.c huffman.c crctable.c randtable.c compress.c decompress.c bzlib.c && \
-          x86_64-w64-mingw32-gcc -shared -o libbz2.dll *.o )
-        cp bzip2/libbz2.dll bin/
+        # Stage the runtime DLLs next to the freshly built .exe (Wine searches the
+        # exe's directory); after the build so `make clean` cannot remove them.
+        cp zlib/zlib1.dll bzip2/libbz2.dll bin/
 
     - name: Smoke-run under Wine
       run: |
