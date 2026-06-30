@@ -163,23 +163,47 @@ jobs:
         make clean
         make ARFLAGS="cr" -j$(nproc)
 
+    - name: Provide target zlib/bzip2 for runtime gz/bz2
+      run: |
+        # vsearch dlopens libz.so.1 / libbz2.so.1 at runtime; the target-arch
+        # builds are not packaged for cross use, so build them from source with
+        # the cross toolchain and drop them into the QEMU sysroot's lib dir (the
+        # target ld.so searches <prefix>/lib). bzip2's soname is libbz2.so.1.0,
+        # so add the libbz2.so.1 name vsearch dlopens.
+        sysroot=${{ matrix.target.prefix }}
+        cc=${{ matrix.target.host }}-gcc
+        mkdir -p zlib bzip2
+        curl -fsSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz --strip-components=1 -C zlib
+        curl -fsSL https://github.com/libarchive/bzip2/archive/refs/tags/bzip2-1.0.8.tar.gz | tar xz --strip-components=1 -C bzip2
+        ( cd zlib && CC="$cc" CHOST=${{ matrix.target.host }} ./configure && make -j"$(nproc)" )
+        sudo cp -a zlib/libz.so.1* "$sysroot/lib/"
+        ( cd bzip2 && make -f Makefile-libbz2_so CC="$cc" -j"$(nproc)" )
+        sudo cp -a bzip2/libbz2.so.1.0* "$sysroot/lib/"
+        sudo ln -sf libbz2.so.1.0 "$sysroot/lib/libbz2.so.1"
+
     - name: Smoke-run under QEMU (${{ matrix.target.qemu }})
       run: |
-        # qemu-user needs the target's shared libraries (ld.so, libc, libstdc++
-        # from the cross toolchain); QEMU_LD_PREFIX points it at them.
+        # qemu-user needs the target's shared libraries (ld.so, libc, libstdc++,
+        # and now libz/libbz2); QEMU_LD_PREFIX points it at the cross sysroot.
         export QEMU_LD_PREFIX=${{ matrix.target.prefix }}
-        echo "===== version / CPU-feature dispatch ====="
-        ${{ matrix.target.qemu }} bin/vsearch --version
-        echo "===== functional smoke: dereplicate ====="
+        q=${{ matrix.target.qemu }}
+        echo "===== version (expect zlib AND bzip2 loaded) ====="
+        $q bin/vsearch --version
         # 3 sequences (32 bp, >= default minseqlength), two identical -> expect 2
-        # unique. Exercises hashing, dedup and FASTA I/O under emulation, not just
-        # process startup (which is all --version proves).
+        # unique. Run it plain, gzip'd and bzip2'd: reading the compressed inputs
+        # exercises the dlopen'd libz/libbz2 (would error if they were missing),
+        # plus hashing/dedup/FASTA-I/O under emulation — not just startup.
         printf '>a\nACGTACGTACGTACGTACGTACGTACGTACGT\n>b\nACGTACGTACGTACGTACGTACGTACGTACGT\n>c\nTTTTGGGGTTTTGGGGTTTTGGGGTTTTGGGG\n' > smoke.fasta
-        ${{ matrix.target.qemu }} bin/vsearch --derep_fulllength smoke.fasta --output smoke.out --quiet
-        got=$(grep -c '^>' smoke.out || true)
-        echo "unique sequences: ${got} (expected 2)"
-        test "${got}" -eq 2
-        echo "${{ matrix.target.name }} QEMU smoke test passed."
+        gzip  -c smoke.fasta > smoke.fasta.gz
+        bzip2 -c smoke.fasta > smoke.fasta.bz2
+        for f in smoke.fasta smoke.fasta.gz smoke.fasta.bz2; do
+          echo "===== dereplicate ${f} ====="
+          $q bin/vsearch --derep_fulllength "$f" --output out --quiet
+          got=$(grep -c '^>' out || true)
+          echo "  unique sequences: ${got} (expected 2)"
+          test "${got}" -eq 2
+        done
+        echo "${{ matrix.target.name }} QEMU smoke (plain/gz/bz2) passed."
 
 
   # Actually RUN the Windows (mingw) cross-build under Wine, to catch
@@ -208,21 +232,44 @@ jobs:
         make clean
         make ARFLAGS="cr" -j$(nproc)
 
+    - name: Provide Windows zlib/bzip2 DLLs for runtime gz/bz2
+      run: |
+        # vsearch dlopens zlib1.dll / libbz2.dll at runtime. Neither is packaged
+        # for mingw on Ubuntu, so build both from source with the mingw toolchain
+        # and place them next to the .exe (Wine searches the exe's directory).
+        mkdir -p zlib bzip2
+        curl -fsSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz --strip-components=1 -C zlib
+        curl -fsSL https://github.com/libarchive/bzip2/archive/refs/tags/bzip2-1.0.8.tar.gz | tar xz --strip-components=1 -C bzip2
+        make -C zlib -f win32/Makefile.gcc PREFIX=x86_64-w64-mingw32- zlib1.dll
+        cp zlib/zlib1.dll bin/
+        # bzip2 has no mingw makefile; compile its sources and link a DLL by hand.
+        ( cd bzip2 && x86_64-w64-mingw32-gcc -O2 -D_FILE_OFFSET_BITS=64 \
+            -c blocksort.c huffman.c crctable.c randtable.c compress.c decompress.c bzlib.c && \
+          x86_64-w64-mingw32-gcc -shared -o libbz2.dll *.o )
+        cp bzip2/libbz2.dll bin/
+
     - name: Smoke-run under Wine
       run: |
         export WINEDEBUG=-all
         # mingw may name the binary with or without the .exe suffix.
         exe=bin/vsearch.exe; [ -f "$exe" ] || exe=bin/vsearch
-        echo "===== version ====="
+        echo "===== version (expect zlib AND bzip2 loaded) ====="
         wine "$exe" --version
-        echo "===== functional smoke: dereplicate ====="
-        # grep '^>' is line-ending agnostic, so a Windows CRLF output still counts.
+        # 3 sequences, two identical -> expect 2 unique. Run plain, gzip'd and
+        # bzip2'd: reading the compressed inputs exercises the DLLs we staged
+        # (would error if missing). grep '^>' is line-ending agnostic, so Windows
+        # CRLF output still counts.
         printf '>a\nACGTACGTACGTACGTACGTACGTACGTACGT\n>b\nACGTACGTACGTACGTACGTACGTACGTACGT\n>c\nTTTTGGGGTTTTGGGGTTTTGGGGTTTTGGGG\n' > smoke.fasta
-        wine "$exe" --derep_fulllength smoke.fasta --output smoke.out --quiet
-        got=$(grep -c '^>' smoke.out || true)
-        echo "unique sequences: ${got} (expected 2)"
-        test "${got}" -eq 2
-        echo "windows-x86_64 Wine smoke test passed."
+        gzip  -c smoke.fasta > smoke.fasta.gz
+        bzip2 -c smoke.fasta > smoke.fasta.bz2
+        for f in smoke.fasta smoke.fasta.gz smoke.fasta.bz2; do
+          echo "===== dereplicate ${f} ====="
+          wine "$exe" --derep_fulllength "$f" --output out --quiet
+          got=$(grep -c '^>' out || true)
+          echo "  unique sequences: ${got} (expected 2)"
+          test "${got}" -eq 2
+        done
+        echo "windows-x86_64 Wine smoke (plain/gz/bz2) passed."
 
 
   macos-arm64:
