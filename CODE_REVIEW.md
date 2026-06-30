@@ -349,6 +349,45 @@ itself is correct; only the print interface narrows.
     **Testing caveat:** the bug only manifests at >2 GB single records, which is
     impractical to exercise in CI — verification is code review + clean build +
     the normal-size regression suite proving no behaviour change.
+  - **Status (2026-06).**
+    - **Tier 1 — FIXED.** `getseq` (`6d8509d`), `results`/`showalign`
+      (`7de7362`), `otutable` (`73fed2d`). The `search.cc` site was handled by
+      capping the **header** length at the single fastx/DB read choke point
+      (`fastx_filter_header` rejects headers > `INT_MAX − 2001`, deferred on
+      worker threads; `f7393f3`) rather than widening the shared `searchinfo_s`
+      header fields. **Caveat / open follow-up:** that guard covers `head_len`
+      but **not** the sibling `seq_len` in `populate_si`. Query *sequences* are
+      bounded by `--maxseqlength`, whose hard cap is `UINT32_MAX` (~4.29 GB) —
+      *above* `INT_MAX` — so a 2–4.29 GB query sequence still narrows to a
+      negative `int qseqlen`, skips the realloc, and overflows `qsequence` via
+      `strcpy` (same class as the header bug). Closing it means bounding the
+      sequence length at the `int` limit too — either lower the `--maxseqlength`
+      cap to `INT_MAX − margin` (simplest; the int-based search/aligner cannot
+      process longer sequences anyway) or guard `seq_len` like `head_len`. See
+      **S5b** below.
+    - **Tier 2 — PARTIAL (renderer fixed, param-sweep deferred).**
+      `fasta_print_sequence` now prints >`INT_MAX` sequences correctly
+      (`fwrite` + 64-bit fold loop; `d9b8a61`). The remaining read-only sites —
+      `fasta_print_general`/`fastq_print_general`'s `int len` param, the
+      `length=` annotation, `fprint_seq_label`, the fastq `%.*s` seq/quality
+      output, and the `--relabel_sha1`/`md5` digest chain
+      (`get_hex_seq_digest_*` → `string_normalize`) plus their ~15 callers — are
+      **deferred**: read-only (wrong output, no corruption), reachable only with
+      a >2 GB single sequence and `--maxseqlength` raised. The `int len` limit is
+      recorded in comments at both `*_print_general` functions (`7bb1c39`).
+    - **Tier 3 — DOCUMENTED + SKIPPED** (see above; `db.h` comment `3442f8a`).
+
+> **S5b — sequence-length counterpart of the Tier-1 search heap-write (open).**
+> The Tier-1 header guard (`f7393f3`) closed the `head_len` overflow but the
+> `seq_len` path in `search.cc` `populate_si` (`si->qseqlen = seq_len`; realloc
+> `if (qseqlen + 1 > seq_alloc)`; `strcpy(qsequence, seq)`) is the same
+> heap-write and is **not** guarded. Reachable because `--maxseqlength` caps at
+> `UINT32_MAX` > `INT_MAX`, so a 2–4.29 GB query sequence wraps `qseqlen`
+> negative. Recommended fix: lower the `--maxseqlength` hard cap to
+> `INT_MAX − margin` (honest — the int-based engine/SIMD aligner cannot handle
+> longer sequences regardless), which also makes every other `int` sequence-
+> length narrowing safe-by-construction. Default `--maxseqlength` is small, so
+> not default-reachable; needs the cap raised explicitly.
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
@@ -2765,10 +2804,14 @@ disks mid-run. Not adversarial, but they corrupt science silently:
   record) and abundance/length truncation at `>UINT_MAX` — reachable on **genuinely
   large real datasets** (large assemblies, deeply pooled `;size=`), not crafted.
   The N1(c) **abundance** half (a/b) is *FIXED* (`4dbf556`). The S5 length sweep
-  is *scoped, not yet implemented* — see the verified three-tier plan in the S5
-  entry above (Tier 1 heap-write fixes; Tier 2 read-only print path; Tier 3
-  storage *documented and skipped* — the `--maxseqlength ≤ UINT32_MAX` cap is the
-  guard, noted in a `db.h` comment).
+  is *mostly addressed* — see the verified three-tier plan and **Status** in the
+  S5 entry above: **Tier 1 heap-write FIXED** (`6d8509d`, `7de7362`, `73fed2d`,
+  `f7393f3`) with one open sequence-length counterpart (**S5b**, the `seq_len`
+  twin of the header guard); **Tier 2** renderer fixed (`d9b8a61`), param-sweep
+  *deferred + documented* (`7bb1c39`); **Tier 3** storage *documented + skipped*
+  (`3442f8a`). S5b: the `--maxseqlength` hard cap is `UINT32_MAX` (> `INT_MAX`),
+  so a 2–4.29 GB query sequence still overflows the int `qseqlen` path — lower
+  the cap to `INT_MAX − margin` to close it.
 
 ### Band 4 — Crafted-/malicious-input hardening (deprioritized)
 
