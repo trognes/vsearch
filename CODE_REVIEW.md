@@ -370,7 +370,11 @@ itself is correct; only the print interface narrows.
       (`get_hex_seq_digest_*` → `string_normalize`) plus their ~15 callers — are
       **deferred**: read-only (wrong output, no corruption), reachable only with
       a >2 GB single sequence and `--maxseqlength` raised. The `int len` limit is
-      recorded in comments at both `*_print_general` functions (`7bb1c39`).
+      recorded in comments at both `*_print_general` functions (`7bb1c39`). The
+      *out-of-bounds* half of this residual (a **negative** `len` from a >2 GB
+      record read via `fasta_next`/`fastx_next`) is now unreachable — see
+      **S5e**, which caps sequence length at the central reader; the remaining
+      deferred work is purely the correct rendering of a genuine >2 GB sequence.
     - **Tier 3 — DOCUMENTED + SKIPPED** (see above; `db.h` comment `3442f8a`).
 
 > **S5b — sequence-length counterpart of the Tier-1 search heap-write. FIXED.**
@@ -424,6 +428,60 @@ itself is correct; only the print interface narrows.
 > `fastx_query_length_ok()` (worker-safe deferred error / fatal, mirroring the
 > header guard) called from the four query loops, and a bounds check in the UDB
 > loader.
+
+> **S5e — the length guard was not central: readers that bypass the query loops
+> and a length *sum* that overflows. FIXED.** A careful post-audit review pass
+> (2026-07, nine-finder + three-lens adversarial verification) confirmed the
+> length handling was still *not* complete: `fastx_query_length_ok()` guarded
+> only the four search-family query loops, so every command that reads records
+> directly via `fasta_next`/`fastx_next` was unguarded, and one site computes a
+> length as a *sum* (which no per-record length cap can bound). Three defects
+> survived verification:
+> - **`chimera.cc:2108–2109` (HIGH — heap write).** The `uchime_ref` query loop
+>   (`opt_uchime_ref` branch) narrows `fasta_get_header_length` /
+>   `fasta_get_sequence_length` to the `int` fields `ci->query_head_len` /
+>   `ci->query_len`, then `realloc_arrays(ci)` sizes the buffers from those ints
+>   and `std::strcpy` copies the full header/sequence in — a negative narrowed
+>   length under-allocates and the `strcpy` overflows the heap. Same class as the
+>   S5b search heap-write, but a distinct loop the query-loop guards never
+>   covered. (`chimera.cc` already sets `defer_errors = true` on the query handle
+>   and reports the deferred error after the `ThreadRunner` join.)
+> - **`cut.cc:120` (Medium — DoS / corruption).** `cut_a_sequence` takes its sole
+>   size from `int seq_length = (int)fasta_get_sequence_length(...)` and sizes
+>   `rc_buffer.resize(seq_length + 1)` plus all indexing/output from it. `cut`
+>   never applies `--maxseqlength`, so a >2 GB record narrows `seq_length`
+>   negative. (Earlier this site was dismissed as "bounded by `seq_length`" — but
+>   `seq_length` *is* the unbounded narrowing, since `cut` enforces no cap.)
+> - **`msa.cc:189–191` (Medium — corruption).** `find_total_alignment_length`
+>   returns `int` and seeds `std::accumulate` with an `int` (`centroid_len`) and
+>   an `int` accumulator, so the total alignment length overflows *in the sum*
+>   before `alignment_length` (`msa.cc:555`) is widened to `unsigned long` at
+>   line 558 — too late. A per-record length cap cannot fix a sum; this needs
+>   64-bit accumulation.
+>
+> **Systemic residual (same review).** Because so many commands read through
+> `fasta_next`/`fastx_next` without any length bound, the S5 Tier-2 print-path
+> residual (`fasta_print_general` / `fastq_print_general` still take `int len`;
+> a negative `len` drives `fwrite`/`%.*s` out of bounds) was reachable from
+> *every* such command (`rereplicate`, `fasta2fastq`, `sortbylength`, `shuffle`,
+> `subsample`, `getseq`, `derep`, `cut`, `filter`, `chimera`), not just the
+> print callers listed under Tier 2.
+>
+> **Fix (central reader guard, superseding the query-loop guards).** Rather than
+> add a guard per command, the sequence-length bound was moved to the single
+> choke point all FASTA/FASTQ (and DB) reads pass through, symmetric with the
+> `fastx_filter_header` header guard: `fasta_next`/`fastq_next` now reject any
+> record whose sequence exceeds `INT_MAX − buffer_headroom` (deferred on worker
+> threads, `fatal()` on the main thread). This bounds **all** sequence reads in
+> one place — closing the `chimera.cc:2108` query loop, `cut.cc:120`, and making
+> the negative-`len` print-path residual unreachable — so the four
+> `fastx_query_length_ok()` call sites and the helper itself were removed. A
+> >2 GB single sequence is now fatal on any command (previously `db_read`
+> discarded it via `--maxseqlength`; discarding a >2.15 GB record it would always
+> reject anyway is not a meaningful regression, and fatal-on-over-long is the
+> agreed behaviour). `msa.cc`'s length *sum* is not a per-record read, so it was
+> fixed separately by accumulating and returning `int64_t` and carrying
+> `alignment_length` / `position_in_alignment` as `int64_t`.
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
