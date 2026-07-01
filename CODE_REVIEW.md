@@ -390,20 +390,40 @@ itself is correct; only the print interface narrows.
 > this only ever affected users who explicitly raised `--maxseqlength` above
 > ~2.15 GB.
 
-> **S5c — chimera per-alignment buffers overflow `int` well below the length
-> cap (open, distinct from S5b).** `realloc_arrays` in `chimera.cc` sizes
-> buffers with `int` length arithmetic that overflows *below* the new
-> `--maxseqlength` cap, so the cap does **not** cover it: `max_2x2_size =
-> maxcandidates * maxqlen` (`chimera.cc:255`, a **multiplicative** `int` product)
-> and `maxalnlen = maxqlen + 2 * db_getlongestsequence()` (`:272`, a **3×**
-> `int` sum) both feed `vector.resize()`. The multiplicative one overflows `int`
-> at `maxqlen` on the order of tens of millions (÷ `maxcandidates`), so no
-> *practical* `--maxseqlength` cap defeats it — it needs the computations carried
-> in `size_t`/`int64_t` instead. Gated on large sequences / many candidates;
-> read-and-write allocation sizing, but also partly a memory-footprint issue
-> (these arrays are `maxcandidates × maxqlen` regardless). Fix: widen the
-> `max_2x2_size` and `maxalnlen` computations (and the counters derived from
-> them) to 64-bit. Not attempted here.
+> **S5c — length-derived `int` arithmetic that overflows *below* the length cap.
+> FIXED.** A full five-cluster audit (2026-07) found sites where a length is
+> multiplied or doubled in `int`, overflowing well under the `--maxseqlength`
+> cap (so the cap cannot cover them — they need 64-bit computation). All fixed
+> in `6c36ceb`:
+> - `chimera.cc`: `max_2x2_size = maxcandidates * maxqlen` (`:255`) and
+>   `maxalnlen = maxqlen + 2*db_getlongestsequence()` (`:272`) sizing the
+>   per-alignment vectors, and the per-candidate index `i*query_len + qpos`
+>   (`:619`, `:647`) — now `size_t`/`int64_t`.
+> - `msa.cc`: the profile index `profsize * position` (`:100`, `:442`, `:451`,
+>   `:459`, `:536`) — operands widened before the multiply.
+> - `unique.cc` / `kmerhash.cc`: the kmer hash grows to `2 * seqlen`; the target
+>   and the `size`/`alloc` doubling counters were `int` (wrap + non-terminating
+>   doubling above ~1.07 Gnt). Fields widened to `int64_t`, target computed in
+>   64-bit.
+> - `search_exact.cc`: `nwscore = qseqlen * opt_match` (`int*int`, signed-overflow
+>   UB) now computed in `int64_t`.
+>
+> **Audit false positives (verified safe, not changed):** `results.cc:164/191`
+> and `cut.cc:*` (bounded by `seq_length`, which is ≤ cap), `mask.cc:133`
+> (`besti + bestj ≤ len`), `align_simd.cc` cigar sizing (SIMD path self-limited
+> to `qlen+dlen ≤ 65535` by `search16_fits`, larger pairs go to linmemalign).
+
+> **S5d — ingest paths that bypass the `--maxseqlength` cap. FIXED (`d3b51ab`).**
+> The cap only bounds lengths where a read path enforces it. `db_read` discards
+> over-long sequences, but two paths did not: (a) **query** reads
+> (usearch_global/search, search_exact, sintax, orient) are *not* length-filtered,
+> so a query > `INT_MAX − buffer_headroom` overflowed the per-query buffer (the
+> most reachable case — needs no option, just a >2 GB query); (b) the **UDB**
+> reader loaded stored `seqlen`/`headerlen` without bounds-checking, so a crafted
+> or legacy `.udb` could carry over-long lengths into the `int` fields. Added
+> `fastx_query_length_ok()` (worker-safe deferred error / fatal, mirroring the
+> header guard) called from the four query loops, and a bounds check in the UDB
+> loader.
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
@@ -2836,9 +2856,10 @@ disks mid-run. Not adversarial, but they corrupt science silently:
   `f7393f3`); **S5b** (the `seq_len` twin of the header guard) **FIXED** by
   lowering the `--maxseqlength` cap to `INT_MAX − 2001`; **Tier 2** renderer
   fixed (`d9b8a61`), param-sweep *deferred + documented* (`7bb1c39`); **Tier 3**
-  storage *documented + skipped* (`3442f8a`). Still **open: S5c** — chimera
-  per-alignment buffers (`chimera.cc:255` multiplicative, `:272` 3×) overflow
-  `int` *below* the cap and need 64-bit widening, not a cap.
+  storage *documented + skipped* (`3442f8a`). **S5c** (length × count `int`
+  overflows below the cap — chimera/msa/unique/kmerhash/search_exact) **FIXED**
+  (`6c36ceb`) and **S5d** (query + UDB ingest paths that bypass the cap) **FIXED**
+  (`d3b51ab`) after a full multiplicative-overflow + ingest-coverage audit.
 
 ### Band 4 — Crafted-/malicious-input hardening (deprioritized)
 
