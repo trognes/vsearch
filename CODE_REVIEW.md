@@ -333,13 +333,14 @@ itself is correct; only the print interface narrows.
   - **Tier 3 — storage (N1(c)), latent and currently unreachable: DOCUMENTED
     AND SKIPPED.** `seqinfo_s.headerlen`/`seqlen` are `unsigned int`
     (`db.h:72–73`), assigned with narrowing casts at `db.cc:207–208`; accessors
-    already return `uint64_t`. Because `--maxseqlength` is capped at exactly
-    `UINT32_MAX` (`cli.cc`), no accepted record can overflow these fields, so
-    the storage path is **not reachable today**. Widening both to `uint64_t`
-    would grow `seqinfo_s` from 40 → 48 bytes (**+8 bytes per sequence** in
-    `seqindex`; alignment padding makes widening just one cost the same as both)
-    for **no current benefit** — e.g. +760 MB on a 100 M-sequence DB. Decision:
-    **do not widen**; the `--maxseqlength ≤ UINT32_MAX` cap is the documented
+    already return `uint64_t`. Because `--maxseqlength` is capped at
+    `INT_MAX − 2001` (`cli.cc`; lowered from `UINT32_MAX` for S5b), which is well
+    under the `unsigned int` field maximum, no accepted record can overflow these
+    fields, so the storage path is **not reachable today**. Widening both to
+    `uint64_t` would grow `seqinfo_s` from 40 → 48 bytes (**+8 bytes per
+    sequence** in `seqindex`; alignment padding makes widening just one cost the
+    same as both) for **no current benefit** — e.g. +760 MB on a 100 M-sequence
+    DB. Decision: **do not widen**; the `--maxseqlength` cap is the documented
     guard, recorded in a comment at `db.h:72–73`. If that cap is ever raised
     above `UINT32_MAX`, widen both fields then (and drop the `db_add()` casts).
   - **Suggested commit decomposition** (one fix = one atomic, cherry-pickable
@@ -355,16 +356,11 @@ itself is correct; only the print interface narrows.
       capping the **header** length at the single fastx/DB read choke point
       (`fastx_filter_header` rejects headers > `INT_MAX − 2001`, deferred on
       worker threads; `f7393f3`) rather than widening the shared `searchinfo_s`
-      header fields. **Caveat / open follow-up:** that guard covers `head_len`
-      but **not** the sibling `seq_len` in `populate_si`. Query *sequences* are
-      bounded by `--maxseqlength`, whose hard cap is `UINT32_MAX` (~4.29 GB) —
-      *above* `INT_MAX` — so a 2–4.29 GB query sequence still narrows to a
-      negative `int qseqlen`, skips the realloc, and overflows `qsequence` via
-      `strcpy` (same class as the header bug). Closing it means bounding the
-      sequence length at the `int` limit too — either lower the `--maxseqlength`
-      cap to `INT_MAX − margin` (simplest; the int-based search/aligner cannot
-      process longer sequences anyway) or guard `seq_len` like `head_len`. See
-      **S5b** below.
+      header fields. The sibling `seq_len` path in `populate_si` was the same
+      heap-write for *sequences*, closed separately by lowering the
+      `--maxseqlength` cap to `INT_MAX − 2001` — see **S5b** (FIXED) below.
+      A related but distinct chimera overflow that the cap does *not* cover is
+      logged as **S5c** (open).
     - **Tier 2 — PARTIAL (renderer fixed, param-sweep deferred).**
       `fasta_print_sequence` now prints >`INT_MAX` sequences correctly
       (`fwrite` + 64-bit fold loop; `d9b8a61`). The remaining read-only sites —
@@ -374,20 +370,128 @@ itself is correct; only the print interface narrows.
       (`get_hex_seq_digest_*` → `string_normalize`) plus their ~15 callers — are
       **deferred**: read-only (wrong output, no corruption), reachable only with
       a >2 GB single sequence and `--maxseqlength` raised. The `int len` limit is
-      recorded in comments at both `*_print_general` functions (`7bb1c39`).
+      recorded in comments at both `*_print_general` functions (`7bb1c39`). The
+      *out-of-bounds* half of this residual (a **negative** `len` from a >2 GB
+      record read via `fasta_next`/`fastx_next`) is now unreachable — see
+      **S5e**, which caps sequence length at the central reader; the remaining
+      deferred work is purely the correct rendering of a genuine >2 GB sequence.
     - **Tier 3 — DOCUMENTED + SKIPPED** (see above; `db.h` comment `3442f8a`).
 
-> **S5b — sequence-length counterpart of the Tier-1 search heap-write (open).**
+> **S5b — sequence-length counterpart of the Tier-1 search heap-write. FIXED.**
 > The Tier-1 header guard (`f7393f3`) closed the `head_len` overflow but the
 > `seq_len` path in `search.cc` `populate_si` (`si->qseqlen = seq_len`; realloc
 > `if (qseqlen + 1 > seq_alloc)`; `strcpy(qsequence, seq)`) is the same
-> heap-write and is **not** guarded. Reachable because `--maxseqlength` caps at
-> `UINT32_MAX` > `INT_MAX`, so a 2–4.29 GB query sequence wraps `qseqlen`
-> negative. Recommended fix: lower the `--maxseqlength` hard cap to
-> `INT_MAX − margin` (honest — the int-based engine/SIMD aligner cannot handle
-> longer sequences regardless), which also makes every other `int` sequence-
-> length narrowing safe-by-construction. Default `--maxseqlength` is small, so
-> not default-reachable; needs the cap raised explicitly.
+> heap-write. It was reachable because `--maxseqlength` capped at `UINT32_MAX` >
+> `INT_MAX`, so a 2–4.29 GB query sequence wrapped `qseqlen` negative. **Fixed**
+> by lowering the `--maxseqlength` hard cap from `UINT32_MAX` to `INT_MAX − 2001`
+> (`cli.cc`), matching the header guard's own `INT_MAX − 2001` limit — no
+> accepted sequence can now wrap the `int` length or its `+ 2001` realloc, and
+> the `+ 2001` margin is the largest additive headroom applied to a query length
+> in the hot paths (search/sintax/search_exact `seq_alloc = qseqlen + 2001`).
+> The library entry points take an `int` sequence length by API contract, so
+> they cannot exceed the limit either. Manual updated in both systems
+> (`fragments/option_maxseqlength.md`, roff `vsearch.1`). Default is small, so
+> this only ever affected users who explicitly raised `--maxseqlength` above
+> ~2.15 GB.
+
+> **S5c — length-derived `int` arithmetic that overflows *below* the length cap.
+> FIXED.** A full five-cluster audit (2026-07) found sites where a length is
+> multiplied or doubled in `int`, overflowing well under the `--maxseqlength`
+> cap (so the cap cannot cover them — they need 64-bit computation). All fixed
+> in `6c36ceb`:
+> - `chimera.cc`: `max_2x2_size = maxcandidates * maxqlen` (`:255`) and
+>   `maxalnlen = maxqlen + 2*db_getlongestsequence()` (`:272`) sizing the
+>   per-alignment vectors, and the per-candidate index `i*query_len + qpos`
+>   (`:619`, `:647`) — now `size_t`/`int64_t`.
+> - `msa.cc`: the profile index `profsize * position` (`:100`, `:442`, `:451`,
+>   `:459`, `:536`) — operands widened before the multiply.
+> - `unique.cc` / `kmerhash.cc`: the kmer hash grows to `2 * seqlen`; the target
+>   and the `size`/`alloc` doubling counters were `int` (wrap + non-terminating
+>   doubling above ~1.07 Gnt). Fields widened to `int64_t`, target computed in
+>   64-bit.
+> - `search_exact.cc`: `nwscore = qseqlen * opt_match` (`int*int`, signed-overflow
+>   UB) now computed in `int64_t`.
+>
+> **Audit false positives (verified safe, not changed):** `results.cc:164/191`
+> and `cut.cc:*` (bounded by `seq_length`, which is ≤ cap), `mask.cc:133`
+> (`besti + bestj ≤ len`), `align_simd.cc` cigar sizing (SIMD path self-limited
+> to `qlen+dlen ≤ 65535` by `search16_fits`, larger pairs go to linmemalign).
+
+> **S5d — ingest paths that bypass the `--maxseqlength` cap. FIXED (`d3b51ab`).**
+> The cap only bounds lengths where a read path enforces it. `db_read` discards
+> over-long sequences, but two paths did not: (a) **query** reads
+> (usearch_global/search, search_exact, sintax, orient) are *not* length-filtered,
+> so a query > `INT_MAX − buffer_headroom` overflowed the per-query buffer (the
+> most reachable case — needs no option, just a >2 GB query); (b) the **UDB**
+> reader loaded stored `seqlen`/`headerlen` without bounds-checking, so a crafted
+> or legacy `.udb` could carry over-long lengths into the `int` fields. Added
+> `fastx_query_length_ok()` (worker-safe deferred error / fatal, mirroring the
+> header guard) called from the four query loops, and a bounds check in the UDB
+> loader.
+
+> **S5e — the length guard was not central: readers that bypass the query loops
+> and a length *sum* that overflows. FIXED.** A careful post-audit review pass
+> (2026-07, nine-finder + three-lens adversarial verification) confirmed the
+> length handling was still *not* complete: `fastx_query_length_ok()` guarded
+> only the four search-family query loops, so every command that reads records
+> directly via `fasta_next`/`fastx_next` was unguarded, and one site computes a
+> length as a *sum* (which no per-record length cap can bound). Three defects
+> survived verification:
+> - **`chimera.cc:2108–2109` (HIGH — heap write).** The `uchime_ref` query loop
+>   (`opt_uchime_ref` branch) narrows `fasta_get_header_length` /
+>   `fasta_get_sequence_length` to the `int` fields `ci->query_head_len` /
+>   `ci->query_len`, then `realloc_arrays(ci)` sizes the buffers from those ints
+>   and `std::strcpy` copies the full header/sequence in — a negative narrowed
+>   length under-allocates and the `strcpy` overflows the heap. Same class as the
+>   S5b search heap-write, but a distinct loop the query-loop guards never
+>   covered. (`chimera.cc` already sets `defer_errors = true` on the query handle
+>   and reports the deferred error after the `ThreadRunner` join.)
+> - **`cut.cc:120` (Medium — DoS / corruption).** `cut_a_sequence` takes its sole
+>   size from `int seq_length = (int)fasta_get_sequence_length(...)` and sizes
+>   `rc_buffer.resize(seq_length + 1)` plus all indexing/output from it. `cut`
+>   never applies `--maxseqlength`, so a >2 GB record narrows `seq_length`
+>   negative. (Earlier this site was dismissed as "bounded by `seq_length`" — but
+>   `seq_length` *is* the unbounded narrowing, since `cut` enforces no cap.)
+> - **`msa.cc:189–191` (Medium — corruption).** `find_total_alignment_length`
+>   returns `int` and seeds `std::accumulate` with an `int` (`centroid_len`) and
+>   an `int` accumulator, so the total alignment length overflows *in the sum*
+>   before `alignment_length` (`msa.cc:555`) is widened to `unsigned long` at
+>   line 558 — too late. A per-record length cap cannot fix a sum; this needs
+>   64-bit accumulation.
+>
+> **Systemic residual (same review).** Because so many commands read through
+> `fasta_next`/`fastx_next` without any length bound, the S5 Tier-2 print-path
+> residual (`fasta_print_general` / `fastq_print_general` still take `int len`;
+> a negative `len` drives `fwrite`/`%.*s` out of bounds) was reachable from
+> *every* such command (`rereplicate`, `fasta2fastq`, `sortbylength`, `shuffle`,
+> `subsample`, `getseq`, `derep`, `cut`, `filter`, `chimera`), not just the
+> print callers listed under Tier 2.
+>
+> **Fix (central reader guard, superseding the query-loop guards).** Rather than
+> add a guard per command, the sequence-length bound was moved to the single
+> choke point all FASTA/FASTQ (and DB) reads pass through, symmetric with the
+> `fastx_filter_header` header guard: `fasta_next`/`fastq_next` now reject any
+> record whose sequence exceeds `INT_MAX − buffer_headroom` (deferred on worker
+> threads, `fatal()` on the main thread). This bounds **all** sequence reads in
+> one place — closing the `chimera.cc:2108` query loop, `cut.cc:120`, and making
+> the negative-`len` print-path residual unreachable — so the four
+> `fastx_query_length_ok()` call sites and the helper itself were removed. A
+> >2 GB single sequence is now fatal on any command (previously `db_read`
+> discarded it via `--maxseqlength`; discarding a >2.15 GB record it would always
+> reject anyway is not a meaningful regression, and fatal-on-over-long is the
+> agreed behaviour). `msa.cc`'s length *sum* is not a per-record read, so it was
+> fixed separately by making `find_total_alignment_length` sum and return
+> `int64_t`. Because the profile/alignment buffers are allocated from that
+> length *before* the alignment walk runs, a correct 64-bit length either sizes
+> the buffers correctly or (beyond int capacity) fails the allocation cleanly
+> before any walk, so the downstream `int position_in_alignment` bookkeeping
+> never overflows and did not need widening.
+>
+> **Commits:** central reader guard + query-loop removal (`d62c912`); msa 64-bit
+> alignment-length sum (`113e96b`). Build-checked at `-O2` and `--enable-debug`
+> (the `-Wconversion`/`-Wsign-conversion` narrowing gate) and smoke-tested across
+> usearch_global, search_exact, sintax, orient, uchime_ref, cut, and
+> cluster_fast consensus (msa).
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
@@ -2817,12 +2921,13 @@ disks mid-run. Not adversarial, but they corrupt science silently:
   The N1(c) **abundance** half (a/b) is *FIXED* (`4dbf556`). The S5 length sweep
   is *mostly addressed* — see the verified three-tier plan and **Status** in the
   S5 entry above: **Tier 1 heap-write FIXED** (`6d8509d`, `7de7362`, `73fed2d`,
-  `f7393f3`) with one open sequence-length counterpart (**S5b**, the `seq_len`
-  twin of the header guard); **Tier 2** renderer fixed (`d9b8a61`), param-sweep
-  *deferred + documented* (`7bb1c39`); **Tier 3** storage *documented + skipped*
-  (`3442f8a`). S5b: the `--maxseqlength` hard cap is `UINT32_MAX` (> `INT_MAX`),
-  so a 2–4.29 GB query sequence still overflows the int `qseqlen` path — lower
-  the cap to `INT_MAX − margin` to close it.
+  `f7393f3`); **S5b** (the `seq_len` twin of the header guard) **FIXED** by
+  lowering the `--maxseqlength` cap to `INT_MAX − 2001`; **Tier 2** renderer
+  fixed (`d9b8a61`), param-sweep *deferred + documented* (`7bb1c39`); **Tier 3**
+  storage *documented + skipped* (`3442f8a`). **S5c** (length × count `int`
+  overflows below the cap — chimera/msa/unique/kmerhash/search_exact) **FIXED**
+  (`6c36ceb`) and **S5d** (query + UDB ingest paths that bypass the cap) **FIXED**
+  (`d3b51ab`) after a full multiplicative-overflow + ingest-coverage audit.
 
 ### Band 4 — Crafted-/malicious-input hardening (deprioritized)
 
