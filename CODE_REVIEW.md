@@ -480,8 +480,18 @@ itself is correct; only the print interface narrows.
 > discarded it via `--maxseqlength`; discarding a >2.15 GB record it would always
 > reject anyway is not a meaningful regression, and fatal-on-over-long is the
 > agreed behaviour). `msa.cc`'s length *sum* is not a per-record read, so it was
-> fixed separately by accumulating and returning `int64_t` and carrying
-> `alignment_length` / `position_in_alignment` as `int64_t`.
+> fixed separately by making `find_total_alignment_length` sum and return
+> `int64_t`. Because the profile/alignment buffers are allocated from that
+> length *before* the alignment walk runs, a correct 64-bit length either sizes
+> the buffers correctly or (beyond int capacity) fails the allocation cleanly
+> before any walk, so the downstream `int position_in_alignment` bookkeeping
+> never overflows and did not need widening.
+>
+> **Commits:** central reader guard + query-loop removal (`d62c912`); msa 64-bit
+> alignment-length sum (`113e96b`). Build-checked at `-O2` and `--enable-debug`
+> (the `-Wconversion`/`-Wsign-conversion` narrowing gate) and smoke-tested across
+> usearch_global, search_exact, sintax, orient, uchime_ref, cut, and
+> cluster_fast consensus (msa).
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
