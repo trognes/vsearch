@@ -960,22 +960,28 @@ last position, writing past the whole allocation. The default `qmin = 0` masks i
 - **Effort:** Low–Medium · **Impact:** High (heap OOB write) · **Criticality:**
   High · *verified (row width vs raw-`qual` index)*.
 
-#### S25. `build_sam_strings` walks the CIGAR into the sequences with no length bound (latent)
+#### S25. `build_sam_strings` walks the CIGAR into the sequences with no length bound — **Fixed** (`60d309a`)
 
-`build_sam_strings` (`results.cc:753–852`) parses a hit's CIGAR (`12M3I…`) and,
+`build_sam_strings` (`results.cc`) parses a hit's CIGAR (`12M3I…`) and,
 per op, advances `qpos`/`tpos` and reads `queryseq[qpos]` / `targetseq[tpos]`
 with **no check that the positions stay within the sequence lengths** —
-correctness rests entirely on the CIGAR's run-lengths summing to exactly the
-sequence lengths. The `sscanf(p, "%d%n", …)` return is also unchecked. Safe today
-because the CIGAR is produced by the in-tree aligner consistently with the
-sequences; becomes an over-read only if a CIGAR/sequence pairing is ever
-corrupted (e.g. a stale `nwalignment`, or mismatched lengths from a crafted DB).
+correctness rested entirely on the CIGAR's run-lengths summing to exactly the
+sequence lengths. The `sscanf(p, "%d%n", …)` return was also unchecked. Safe
+today because the CIGAR is produced by the in-tree aligner consistently with the
+sequences; became an over-read only if a CIGAR/sequence pairing were corrupted
+(e.g. a stale `nwalignment`, or mismatched lengths from a crafted DB).
 
-- **Reachability:** latent (no user-triggered overflow on well-formed input today).
-- **Fix:** pass query/target lengths and clamp/`fatal()` on `qpos`/`tpos` overrun;
-  check the `sscanf` return.
+- **Fix (applied):** `build_sam_strings` now takes `queryseqlen`/`targetseqlen`
+  (query length via `std::strlen` of the emitted query, target via
+  `db_getsequencelen` — both at the single call site, no cross-file signature
+  churn) and `fatal()`s before any op walks past the end. The bound is per-op,
+  not uniform: `'M'` advances both positions (checks both), `'D'` only the query,
+  `'I'` only the target, so each op is bounded against exactly what it reads. A
+  negative run length is rejected, and the `sscanf` return is checked (a missing
+  run-length number keeps the intended implicit run of 1). No behaviour change on
+  well-formed input — SAM `M`/`D`/`I` output and MD strings verified identical.
 - **Effort:** Medium · **Impact:** Medium · **Criticality:** Medium ·
-  *latent; verified (no bound)* · same family as S4/S5 (length used without a check).
+  **Fixed** · same family as S4/S5 (length used without a check).
 
 #### S26. SHA-1/MD5 transform: write-through-`const` and unaligned type-punning (UB)
 
@@ -2916,7 +2922,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Fixed (`4198319`) — `std::isfinite` guard in `args_getdouble` |
 | S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Bug | Low | High | High | Fixed (`94ed5fe`) |
 | S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Fixed (`6740721`) |
-| S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium | Latent |
+| S25 | `build_sam_strings` walks CIGAR into sequences with no length bound | Security | Medium | Medium | Medium | Fixed (`60d309a`) — per-op bounds + `fatal()`, `sscanf` return checked |
 | S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Not reachable in vsearch usage (no code change) — hashing runs on a fresh heap-aligned `std::vector` copy; vendored code is thread-safe as-is. **Do NOT enable `SHA1HANDSOFF`** (its `static` workspace would race — SHA-1 runs in search workers) |
 | S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
@@ -3091,7 +3097,8 @@ Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.
   additive `datap` alloc).~~ **DONE** — the whole UDB validate-on-load cluster
   (S1/S6/S16, then S3/S9, with S14 already in) is fixed; see the update callout
   above.
-- **S25** (CIGAR walk bound), ~~**S22**~~ (done — `std::isfinite` in
+- ~~**S25**~~ (fixed — per-op CIGAR bounds + `fatal()` in `build_sam_strings`,
+  `60d309a`), ~~**S22**~~ (done — `std::isfinite` in
   `args_getdouble`, `4198319`), ~~**S26**~~ (not reachable in vsearch usage —
   vendored code left pristine; hashing runs on a fresh aligned copy and is
   thread-safe as-is, and `SHA1HANDSOFF` must stay off — see callout), **S27**
@@ -3099,8 +3106,9 @@ Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.
   ~~**S21**~~ (fixed — `hash_mask` now `uint64_t`), ~~**S8**~~ (not reachable +
   vendored), ~~**S11**~~ (not a bug on 64-bit — exact-fit), ~~**ST2**~~ (fixed —
   `-Wformat-signedness` clean tree-wide, `302b365`). **Remaining Band 4 is
-  exactly two items, neither a reachable memory-safety bug:** **S25** (CIGAR
-  walk bound) and **S27** (Windows DLL-planting) — crafted-input/platform, best via Band 8 fuzzing.
+  exactly one item, not a reachable memory-safety bug:** **S27** (Windows
+  DLL-planting) — a platform/load-path hardening item, best addressed on the
+  Windows packaging side.
 
 ### Band 5 — Library-API correctness & lifecycle
 
@@ -3185,7 +3193,7 @@ for. Each is scoped as separate, tool-driven effort, not part of this review.
    Two properties make vsearch unusually fuzz-friendly: `-fno-exceptions` plus
    `fatal()`→`std::exit()` means every malformed-input path is either a clean exit
    or a memory bug (no exception noise), and ASan instrumentation turns the
-   latent/needs-confirmation S-items (S3, S6, S9, S16, S19, S25) into crashing
+   latent/needs-confirmation S-items (S3, S6, S9, S16, S19) into crashing
    repros or clears them. The sanitizer CI runs only **well-formed** inputs (its
    own caveat), so this is the natural way to reach the S1–S4/S14–S19 crafted-input
    class.
