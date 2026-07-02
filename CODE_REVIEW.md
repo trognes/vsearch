@@ -571,6 +571,12 @@ no safety net.
 
 #### S8. `md5.c` `body()` unsigned-underflow loop if called with `size == 0` (Low)
 
+**Status: NOT REACHABLE — no change.** `MD5_Update` only ever calls `body()` with
+a non-zero multiple of 64, so the `size == 0` underflow (and the
+non-multiple-of-64 under-run) cannot occur; the routine's contract is honoured by
+its only caller. `md5.c` is also **vendored** (`src/vendored/md5.c`) — re-sync
+from upstream rather than adding an internal guard. Original analysis below.
+
 `body()` ends with `} while (size -= 64);` (`md5.c:200`); a `size` of 0 would
 underflow to ~`ULONG_MAX` and read far out of bounds. All current callers pass
 a non-zero multiple of 64, so it is **not currently reachable** — latent only.
@@ -598,6 +604,13 @@ go out of bounds. Large allocations elsewhere would likely fail first.
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low · *needs-confirmation*
 
 #### S11. Wrong `sizeof` in `dbmatched` allocation (Low, latent)
+
+**Status: NOT A BUG on the supported platform.** vsearch is 64-bit only (see
+CLAUDE.md), where `sizeof(uint64_t*) == sizeof(uint64_t) == 8`, so
+`xmalloc(seqcount * sizeof(uint64_t *))` for a `uint64_t` array is an exact fit —
+not an over- or under-allocation. The wrong-type `sizeof` is worth a cosmetic
+correction for clarity/portability, but it is not a defect on any target vsearch
+runs. Same class as S7. Original analysis below.
 
 `dbmatched = (uint64_t *) xmalloc(seqcount * sizeof(uint64_t *))`
 (`search_exact.cc:748`, `search.cc:838`) sizes an array of `uint64_t` using
@@ -678,18 +691,18 @@ exceed an undersized `kmerhashsize`, giving out-of-bounds writes to
 
 #### S14. UDB header/length tables stored as `std::vector<int>` for unsigned 32-bit file values (Medium)
 
-**Re-confirm (2026-07-02): largely addressed.** Both containers are now
-**unsigned**: `std::vector<unsigned int> header_index(seqcount + 1)`
-(`udb.cc:414`) and `std::vector<unsigned int> sequence_lengths(seqcount)`
-(`udb.cc:453`), and each value is validated before use — header offsets against
-`[last, udb_headerchars)` with a `headerlen` overflow guard (`udb.cc:424–433`)
-and sequence lengths with a matching `INT_MAX − headroom` guard (`udb.cc:465`).
-That is the storage-type + validation fix prescribed below, and it removes the
-type-level root cause under S3 and S9. What the recommendation below still asks
-for that is *not* yet done: nothing further of substance — the `header_index[i+1]
-== current_index` (equal-offset) case is handled by the S3 `headerlen` guard
-rather than an explicit `>` reject, which is worth tidying for clarity. Original
-analysis below (the cited `vector<int>` sites are now stale).
+**Status: FIXED.** Both containers are `std::vector<unsigned int>`
+(`header_index`, `sequence_lengths`), so top-bit-set file values are no longer
+read as negative `int`, and each value is validated before use — header offsets
+against `[last, udb_headerchars)` plus a `headerlen` overflow guard, and sequence
+lengths with a matching `INT_MAX − headroom` guard. That storage-type + validation
+fix removes the type-level root cause under S3 and S9. The one remaining tidy-up
+this entry used to note — an *explicit* strictly-increasing (`>`) offset reject
+instead of relying on the downstream `headerlen` guard — landed with the S3 fix
+(`9bc4e4d`): `if (header_index[i + 1] <= current_index) fatal(...)`. Nothing left
+(the `header_index[seqcount]` `uint64_t`→`uint32_t` store is inherent to the
+32-bit on-disk offset format, an S5-family width point, not the signedness issue
+S14 is about). Original analysis below (the cited `vector<int>` sites are stale).
 
 `udb_read` reads the per-sequence header offsets and lengths straight from the
 file into **signed** containers: `std::vector<int> header_index(seqcount + 1)`
@@ -839,6 +852,13 @@ Valgrind will flag it).
 
 #### S21. `derep_prefix` hash mask declared `int` while the table size is `int64_t` → OOB at extreme scale (latent)
 
+**Status: FIXED (already in current source).** `hash_mask` is now
+`uint64_t const hash_mask = static_cast<uint64_t>(hashtablesize - 1)`
+(`derep_prefix.cc:208`), matching the `int64_t hashtablesize`, so it no longer
+truncates to a negative `int` at 2³¹ buckets; the `hashtable[hash & hash_mask]`
+indices (`:270`, `:309`) stay confined. The entry below described the old `int`
+mask (doc was stale). Original analysis below.
+
 `derep_prefix` grows `int64_t hashtablesize` by `<<= 1` until `3*dbsequencecount
 <= 2*hashtablesize` (`derep_prefix.cc:198–202`), then truncates it into `int const
 hash_mask = hashtablesize - 1` (`derep_prefix.cc:203`). Once the table reaches
@@ -855,6 +875,11 @@ prefix-only.
   *verified (overflow path); latent (trigger)* · narrowing family, distinct from N1(c).
 
 #### S22. Non-finite CLI floats (NaN) bypass range validation → NaN→`uint64_t` cast UB (Low)
+
+**Status: FIXED (`4198319`).** `args_getdouble` (now `cli.cc`) rejects non-finite
+values with a `std::isfinite` check, so both `nan` and `inf` fail with "Illegal
+option argument" for every float option at once. Verified: `--sample_pct nan` /
+`inf` rejected; valid values still parse. Original analysis below.
 
 `args_getdouble` uses `sscanf("%lf")` (`vsearch.cc:763`), which accepts `nan`/`inf`.
 Range checks of the form `if ((x < lo) or (x > hi))` are **false for NaN** (every
@@ -935,24 +960,60 @@ last position, writing past the whole allocation. The default `qmin = 0` masks i
 - **Effort:** Low–Medium · **Impact:** High (heap OOB write) · **Criticality:**
   High · *verified (row width vs raw-`qual` index)*.
 
-#### S25. `build_sam_strings` walks the CIGAR into the sequences with no length bound (latent)
+#### S25. `build_sam_strings` walks the CIGAR into the sequences with no length bound — **Fixed** (`60d309a`)
 
-`build_sam_strings` (`results.cc:753–852`) parses a hit's CIGAR (`12M3I…`) and,
+`build_sam_strings` (`results.cc`) parses a hit's CIGAR (`12M3I…`) and,
 per op, advances `qpos`/`tpos` and reads `queryseq[qpos]` / `targetseq[tpos]`
 with **no check that the positions stay within the sequence lengths** —
-correctness rests entirely on the CIGAR's run-lengths summing to exactly the
-sequence lengths. The `sscanf(p, "%d%n", …)` return is also unchecked. Safe today
-because the CIGAR is produced by the in-tree aligner consistently with the
-sequences; becomes an over-read only if a CIGAR/sequence pairing is ever
-corrupted (e.g. a stale `nwalignment`, or mismatched lengths from a crafted DB).
+correctness rested entirely on the CIGAR's run-lengths summing to exactly the
+sequence lengths. The `sscanf(p, "%d%n", …)` return was also unchecked. Safe
+today because the CIGAR is produced by the in-tree aligner consistently with the
+sequences; became an over-read only if a CIGAR/sequence pairing were corrupted
+(e.g. a stale `nwalignment`, or mismatched lengths from a crafted DB).
 
-- **Reachability:** latent (no user-triggered overflow on well-formed input today).
-- **Fix:** pass query/target lengths and clamp/`fatal()` on `qpos`/`tpos` overrun;
-  check the `sscanf` return.
+- **Fix (applied):** `build_sam_strings` now takes `queryseqlen`/`targetseqlen`
+  (query length via `std::strlen` of the emitted query, target via
+  `db_getsequencelen` — both at the single call site, no cross-file signature
+  churn) and `fatal()`s before any op walks past the end. The bound is per-op,
+  not uniform: `'M'` advances both positions (checks both), `'D'` only the query,
+  `'I'` only the target, so each op is bounded against exactly what it reads. A
+  negative run length is rejected, and the `sscanf` return is checked (a missing
+  run-length number keeps the intended implicit run of 1). No behaviour change on
+  well-formed input — SAM `M`/`D`/`I` output and MD strings verified identical.
 - **Effort:** Medium · **Impact:** Medium · **Criticality:** Medium ·
-  *latent; verified (no bound)* · same family as S4/S5 (length used without a check).
+  **Fixed** · same family as S4/S5 (length used without a check).
 
 #### S26. SHA-1/MD5 transform: write-through-`const` and unaligned type-punning (UB)
+
+**Status: NOT REACHABLE in vsearch's usage — no code change (vendored files left
+pristine).** The UB in the vendored `sha1.c`/`md5.c` is real *in isolation*, but
+vsearch never triggers its consequences: both hashes are only ever called via
+`get_hex_seq_digest_{sha1,md5}` (`util.cc`), which first copies the sequence into
+a fresh, per-call `std::vector<char> normalized` and hashes *that*. So (a) the
+`const`-cast write-back mutates a throwaway, non-`const` buffer (not the caller's
+data — no observable corruption, and the object is not actually `const`), and (b)
+`std::vector` storage is `max_align_t`-aligned, so the `uint32_t` block accesses
+are aligned — the "misaligned access" never happens. The only residual is the
+`union`/reinterpret type-pun itself, which is universally supported and present
+in essentially every MD5/SHA-1.
+
+**Thread-safety is the reason NOT to "fix" this by enabling `SHA1HANDSOFF`.** SHA-1
+*is* computed from worker threads: `search_thread_run` (ThreadRunner worker) →
+`search_query` → `search_output_results` → relabel → `get_hex_seq_digest_sha1`
+runs concurrently for `--relabel_sha1` (e.g. `--usearch_global … --matched …
+--relabel_sha1 --threads N`; cluster differs — it relabels on the main thread
+after each round's join). The current vendored code is thread-safe (each call has
+its own `SHA1_CTX` and uses its own per-call `normalized` vector as the block
+workspace). Defining `SHA1HANDSOFF` switches to a **`static uint8_t
+workspace[64]`** shared across all threads — a data race that would corrupt
+digests under concurrent relabel. An earlier attempt to "fix" S26 by defining
+`SHA1HANDSOFF` (and disabling the MD5 fast path) was reverted for exactly this
+reason; see the vendored-code note below. **Alternatives** (system libcrypto,
+swapping the vendored files) aren't worth it: libcrypto adds a dependency vsearch
+avoids, and these do a non-security labelling job correctly.
+
+Original analysis below (the UB it describes is accurate for the code in
+isolation; the reachability caveats above are what make it a non-issue here).
 
 `SHA1_Transform` (`sha1.c:137`) is compiled with `SHA1HANDSOFF` **undefined**
 (it is commented out, `sha1.c:87`), so the `#else` path runs `block =
@@ -977,7 +1038,7 @@ clean by contrast — it uses `memcpy` (`Fetch32`/`Fetch64`).
   (SHA1HANDSOFF off; const-cast write-through; unaligned cast)* · related P1 (the
   endianness FIXME on the same line is a different aspect).
 
-#### S27. zlib/bzip2 loaded by bare soname at runtime — library-search-path trust (Low; Windows DLL-planting)
+#### S27. zlib/bzip2 loaded by bare soname at runtime — library-search-path trust — **Fixed** (`f5f7079`, Windows path)
 
 `.gz`/`.bz2` support is provided by `dlopen`/`LoadLibrary` of the compression
 libraries at runtime, by **bare name**: on Linux `dlopen("libz.so.1", …)` /
@@ -998,16 +1059,25 @@ symbols are called on user input.
   `zlib1.dll` / `libbz2.dll` into enables classic **DLL planting** → arbitrary code
   in the vsearch process. The first `--gzip_decompress`/auto-sniffed `.gz` input
   triggers the load.
-- **Fix direction:** on Windows, load with an absolute path (resolve next to the
-  executable) and/or call `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 |
-  …)` / pass `LOAD_LIBRARY_SEARCH_*` flags to `LoadLibraryEx`; on POSIX the bare
-  soname is acceptable. (Cross-ref the E9 `dynlibs` entry, which covers the dead
-  `gz*_p` declarations, the silent-when-absent behaviour, and the double-open
-  handle leak — distinct, non-security aspects of the same file.)
+- **Fix (applied):** the two Windows `LoadLibraryA` calls (`dynlibs.cc`) now use
+  `LoadLibraryExA(name, nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)`, which
+  restricts the search to the application directory, any `AddDllDirectory` dirs,
+  and System32 — **never** the current directory — matching how the compression
+  DLLs are shipped (bundled next to `vsearch.exe`). The flag is present on
+  Windows 8+ (Vista/7 with KB2533623) and is `#define`d locally if the build SDK
+  headers predate it. The POSIX `dlopen` branch is untouched (a plain soname
+  never searches CWD). **Smoke-tested under Wine** — the Windows binary loads the
+  bundled `zlib1.dll`/`libbz2.dll` and decompresses `.gz`/`.bz2` input
+  successfully with the restricted search flag, confirming the tighter flag does
+  not break normal (bundled-DLL) loading. There is still **no Windows CI target**,
+  so real-Windows search-order behaviour is not exercised in CI. (Cross-ref the
+  E9 `dynlibs` entry, which covers the
+  dead `gz*_p` declarations, the silent-when-absent behaviour, and the
+  double-open handle leak — distinct, non-security aspects of the same file.)
 - **Type:** Security (untrusted library load) · **Effort:** Low ·
   **Impact:** Low (POSIX) / Medium (Windows) · **Criticality:** Low ·
-  *verified (bare-name load); Windows search-order risk by construction, no Windows
-  CI target* · cross-ref E9.
+  **Fixed** (Windows load path hardened; POSIX unchanged; Wine smoke-test
+  passed) · cross-ref E9.
 
 ### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
 
@@ -2325,28 +2395,32 @@ whose empty vector is not all-zero-bits. The correct reset is value-init /
   or value-initialize the struct; never `memset` a type with `std::vector` members.
 - **Effort:** Low–Medium · **Impact:** Medium · **Criticality:** Low–Medium · *verified*
 
-### ST2. `printf`-family format/argument signedness mismatches (batch)
+### ST2. `printf`-family format/argument signedness mismatches (batch) — **Fixed**
 
-cppcheck pinpoints ~13 sites where a `%u`/`%d` conversion does not match the
-argument's signedness — concrete instances of the **P1(a)** width/sign family:
+Signed/unsigned mismatches between a `printf` conversion specifier and its
+argument — concrete instances of the **P1(a)** width/sign family. The original
+one-off cppcheck line-list (chimera/fasta/fastq/orient/sff_convert/udb, ~13
+sites) had drifted against the current tree; the authoritative set is now
+whatever GCC `-Wformat-signedness` flags. That set was swept to zero across the
+whole source tree. Fixed sites, by file, each keeping the argument type and
+matching the specifier:
 
-| File:line | Mismatch |
-|-----------|----------|
-| `chimera.cc:2522, 2534, 2552, 2562` | `%u` ← signed `int` |
-| `fasta.cc:537`, `fastq.cc:719` | `%u` ← signed `int` |
-| `orient.cc:430` (×2) | `%d` ← `unsigned int` |
-| `sff_convert.cc:402` (×2), `:445`, `:452` | `%d` ← `unsigned int` |
-| `sha1.c:125` (×2) | `%d` ← `unsigned int` |
-| `udb.cc:725, 872` | `%u` ← signed `int` |
+| File | Fix |
+|------|-----|
+| `derep.cc`, `derep_smallmem.cc` | min/max lengths (`int64_t`) → `PRId64`; discarded counts, unique-sequence / uniques-written / clusters-discarded counts and the uc cluster index `i` (all `uint64_t`) → `PRIu64` |
+| `fastq_mergepairs.cc` | Pairs / Merged / Not merged totals (`int64_t`) → `PRId64` |
+| `msa.cc` | alignment-profile counts (`prof_type == uint64_t`) → `PRIu64` |
+| `results.cc` | SAM FLAG and MAPQ `int` expressions → `%d` |
+| `udb.cc` | Word width / Word ones (`opt_wordlength`, `int64_t`) → `PRId64` |
 
-Benign for in-range values on LP64 (where `int` and `unsigned` share a width),
-but a signed/unsigned format mismatch is technically UB and trivially fixed by
-matching the specifier. Also in this group: `fastx.cc:175` passes three
-arguments to a `format` that one caller fills with only two conversions
-(`wrongPrintfScanfArgNum`) — the extra argument is evaluated and ignored, so it
-is harmless, but worth aligning.
+A signed/unsigned conversion mismatch is technically UB even when benign for
+in-range values on LP64 (where `int` and `unsigned` share a width); matching the
+specifier removes it. The vendored `sha1.c` `%d` sites from the old list are now
+under `#ifdef VERBOSE` (not compiled) and left untouched. `fastx.cc:175`
+(`wrongPrintfScanfArgNum` — one caller supplies an extra, ignored argument) was
+harmless and no longer flagged; left as-is.
 
-- **Effort:** Low · **Impact:** Low · **Criticality:** Low · *verified*
+- **Effort:** Low · **Impact:** Low · **Criticality:** Low · **Fixed** (`-Wformat-signedness` clean tree-wide)
 
 ### Notable false positives (recorded — no action)
 
@@ -2841,27 +2915,27 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S5 | 64-bit length → `int` truncation in print path | Security | Medium | Medium | Low | Fixed (reachable defects closed; Tier 2 typing cosmetic, Tier 3 skipped) |
 | S6 | UDB additive allocation size unchecked | Security | Low | Medium | Low | Fixed (`63ab55a`) — additive `datap` sizes now routed through an overflow-checked helper |
 | S7 | `xmalloc`/`xrealloc` no overflow check; `count*size` callers | Security | Low | Medium | Low | Not a bug (64-bit only) — `count*size` products can't overflow 64-bit `size_t`; the real residual (library-path `opt_maxaccepts/maxrejects`→`tophits` truncation, a correctness issue) is Band 5 C1(e) |
-| S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low | Latent |
+| S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low | Not reachable — callers pass non-zero ×64 by contract; also vendored (`src/vendored/md5.c`), so left pristine |
 | S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low | Fixed (`9bc4e4d`) — `seqcount` now bounded by `filesize/4`, closing the `seqcount+1` wrap |
-| S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low | Latent |
+| S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low | Not a bug on 64-bit — `sizeof(uint64_t*) == sizeof(uint64_t) == 8` (exact fit); optional cosmetic `sizeof` fix |
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Bug | Low | Low | Low | Fixed (`3946769`) |
 | S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium | Pending |
-| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Largely addressed (re-confirm 2026-07-02: `header_index`/`sequence_lengths` are now `std::vector<unsigned int>` with per-entry region validation at `udb.cc:424`/`465`; closes the root cause under S3/S9) |
+| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Fixed — tables are `std::vector<unsigned int>` with per-entry region validation; the last tidy-up (explicit strictly-increasing offset reject) landed in `9bc4e4d` |
 | S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med | Fixed (`9d7f242`) |
 | S16 | UDB `kmerindexsize` summed from unchecked file counts, no consistency check | Security | Low | Medium | Low–Med | Fixed (`63ab55a`) — overflow-checked sum + reject total > `filesize/4` |
 | S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium | Pending |
 | S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium | Pending |
 | S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium | Needs-confirm |
 | S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Bug | Low | Low–Med | Medium | Fixed (`cb12ba7`) |
-| S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Latent |
-| S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Pending |
+| S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Fixed — `hash_mask` is now `uint64_t` (`derep_prefix.cc:208`), matching `hashtablesize` |
+| S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Fixed (`4198319`) — `std::isfinite` guard in `args_getdouble` |
 | S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Bug | Low | High | High | Fixed (`94ed5fe`) |
 | S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Fixed (`6740721`) |
-| S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium | Latent |
-| S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Pending |
-| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
+| S25 | `build_sam_strings` walks CIGAR into sequences with no length bound | Security | Medium | Medium | Medium | Fixed (`60d309a`) — per-op bounds + `fatal()`, `sscanf` return checked |
+| S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Not reachable in vsearch usage (no code change) — hashing runs on a fresh heap-aligned `std::vector` copy; vendored code is thread-safe as-is. **Do NOT enable `SHA1HANDSOFF`** (its `static` workspace would race — SHA-1 runs in search workers) |
+| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Fixed (`f5f7079`) — `LoadLibraryEx` + `SEARCH_DEFAULT_DIRS`; Wine smoke-test passed (no Windows CI) |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
-| ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low | Latent |
+| ST2 | `printf` format/arg signedness mismatches (batch) | Static analysis | Low | Low | Low | Fixed (`302b365`) — `-Wformat-signedness` clean tree-wide |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (3 sites `310e7de`+`6dbba98`; `rereplicate.cc` sibling `273c40d`) | Bug | Low | Low–Med | Medium | Fixed |
 | B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`, `bb45598`) | Bug | Low | Low | Low | Fixed |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med | Fixed (`e9405c6`) |
@@ -3032,11 +3106,23 @@ Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.
   additive `datap` alloc).~~ **DONE** — the whole UDB validate-on-load cluster
   (S1/S6/S16, then S3/S9, with S14 already in) is fixed; see the update callout
   above.
-- **S25** (CIGAR walk bound), **S22** (`std::isfinite` in `args_getdouble`), **S26**
-  (SHA-1/MD5 const-write-through UB), **S27** (Windows DLL-planting load path),
-  ~~**S7**~~ (not a bug on 64-bit — see callout) /**S8**/**S11**/**S21** (latent
-  overflow/scale), **ST2** (format signedness). The shared "validate-on-load"
-  helpers in the note below cover most of these at once.
+- ~~**S25**~~ (fixed — per-op CIGAR bounds + `fatal()` in `build_sam_strings`,
+  `60d309a`), ~~**S22**~~ (done — `std::isfinite` in
+  `args_getdouble`, `4198319`), ~~**S26**~~ (not reachable in vsearch usage —
+  vendored code left pristine; hashing runs on a fresh aligned copy and is
+  thread-safe as-is, and `SHA1HANDSOFF` must stay off — see callout),
+  ~~**S27**~~ (fixed — `LoadLibraryEx` + `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`,
+  `f5f7079`; no Windows CI), ~~**S7**~~ (not a bug on 64-bit),
+  ~~**S21**~~ (fixed — `hash_mask` now `uint64_t`), ~~**S8**~~ (not reachable +
+  vendored), ~~**S11**~~ (not a bug on 64-bit — exact-fit), ~~**ST2**~~ (fixed —
+  `-Wformat-signedness` clean tree-wide, `302b365`). **Band 4 is now fully
+  swept** — every finding is fixed, reclassified as a non-bug on the supported
+  64-bit build, or (S26) shown not reachable in vsearch's usage. The one
+  platform item, **S27** (Windows DLL-planting), is hardened in source
+  (`f5f7079`) and **smoke-tested under Wine** (bundled-DLL load + `.gz`/`.bz2`
+  decompression confirmed working with the restricted search flag). The residual
+  caveat is only that there is **no Windows CI target**, so real-Windows
+  search-order behaviour is not exercised in CI.
 
 ### Band 5 — Library-API correctness & lifecycle
 
@@ -3121,7 +3207,7 @@ for. Each is scoped as separate, tool-driven effort, not part of this review.
    Two properties make vsearch unusually fuzz-friendly: `-fno-exceptions` plus
    `fatal()`→`std::exit()` means every malformed-input path is either a clean exit
    or a memory bug (no exception noise), and ASan instrumentation turns the
-   latent/needs-confirmation S-items (S3, S6, S9, S16, S19, S25) into crashing
+   latent/needs-confirmation S-items (S3, S6, S9, S16, S19) into crashing
    repros or clears them. The sanitizer CI runs only **well-formed** inputs (its
    own caveat), so this is the natural way to reach the S1–S4/S14–S19 crafted-input
    class.
