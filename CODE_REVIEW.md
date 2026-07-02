@@ -856,6 +856,11 @@ prefix-only.
 
 #### S22. Non-finite CLI floats (NaN) bypass range validation → NaN→`uint64_t` cast UB (Low)
 
+**Status: FIXED (`4198319`).** `args_getdouble` (now `cli.cc`) rejects non-finite
+values with a `std::isfinite` check, so both `nan` and `inf` fail with "Illegal
+option argument" for every float option at once. Verified: `--sample_pct nan` /
+`inf` rejected; valid values still parse. Original analysis below.
+
 `args_getdouble` uses `sscanf("%lf")` (`vsearch.cc:763`), which accepts `nan`/`inf`.
 Range checks of the form `if ((x < lo) or (x > hi))` are **false for NaN** (every
 NaN comparison is false), so a NaN passes validation. Concrete instance:
@@ -953,6 +958,36 @@ corrupted (e.g. a stale `nwalignment`, or mismatched lengths from a crafted DB).
   *latent; verified (no bound)* · same family as S4/S5 (length used without a check).
 
 #### S26. SHA-1/MD5 transform: write-through-`const` and unaligned type-punning (UB)
+
+**Status: NOT REACHABLE in vsearch's usage — no code change (vendored files left
+pristine).** The UB in the vendored `sha1.c`/`md5.c` is real *in isolation*, but
+vsearch never triggers its consequences: both hashes are only ever called via
+`get_hex_seq_digest_{sha1,md5}` (`util.cc`), which first copies the sequence into
+a fresh, per-call `std::vector<char> normalized` and hashes *that*. So (a) the
+`const`-cast write-back mutates a throwaway, non-`const` buffer (not the caller's
+data — no observable corruption, and the object is not actually `const`), and (b)
+`std::vector` storage is `max_align_t`-aligned, so the `uint32_t` block accesses
+are aligned — the "misaligned access" never happens. The only residual is the
+`union`/reinterpret type-pun itself, which is universally supported and present
+in essentially every MD5/SHA-1.
+
+**Thread-safety is the reason NOT to "fix" this by enabling `SHA1HANDSOFF`.** SHA-1
+*is* computed from worker threads: `search_thread_run` (ThreadRunner worker) →
+`search_query` → `search_output_results` → relabel → `get_hex_seq_digest_sha1`
+runs concurrently for `--relabel_sha1` (e.g. `--usearch_global … --matched …
+--relabel_sha1 --threads N`; cluster differs — it relabels on the main thread
+after each round's join). The current vendored code is thread-safe (each call has
+its own `SHA1_CTX` and uses its own per-call `normalized` vector as the block
+workspace). Defining `SHA1HANDSOFF` switches to a **`static uint8_t
+workspace[64]`** shared across all threads — a data race that would corrupt
+digests under concurrent relabel. An earlier attempt to "fix" S26 by defining
+`SHA1HANDSOFF` (and disabling the MD5 fast path) was reverted for exactly this
+reason; see the vendored-code note below. **Alternatives** (system libcrypto,
+swapping the vendored files) aren't worth it: libcrypto adds a dependency vsearch
+avoids, and these do a non-security labelling job correctly.
+
+Original analysis below (the UB it describes is accurate for the code in
+isolation; the reachability caveats above are what make it a non-issue here).
 
 `SHA1_Transform` (`sha1.c:137`) is compiled with `SHA1HANDSOFF` **undefined**
 (it is commented out, `sha1.c:87`), so the `#else` path runs `block =
@@ -2854,11 +2889,11 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium | Needs-confirm |
 | S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Bug | Low | Low–Med | Medium | Fixed (`cb12ba7`) |
 | S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Latent |
-| S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Pending |
+| S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Fixed (`4198319`) — `std::isfinite` guard in `args_getdouble` |
 | S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Bug | Low | High | High | Fixed (`94ed5fe`) |
 | S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Fixed (`6740721`) |
 | S25 | `build_sam_strings` walks CIGAR into sequences with no length bound (latent) | Security | Medium | Medium | Medium | Latent |
-| S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Pending |
+| S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Not reachable in vsearch usage (no code change) — hashing runs on a fresh heap-aligned `std::vector` copy; vendored code is thread-safe as-is. **Do NOT enable `SHA1HANDSOFF`** (its `static` workspace would race — SHA-1 runs in search workers) |
 | S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
 | ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low | Latent |
@@ -3032,11 +3067,14 @@ Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.
   additive `datap` alloc).~~ **DONE** — the whole UDB validate-on-load cluster
   (S1/S6/S16, then S3/S9, with S14 already in) is fixed; see the update callout
   above.
-- **S25** (CIGAR walk bound), **S22** (`std::isfinite` in `args_getdouble`), **S26**
-  (SHA-1/MD5 const-write-through UB), **S27** (Windows DLL-planting load path),
-  ~~**S7**~~ (not a bug on 64-bit — see callout) /**S8**/**S11**/**S21** (latent
-  overflow/scale), **ST2** (format signedness). The shared "validate-on-load"
-  helpers in the note below cover most of these at once.
+- **S25** (CIGAR walk bound), ~~**S22**~~ (done — `std::isfinite` in
+  `args_getdouble`, `4198319`), ~~**S26**~~ (not reachable in vsearch usage —
+  vendored code left pristine; hashing runs on a fresh aligned copy and is
+  thread-safe as-is, and `SHA1HANDSOFF` must stay off — see callout), **S27**
+  (Windows DLL-planting load path), ~~**S7**~~ (not a bug on 64-bit — see callout)
+  /**S8**/**S11**/**S21** (latent overflow/scale), **ST2** (format signedness).
+  Remaining Band 4: crafted-input latents (S25/S21/S27, best via Band 8 fuzzing)
+  plus benign/not-reachable items (S8/S11/S26/ST2).
 
 ### Band 5 — Library-API correctness & lifecycle
 
