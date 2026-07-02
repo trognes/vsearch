@@ -184,6 +184,18 @@ buffer).
 
 #### S3. UDB header-length underflow → ~4 GB `headerlen` (High)
 
+**Re-confirm (2026-07-02): likely mitigated.** The validation loop still rejects
+only strictly-decreasing indices (`current_index < last`, now `udb.cc:424`), so
+equal consecutive indices still pass and `headerlen` still underflows to
+`0xFFFFFFFF`. But that value no longer flows into the header reads: `headerlen`
+is `unsigned int` (`db.h:81`) and the guard added at `udb.cc:430`
+(`static_cast<int64_t>(seqindex[i].headerlen) > INT_MAX − buffer_headroom →
+fatal`) rejects the underflowed `0xFFFFFFFF`, and monotonicity plus the
+`current_index >= udb_headerchars` reject bound every other case ≥ 0. The clean
+fix (reject equal, or bound against the header region) is still worth landing for
+clarity, and this wants a crafted-file regression test to lock it in. Original
+analysis below.
+
 In `udb_read` (`udb.cc:420`), `headerlen = header_index[i+1] - current_index - 1`.
 The validation loop rejects only *strictly* decreasing indices
 (`current_index < last`, `udb.cc:415`), so **equal consecutive header indices
@@ -495,6 +507,12 @@ itself is correct; only the print interface narrows.
 
 #### S6. Unchecked additive allocation size in UDB load (Medium)
 
+**Re-confirm (2026-07-02): still open, unchanged** — now at `udb.cc:441`. The
+additive `xmalloc(udb_headerchars + nucleotides + seqcount)` still has no
+overflow guard; gated in practice by the `largeread` file-size checks (a wrap
+needs a crafted/padded file). Prime candidate for the shared "validate-on-load"
+helper. Original analysis below.
+
 `datap = xmalloc(udb_headerchars + nucleotides + seqcount)` (`udb.cc:428`)
 sums three file-derived 64-bit values with no overflow guard; a wrap yields an
 undersized buffer that the following `largeread`/`memmove` would overflow. In
@@ -504,6 +522,18 @@ and a final `pos == filesize` check exists), so hard to hit, but unguarded.
 - **Effort:** Low · **Impact:** Medium · **Criticality:** Low · *needs-confirmation (gated by file size)*
 
 #### S7. Allocation wrappers do no overflow checking; callers pass `count * size` (Low–Medium)
+
+**Re-confirm (2026-07-02): partially mitigated.** The wrappers themselves still
+do no overflow checking (`arch.cc:188` `xmalloc` / `:209` `xrealloc` — only floor
+at 1 and null-check). But the two flagged hot callers were since hardened with
+explicit wide casts that defuse the 32-bit multiply: `search16` uses
+`2 * static_cast<uint64_t>(s->qlen) * sizeof(...)` (`align_simd.cc:1372/1379`),
+and `chimera_detect_batch` uses `static_cast<size_t>(nthreads) * sizeof(ptr)`
+with `nthreads = std::max(1, ...)` (`chimera.cc:2960/2936`). Residual gap:
+`minheap_init(int size)` (`minheap.cc:148`) still takes a **signed `int`** and
+casts `static_cast<size_t>(size) * sizeof(elem_t)` without rejecting a
+non-positive `size`. So S7 reduces to (a) an overflow-checked wrapper as a net,
+and (b) `minheap_init` taking/validating a `size_t`. Original analysis below.
 
 `xmalloc`/`xrealloc` (`arch.cc:220–255`) only enforce a minimum size of 1 and
 a non-null result — **no overflow detection**. So any `count * sizeof(T)`
@@ -541,6 +571,15 @@ internal guard on its contract.
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low · *latent, not reachable*
 
 #### S9. `seqcount + 1` vector sizing can wrap at `UINT_MAX` (Low)
+
+**Re-confirm (2026-07-02): latent, mostly defused.** The container is now
+`std::vector<unsigned int> header_index(seqcount + 1)` (`udb.cc:414`, no longer
+signed — see S14) and each entry is validated against the header region
+(`udb.cc:424`). The `seqcount + 1` wrap itself remains possible in principle
+(`seqcount` is only checked `!= 0`), but it needs `seqcount == 0xFFFFFFFF`, i.e.
+a ~16 GB word/header section, so it is gated by `largeread` first. A one-line
+upper-bound check on `seqcount` would close it outright. Original analysis below
+(the cited `udb.cc:405` / `vector<int>` is now stale).
 
 `std::vector<int> header_index(seqcount + 1)` (`udb.cc:405`) with `seqcount`
 only checked `!= 0`; at `0xFFFFFFFF` the `+1` wraps to 0 and subsequent writes
@@ -629,6 +668,19 @@ exceed an undersized `kmerhashsize`, giving out-of-bounds writes to
 
 #### S14. UDB header/length tables stored as `std::vector<int>` for unsigned 32-bit file values (Medium)
 
+**Re-confirm (2026-07-02): largely addressed.** Both containers are now
+**unsigned**: `std::vector<unsigned int> header_index(seqcount + 1)`
+(`udb.cc:414`) and `std::vector<unsigned int> sequence_lengths(seqcount)`
+(`udb.cc:453`), and each value is validated before use — header offsets against
+`[last, udb_headerchars)` with a `headerlen` overflow guard (`udb.cc:424–433`)
+and sequence lengths with a matching `INT_MAX − headroom` guard (`udb.cc:465`).
+That is the storage-type + validation fix prescribed below, and it removes the
+type-level root cause under S3 and S9. What the recommendation below still asks
+for that is *not* yet done: nothing further of substance — the `header_index[i+1]
+== current_index` (equal-offset) case is handled by the S3 `headerlen` guard
+rather than an explicit `>` reject, which is worth tidying for clarity. Original
+analysis below (the cited `vector<int>` sites are now stale).
+
 `udb_read` reads the per-sequence header offsets and lengths straight from the
 file into **signed** containers: `std::vector<int> header_index(seqcount + 1)`
 (`udb.cc:405`, filled by `largeread`) and `std::vector<int>
@@ -664,6 +716,14 @@ file's own helper.
 - **Effort:** Low · **Impact:** Low–Medium · **Criticality:** Low–Medium · *verified*.
 
 #### S16. UDB `kmerindexsize` summed from unchecked file counts with no consistency check (Low–Medium)
+
+**Re-confirm (2026-07-02): still open, unchanged** — now at `udb.cc:373–393`.
+`kmerindexsize` is `uint64_t` (`dbindex.h:77`), so `4 * kmerindexsize` no longer
+risks a 32-bit multiply wrap, but there is still **no** validation of the
+individual `kmercount[i]` values or the running sum against the actual on-disk
+word-list section; the over-read is gated only by `largeread` (a padded file
+passes). Pairs with the S1 per-entry check and the S6 additive alloc under one
+"validate-on-load" helper. Original analysis below.
 
 `udb_read` reads `kmercount[]` verbatim (`udb.cc:362`) and accumulates
 `kmerindexsize += kmercount[i]` over `kmerhashsize` entries (`udb.cc:365–369`)
@@ -2766,20 +2826,20 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 |----|-------|------|--------|--------|-------------|--------|
 | S1 | UDB `kmerindex` seqno → OOB heap write (`bitmap_set`) | Security | Low | High | High | Pending |
 | S2 | SFF clip-offset underflow → OOB read (`--sff_clip`) | Security | Low | Med–High | Med–High | Fixed (`9d7f242`) |
-| S3 | UDB header-length underflow → ~4 GB `headerlen` | Security | Low | Medium | Medium | Pending |
+| S3 | UDB header-length underflow → ~4 GB `headerlen` | Security | Low | Medium | Medium | Likely mitigated (re-confirm 2026-07-02: the equal-index underflow to `0xFFFFFFFF` is now caught by the `headerlen > INT_MAX − headroom` guard at `udb.cc:430`; wants a regression test) |
 | S4 | `--subseq_start` unbounded → OOB read | Bug | Low | Medium | Medium | Fixed (`1592fcb`) |
 | S10 | Hit-list alloc vs. index-bound mismatch (cluster/search) | Bug | Low | High | Medium | Fixed (`60cfb40`) |
 | S5 | 64-bit length → `int` truncation in print path | Security | Medium | Medium | Low | Fixed (reachable defects closed; Tier 2 typing cosmetic, Tier 3 skipped) |
-| S6 | UDB additive allocation size unchecked | Security | Low | Medium | Low | Needs-confirm |
-| S7 | `xmalloc`/`xrealloc` no overflow check; `count*size` callers | Security | Low | Medium | Low | Needs-confirm |
+| S6 | UDB additive allocation size unchecked | Security | Low | Medium | Low | Needs-confirm (re-confirm 2026-07-02: still open at `udb.cc:441`, unchanged; gated by `largeread` file-size checks) |
+| S7 | `xmalloc`/`xrealloc` no overflow check; `count*size` callers | Security | Low | Medium | Low | Partially mitigated (re-confirm 2026-07-02: `search16`/`ci_array` hot callers now use explicit 64-bit/`size_t` casts; residual = unchecked wrappers + signed `int` `minheap_init`) |
 | S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low | Latent |
-| S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low | Needs-confirm |
+| S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low | Latent (re-confirm 2026-07-02: storage now `std::vector<unsigned int>` at `udb.cc:414` + per-entry offset validation; only the `seqcount+1` wrap remains, gated by ~16 GB file size) |
 | S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low | Latent |
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Bug | Low | Low | Low | Fixed (`3946769`) |
 | S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium | Pending |
-| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Pending |
+| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Largely addressed (re-confirm 2026-07-02: `header_index`/`sequence_lengths` are now `std::vector<unsigned int>` with per-entry region validation at `udb.cc:424`/`465`; closes the root cause under S3/S9) |
 | S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med | Fixed (`9d7f242`) |
-| S16 | UDB `kmerindexsize` summed from unchecked file counts, no consistency check | Security | Low | Medium | Low–Med | Needs-confirm |
+| S16 | UDB `kmerindexsize` summed from unchecked file counts, no consistency check | Security | Low | Medium | Low–Med | Needs-confirm (re-confirm 2026-07-02: still open at `udb.cc:373–393`; `kmerindexsize` is `uint64_t` so no multiply wrap, but no count/sum consistency check vs the on-disk word list; gated by `largeread`) |
 | S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium | Pending |
 | S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium | Pending |
 | S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium | Needs-confirm |
@@ -2943,6 +3003,17 @@ disks mid-run. Not adversarial, but they corrupt science silently:
 
 Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.sff`
 — outside the practical threat model for this tool. Worth doing, low urgency:
+
+> **Re-confirm (2026-07-02).** The UDB set has partly closed since this plan was
+> written: **S14** is now largely done (header/length tables are `unsigned int`
+> with per-entry region validation), which mitigated **S3** (equal-index
+> underflow caught by the `headerlen > INT_MAX − headroom` guard) and mostly
+> defused **S9** (only the `seqcount+1` wrap remains, gated by file size). **S7**
+> is partially mitigated (hot callers now use 64-bit/`size_t` casts; residual is
+> `minheap_init`'s signed `int` + an overflow-checked wrapper). Still fully open:
+> **S1** (per-entry OOB write), **S6** (additive `datap` alloc), **S16** (kmer
+> count/sum consistency). See each entry's re-confirm note for line-accurate
+> status.
 
 - **S1** (the most serious — OOB *write* from a crafted `.udb`), bundled with the UDB
   type/validation set **S3/S9/S14/S16** (switch tables to `uint32_t`, validate
