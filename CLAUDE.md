@@ -20,7 +20,7 @@ and complicates upstream cherry-picks — keep commits small and readable.
 ## Build
 
 ```bash
-./configure CFLAGS="-O2" CXXFLAGS="-O2"
+./configure CFLAGS="-O3" CXXFLAGS="-O3"
 make ARFLAGS="cr"            # produces bin/vsearch
 ```
 
@@ -36,8 +36,12 @@ make ARFLAGS="cr"            # produces bin/vsearch
   version rewrites every file's version stamp, so match it.
 - C++11 with **`-fno-exceptions`** — there is no exception-based error handling
   anywhere (see `fatal()` below).
-- `-O3` is safe but note: `align_simd.cc` carries a pragma disabling
-  `-ftree-partial-pre`, which miscompiles the aligner on GCC ≥ 9.
+- `-O3` is the recommended level and is safe. The historical GCC ≥ 9 `-O3`
+  miscompile of `align_simd.cc` (issue #589) was a strict-aliasing bug — SIMD
+  vector lanes were punned through a reinterpreted pointer — fixed at the root in
+  commit `32a3dd2` by accessing lanes via `std::memcpy` (`get_channel`/
+  `set_channel`); the old `-fno-tree-partial-pre` workaround was then removed.
+  Don't reintroduce raw `(CELL *)`/`(short *)` lane access in `align_simd.cc`.
 - zlib/bzip2 are optional and **loaded dynamically at runtime** (`dynlibs.cc`)
   for `.gz`/`.bz2` input; disable with `--disable-zlib` / `--disable-bzip2`.
 
@@ -315,7 +319,7 @@ git fetch upstream                                 # refresh upstream's tip
 git fetch origin <dev-branch>                      # get Claude's commit from the fork
 git switch -c fix/short-name upstream/master       # clean branch off upstream, not the fork
 git cherry-pick <sha-of-fix>                        # lift just the fix commit(s)
-./autogen.sh && ./configure CFLAGS="-O2" CXXFLAGS="-O2" && make ARFLAGS="cr"   # sanity build
+./autogen.sh && ./configure CFLAGS="-O3" CXXFLAGS="-O3" && make ARFLAGS="cr"   # sanity build
 git push -u origin fix/short-name                   # push the clean branch to YOUR fork
 ```
 
