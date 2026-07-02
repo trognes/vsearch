@@ -153,6 +153,17 @@ paths; `riscv64`/`mips64el` and other little-endian targets use the SIMDe
 fallback (`libsimde-dev`). Binary on-disk formats (UDB, SFF) assume a
 little-endian host.
 
+**64-bit only — never built for 32-bit.** Every supported target
+(`x86_64`, `aarch64`, `ppc64le`, `riscv64`, `mips64el`, …) is 64-bit, so
+`size_t`/pointers are 64-bit everywhere vsearch runs. This matters when reasoning
+about allocation overflow: a `count * sizeof(T)` product where `count` is bounded
+by `int` (or an option cap) **cannot** wrap a 64-bit `size_t` — the process
+exhausts memory and `xmalloc`-fatals long before any wrap — so guarding those
+multiplies buys nothing here. What *can* still overflow is the **addition of
+multiple 64-bit values** (e.g. summing file-derived UDB region sizes), which is
+why those additions are overflow-checked (`udb_checked_add`) while the `int`-bounded
+`count*size` multiplies are not.
+
 **I/O flow.** `fastx.cc` sniffs FASTA vs FASTQ and dispatches to `fasta.cc` /
 `fastq.cc`; `results.cc` formats all the output flavours (alnout, userout,
 blast6, uc, SAM). All textual output goes through `fprintf` to `FILE *`.
