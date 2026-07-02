@@ -1066,14 +1066,18 @@ symbols are called on user input.
   DLLs are shipped (bundled next to `vsearch.exe`). The flag is present on
   Windows 8+ (Vista/7 with KB2533623) and is `#define`d locally if the build SDK
   headers predate it. The POSIX `dlopen` branch is untouched (a plain soname
-  never searches CWD). **Not verified by CI — there is no Windows CI target**, so
-  the Windows branch compiles and ships unverified from the fork; needs a manual
-  Windows build/smoke-test. (Cross-ref the E9 `dynlibs` entry, which covers the
+  never searches CWD). **Smoke-tested under Wine** — the Windows binary loads the
+  bundled `zlib1.dll`/`libbz2.dll` and decompresses `.gz`/`.bz2` input
+  successfully with the restricted search flag, confirming the tighter flag does
+  not break normal (bundled-DLL) loading. There is still **no Windows CI target**,
+  so real-Windows search-order behaviour is not exercised in CI. (Cross-ref the
+  E9 `dynlibs` entry, which covers the
   dead `gz*_p` declarations, the silent-when-absent behaviour, and the
   double-open handle leak — distinct, non-security aspects of the same file.)
 - **Type:** Security (untrusted library load) · **Effort:** Low ·
   **Impact:** Low (POSIX) / Medium (Windows) · **Criticality:** Low ·
-  **Fixed** (Windows load path hardened; POSIX unchanged) · cross-ref E9.
+  **Fixed** (Windows load path hardened; POSIX unchanged; Wine smoke-test
+  passed) · cross-ref E9.
 
 ### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
 
@@ -2929,7 +2933,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Fixed (`6740721`) |
 | S25 | `build_sam_strings` walks CIGAR into sequences with no length bound | Security | Medium | Medium | Medium | Fixed (`60d309a`) — per-op bounds + `fatal()`, `sscanf` return checked |
 | S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Not reachable in vsearch usage (no code change) — hashing runs on a fresh heap-aligned `std::vector` copy; vendored code is thread-safe as-is. **Do NOT enable `SHA1HANDSOFF`** (its `static` workspace would race — SHA-1 runs in search workers) |
-| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Fixed (`f5f7079`) — `LoadLibraryEx` + `SEARCH_DEFAULT_DIRS` (no Windows CI) |
+| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Fixed (`f5f7079`) — `LoadLibraryEx` + `SEARCH_DEFAULT_DIRS`; Wine smoke-test passed (no Windows CI) |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
 | ST2 | `printf` format/arg signedness mismatches (batch) | Static analysis | Low | Low | Low | Fixed (`302b365`) — `-Wformat-signedness` clean tree-wide |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (3 sites `310e7de`+`6dbba98`; `rereplicate.cc` sibling `273c40d`) | Bug | Low | Low–Med | Medium | Fixed |
@@ -3115,9 +3119,10 @@ Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.
   swept** — every finding is fixed, reclassified as a non-bug on the supported
   64-bit build, or (S26) shown not reachable in vsearch's usage. The one
   platform item, **S27** (Windows DLL-planting), is hardened in source
-  (`f5f7079`) but carries a caveat: there is **no Windows CI target**, so its
-  Windows branch ships unverified from the fork and wants a manual
-  build/smoke-test before it is fully trusted.
+  (`f5f7079`) and **smoke-tested under Wine** (bundled-DLL load + `.gz`/`.bz2`
+  decompression confirmed working with the restricted search flag). The residual
+  caveat is only that there is **no Windows CI target**, so real-Windows
+  search-order behaviour is not exercised in CI.
 
 ### Band 5 — Library-API correctness & lifecycle
 
