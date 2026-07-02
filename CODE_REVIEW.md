@@ -1038,7 +1038,7 @@ clean by contrast — it uses `memcpy` (`Fetch32`/`Fetch64`).
   (SHA1HANDSOFF off; const-cast write-through; unaligned cast)* · related P1 (the
   endianness FIXME on the same line is a different aspect).
 
-#### S27. zlib/bzip2 loaded by bare soname at runtime — library-search-path trust (Low; Windows DLL-planting)
+#### S27. zlib/bzip2 loaded by bare soname at runtime — library-search-path trust — **Fixed** (`f5f7079`, Windows path)
 
 `.gz`/`.bz2` support is provided by `dlopen`/`LoadLibrary` of the compression
 libraries at runtime, by **bare name**: on Linux `dlopen("libz.so.1", …)` /
@@ -1059,16 +1059,21 @@ symbols are called on user input.
   `zlib1.dll` / `libbz2.dll` into enables classic **DLL planting** → arbitrary code
   in the vsearch process. The first `--gzip_decompress`/auto-sniffed `.gz` input
   triggers the load.
-- **Fix direction:** on Windows, load with an absolute path (resolve next to the
-  executable) and/or call `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 |
-  …)` / pass `LOAD_LIBRARY_SEARCH_*` flags to `LoadLibraryEx`; on POSIX the bare
-  soname is acceptable. (Cross-ref the E9 `dynlibs` entry, which covers the dead
-  `gz*_p` declarations, the silent-when-absent behaviour, and the double-open
-  handle leak — distinct, non-security aspects of the same file.)
+- **Fix (applied):** the two Windows `LoadLibraryA` calls (`dynlibs.cc`) now use
+  `LoadLibraryExA(name, nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)`, which
+  restricts the search to the application directory, any `AddDllDirectory` dirs,
+  and System32 — **never** the current directory — matching how the compression
+  DLLs are shipped (bundled next to `vsearch.exe`). The flag is present on
+  Windows 8+ (Vista/7 with KB2533623) and is `#define`d locally if the build SDK
+  headers predate it. The POSIX `dlopen` branch is untouched (a plain soname
+  never searches CWD). **Not verified by CI — there is no Windows CI target**, so
+  the Windows branch compiles and ships unverified from the fork; needs a manual
+  Windows build/smoke-test. (Cross-ref the E9 `dynlibs` entry, which covers the
+  dead `gz*_p` declarations, the silent-when-absent behaviour, and the
+  double-open handle leak — distinct, non-security aspects of the same file.)
 - **Type:** Security (untrusted library load) · **Effort:** Low ·
   **Impact:** Low (POSIX) / Medium (Windows) · **Criticality:** Low ·
-  *verified (bare-name load); Windows search-order risk by construction, no Windows
-  CI target* · cross-ref E9.
+  **Fixed** (Windows load path hardened; POSIX unchanged) · cross-ref E9.
 
 ### Sanitizer inventory — CI run (ASan + UBSan over the vsearch-tests suite)
 
@@ -2924,7 +2929,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Fixed (`6740721`) |
 | S25 | `build_sam_strings` walks CIGAR into sequences with no length bound | Security | Medium | Medium | Medium | Fixed (`60d309a`) — per-op bounds + `fatal()`, `sscanf` return checked |
 | S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Not reachable in vsearch usage (no code change) — hashing runs on a fresh heap-aligned `std::vector` copy; vendored code is thread-safe as-is. **Do NOT enable `SHA1HANDSOFF`** (its `static` workspace would race — SHA-1 runs in search workers) |
-| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
+| S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Fixed (`f5f7079`) — `LoadLibraryEx` + `SEARCH_DEFAULT_DIRS` (no Windows CI) |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
 | ST2 | `printf` format/arg signedness mismatches (batch) | Static analysis | Low | Low | Low | Fixed (`302b365`) — `-Wformat-signedness` clean tree-wide |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (3 sites `310e7de`+`6dbba98`; `rereplicate.cc` sibling `273c40d`) | Bug | Low | Low–Med | Medium | Fixed |
@@ -3101,14 +3106,18 @@ Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.
   `60d309a`), ~~**S22**~~ (done — `std::isfinite` in
   `args_getdouble`, `4198319`), ~~**S26**~~ (not reachable in vsearch usage —
   vendored code left pristine; hashing runs on a fresh aligned copy and is
-  thread-safe as-is, and `SHA1HANDSOFF` must stay off — see callout), **S27**
-  (Windows DLL-planting load path), ~~**S7**~~ (not a bug on 64-bit),
+  thread-safe as-is, and `SHA1HANDSOFF` must stay off — see callout),
+  ~~**S27**~~ (fixed — `LoadLibraryEx` + `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`,
+  `f5f7079`; no Windows CI), ~~**S7**~~ (not a bug on 64-bit),
   ~~**S21**~~ (fixed — `hash_mask` now `uint64_t`), ~~**S8**~~ (not reachable +
   vendored), ~~**S11**~~ (not a bug on 64-bit — exact-fit), ~~**ST2**~~ (fixed —
-  `-Wformat-signedness` clean tree-wide, `302b365`). **Remaining Band 4 is
-  exactly one item, not a reachable memory-safety bug:** **S27** (Windows
-  DLL-planting) — a platform/load-path hardening item, best addressed on the
-  Windows packaging side.
+  `-Wformat-signedness` clean tree-wide, `302b365`). **Band 4 is now fully
+  swept** — every finding is fixed, reclassified as a non-bug on the supported
+  64-bit build, or (S26) shown not reachable in vsearch's usage. The one
+  platform item, **S27** (Windows DLL-planting), is hardened in source
+  (`f5f7079`) but carries a caveat: there is **no Windows CI target**, so its
+  Windows branch ships unverified from the fork and wants a manual
+  build/smoke-test before it is fully trusted.
 
 ### Band 5 — Library-API correctness & lifecycle
 
