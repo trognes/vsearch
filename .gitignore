@@ -29,3 +29,6 @@
 .vscode
 .DS_Store
 .Tpo
+
+# Claude Code on the web session config (overrides the *.json rule above)
+!.claude/settings.json
