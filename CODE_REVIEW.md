@@ -571,6 +571,12 @@ no safety net.
 
 #### S8. `md5.c` `body()` unsigned-underflow loop if called with `size == 0` (Low)
 
+**Status: NOT REACHABLE — no change.** `MD5_Update` only ever calls `body()` with
+a non-zero multiple of 64, so the `size == 0` underflow (and the
+non-multiple-of-64 under-run) cannot occur; the routine's contract is honoured by
+its only caller. `md5.c` is also **vendored** (`src/vendored/md5.c`) — re-sync
+from upstream rather than adding an internal guard. Original analysis below.
+
 `body()` ends with `} while (size -= 64);` (`md5.c:200`); a `size` of 0 would
 underflow to ~`ULONG_MAX` and read far out of bounds. All current callers pass
 a non-zero multiple of 64, so it is **not currently reachable** — latent only.
@@ -598,6 +604,13 @@ go out of bounds. Large allocations elsewhere would likely fail first.
 - **Effort:** Low · **Impact:** Low · **Criticality:** Low · *needs-confirmation*
 
 #### S11. Wrong `sizeof` in `dbmatched` allocation (Low, latent)
+
+**Status: NOT A BUG on the supported platform.** vsearch is 64-bit only (see
+CLAUDE.md), where `sizeof(uint64_t*) == sizeof(uint64_t) == 8`, so
+`xmalloc(seqcount * sizeof(uint64_t *))` for a `uint64_t` array is an exact fit —
+not an over- or under-allocation. The wrong-type `sizeof` is worth a cosmetic
+correction for clarity/portability, but it is not a defect on any target vsearch
+runs. Same class as S7. Original analysis below.
 
 `dbmatched = (uint64_t *) xmalloc(seqcount * sizeof(uint64_t *))`
 (`search_exact.cc:748`, `search.cc:838`) sizes an array of `uint64_t` using
@@ -678,18 +691,18 @@ exceed an undersized `kmerhashsize`, giving out-of-bounds writes to
 
 #### S14. UDB header/length tables stored as `std::vector<int>` for unsigned 32-bit file values (Medium)
 
-**Re-confirm (2026-07-02): largely addressed.** Both containers are now
-**unsigned**: `std::vector<unsigned int> header_index(seqcount + 1)`
-(`udb.cc:414`) and `std::vector<unsigned int> sequence_lengths(seqcount)`
-(`udb.cc:453`), and each value is validated before use — header offsets against
-`[last, udb_headerchars)` with a `headerlen` overflow guard (`udb.cc:424–433`)
-and sequence lengths with a matching `INT_MAX − headroom` guard (`udb.cc:465`).
-That is the storage-type + validation fix prescribed below, and it removes the
-type-level root cause under S3 and S9. What the recommendation below still asks
-for that is *not* yet done: nothing further of substance — the `header_index[i+1]
-== current_index` (equal-offset) case is handled by the S3 `headerlen` guard
-rather than an explicit `>` reject, which is worth tidying for clarity. Original
-analysis below (the cited `vector<int>` sites are now stale).
+**Status: FIXED.** Both containers are `std::vector<unsigned int>`
+(`header_index`, `sequence_lengths`), so top-bit-set file values are no longer
+read as negative `int`, and each value is validated before use — header offsets
+against `[last, udb_headerchars)` plus a `headerlen` overflow guard, and sequence
+lengths with a matching `INT_MAX − headroom` guard. That storage-type + validation
+fix removes the type-level root cause under S3 and S9. The one remaining tidy-up
+this entry used to note — an *explicit* strictly-increasing (`>`) offset reject
+instead of relying on the downstream `headerlen` guard — landed with the S3 fix
+(`9bc4e4d`): `if (header_index[i + 1] <= current_index) fatal(...)`. Nothing left
+(the `header_index[seqcount]` `uint64_t`→`uint32_t` store is inherent to the
+32-bit on-disk offset format, an S5-family width point, not the signedness issue
+S14 is about). Original analysis below (the cited `vector<int>` sites are stale).
 
 `udb_read` reads the per-sequence header offsets and lengths straight from the
 file into **signed** containers: `std::vector<int> header_index(seqcount + 1)`
@@ -838,6 +851,13 @@ Valgrind will flag it).
   (reachable; one-struct over-read, value unused)*.
 
 #### S21. `derep_prefix` hash mask declared `int` while the table size is `int64_t` → OOB at extreme scale (latent)
+
+**Status: FIXED (already in current source).** `hash_mask` is now
+`uint64_t const hash_mask = static_cast<uint64_t>(hashtablesize - 1)`
+(`derep_prefix.cc:208`), matching the `int64_t hashtablesize`, so it no longer
+truncates to a negative `int` at 2³¹ buckets; the `hashtable[hash & hash_mask]`
+indices (`:270`, `:309`) stay confined. The entry below described the old `int`
+mask (doc was stale). Original analysis below.
 
 `derep_prefix` grows `int64_t hashtablesize` by `<<= 1` until `3*dbsequencecount
 <= 2*hashtablesize` (`derep_prefix.cc:198–202`), then truncates it into `int const
@@ -2876,19 +2896,19 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S5 | 64-bit length → `int` truncation in print path | Security | Medium | Medium | Low | Fixed (reachable defects closed; Tier 2 typing cosmetic, Tier 3 skipped) |
 | S6 | UDB additive allocation size unchecked | Security | Low | Medium | Low | Fixed (`63ab55a`) — additive `datap` sizes now routed through an overflow-checked helper |
 | S7 | `xmalloc`/`xrealloc` no overflow check; `count*size` callers | Security | Low | Medium | Low | Not a bug (64-bit only) — `count*size` products can't overflow 64-bit `size_t`; the real residual (library-path `opt_maxaccepts/maxrejects`→`tophits` truncation, a correctness issue) is Band 5 C1(e) |
-| S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low | Latent |
+| S8 | `md5.c` `body()` underflow if `size==0` (latent) | Security | Low | Low | Low | Not reachable — callers pass non-zero ×64 by contract; also vendored (`src/vendored/md5.c`), so left pristine |
 | S9 | UDB `seqcount+1` wrap at `UINT_MAX` | Security | Low | Low | Low | Fixed (`9bc4e4d`) — `seqcount` now bounded by `filesize/4`, closing the `seqcount+1` wrap |
-| S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low | Latent |
+| S11 | Wrong `sizeof` in `dbmatched` alloc (latent) | Security | Low | Low | Low | Not a bug on 64-bit — `sizeof(uint64_t*) == sizeof(uint64_t) == 8` (exact fit); optional cosmetic `sizeof` fix |
 | S12 | DUST k-mer accumulator `int` left-shift overflow (CI-confirmed) | Bug | Low | Low | Low | Fixed (`3946769`) |
 | S13 | `opt_wordlength` unvalidated on library path → shift UB + undersized k-mer index OOB | Security | Low | High | Medium | Pending |
-| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Largely addressed (re-confirm 2026-07-02: `header_index`/`sequence_lengths` are now `std::vector<unsigned int>` with per-entry region validation at `udb.cc:424`/`465`; closes the root cause under S3/S9) |
+| S14 | UDB header/length tables stored as `std::vector<int>` (signed) for unsigned 32-bit values | Security | Low | Medium | Medium | Fixed — tables are `std::vector<unsigned int>` with per-entry region validation; the last tidy-up (explicit strictly-increasing offset reject) landed in `9bc4e4d` |
 | S15 | SFF flowgram-skip wrong short-read threshold → silent offset desync | Security | Low | Low–Med | Low–Med | Fixed (`9d7f242`) |
 | S16 | UDB `kmerindexsize` summed from unchecked file counts, no consistency check | Security | Low | Medium | Low–Med | Fixed (`63ab55a`) — overflow-checked sum + reject total > `filesize/4` |
 | S17 | `opt_chimeras_parents_max` unvalidated on library path → OOB write in `find_best_parents_long` | Security | Low | High | Medium | Pending |
 | S18 | `chimera_detect_single` trusts caller `query_len` → heap overflow via `strcpy` | Security | Low | High | Medium | Pending |
 | S19 | Chimera denovo model-string fill over-increments `nth_parent` → OOB read | Security | Low | Med–High | Medium | Needs-confirm |
 | S20 | `random_subsampling` reads one element past `seqindex` (reachable OOB read, `--sizein`) | Bug | Low | Low–Med | Medium | Fixed (`cb12ba7`) |
-| S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Latent |
+| S21 | `derep_prefix` `int` hash mask vs `int64_t` table size → OOB at 2³¹ buckets | Security | Low | High | Low | Fixed — `hash_mask` is now `uint64_t` (`derep_prefix.cc:208`), matching `hashtablesize` |
 | S22 | Non-finite (NaN) CLI float bypasses range validation → NaN→`uint64_t` cast UB | Security | Low | Low | Low | Fixed (`4198319`) — `std::isfinite` guard in `args_getdouble` |
 | S23 | `fastq_eestats` `ee_start()` 32-bit overflow on reads >~2074 bp → heap OOB | Bug | Low | High | High | Fixed (`94ed5fe`) |
 | S24 | `fastq_eestats` per-position quality-row OOB write when `--fastq_qmin ≥ 2` | Bug | Low–Med | High | High | Fixed (`6740721`) |
@@ -3071,10 +3091,13 @@ Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.
   `args_getdouble`, `4198319`), ~~**S26**~~ (not reachable in vsearch usage —
   vendored code left pristine; hashing runs on a fresh aligned copy and is
   thread-safe as-is, and `SHA1HANDSOFF` must stay off — see callout), **S27**
-  (Windows DLL-planting load path), ~~**S7**~~ (not a bug on 64-bit — see callout)
-  /**S8**/**S11**/**S21** (latent overflow/scale), **ST2** (format signedness).
-  Remaining Band 4: crafted-input latents (S25/S21/S27, best via Band 8 fuzzing)
-  plus benign/not-reachable items (S8/S11/S26/ST2).
+  (Windows DLL-planting load path), ~~**S7**~~ (not a bug on 64-bit),
+  ~~**S21**~~ (fixed — `hash_mask` now `uint64_t`), ~~**S8**~~ (not reachable +
+  vendored), ~~**S11**~~ (not a bug on 64-bit — exact-fit), **ST2** (format
+  signedness). **Remaining Band 4 is exactly three items, none a reachable
+  memory-safety bug:** **S25** (CIGAR walk bound) and **S27** (Windows
+  DLL-planting) — crafted-input/platform, best via Band 8 fuzzing — plus **ST2**
+  (cosmetic `printf` signedness, ~13 sites).
 
 ### Band 5 — Library-API correctness & lifecycle
 
