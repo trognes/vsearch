@@ -20,16 +20,20 @@ and complicates upstream cherry-picks — keep commits small and readable.
 ## Build
 
 ```bash
-./autogen.sh
 ./configure CFLAGS="-O2" CXXFLAGS="-O2"
 make ARFLAGS="cr"            # produces bin/vsearch
 ```
 
 - **`ARFLAGS="cr"` is required** on the `make` line — the CI and release builds
   all pass it; omitting it can break the archive step.
-- The build uses **autotools**; `./autogen.sh` regenerates `configure` from
-  `configure.ac` / `Makefile.am` / `src/Makefile.am`. Edit those, not the
-  generated `Makefile`/`configure`.
+- The generated build files (`configure`, `Makefile.in`, `src/Makefile.in`, ...)
+  are **committed and authoritative**: `configure.ac` sets
+  `AM_MAINTAINER_MODE([disable])`, so `make` never regenerates them and an
+  ordinary build needs **no** autoconf/automake (any version). Run `./autogen.sh`
+  **only** after editing `configure.ac` / `Makefile.am` / `src/Makefile.am`, then
+  commit the regenerated files alongside the source change. The pinned toolchain
+  is **automake 1.16.5** (Debian oldstable) — regenerating with a different
+  version rewrites every file's version stamp, so match it.
 - C++11 with **`-fno-exceptions`** — there is no exception-based error handling
   anywhere (see `fatal()` below).
 - `-O3` is safe but note: `align_simd.cc` carries a pragma disabling
