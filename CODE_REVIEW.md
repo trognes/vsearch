@@ -2380,28 +2380,32 @@ whose empty vector is not all-zero-bits. The correct reset is value-init /
   or value-initialize the struct; never `memset` a type with `std::vector` members.
 - **Effort:** Low–Medium · **Impact:** Medium · **Criticality:** Low–Medium · *verified*
 
-### ST2. `printf`-family format/argument signedness mismatches (batch)
+### ST2. `printf`-family format/argument signedness mismatches (batch) — **Fixed**
 
-cppcheck pinpoints ~13 sites where a `%u`/`%d` conversion does not match the
-argument's signedness — concrete instances of the **P1(a)** width/sign family:
+Signed/unsigned mismatches between a `printf` conversion specifier and its
+argument — concrete instances of the **P1(a)** width/sign family. The original
+one-off cppcheck line-list (chimera/fasta/fastq/orient/sff_convert/udb, ~13
+sites) had drifted against the current tree; the authoritative set is now
+whatever GCC `-Wformat-signedness` flags. That set was swept to zero across the
+whole source tree. Fixed sites, by file, each keeping the argument type and
+matching the specifier:
 
-| File:line | Mismatch |
-|-----------|----------|
-| `chimera.cc:2522, 2534, 2552, 2562` | `%u` ← signed `int` |
-| `fasta.cc:537`, `fastq.cc:719` | `%u` ← signed `int` |
-| `orient.cc:430` (×2) | `%d` ← `unsigned int` |
-| `sff_convert.cc:402` (×2), `:445`, `:452` | `%d` ← `unsigned int` |
-| `sha1.c:125` (×2) | `%d` ← `unsigned int` |
-| `udb.cc:725, 872` | `%u` ← signed `int` |
+| File | Fix |
+|------|-----|
+| `derep.cc`, `derep_smallmem.cc` | min/max lengths (`int64_t`) → `PRId64`; discarded counts, unique-sequence / uniques-written / clusters-discarded counts and the uc cluster index `i` (all `uint64_t`) → `PRIu64` |
+| `fastq_mergepairs.cc` | Pairs / Merged / Not merged totals (`int64_t`) → `PRId64` |
+| `msa.cc` | alignment-profile counts (`prof_type == uint64_t`) → `PRIu64` |
+| `results.cc` | SAM FLAG and MAPQ `int` expressions → `%d` |
+| `udb.cc` | Word width / Word ones (`opt_wordlength`, `int64_t`) → `PRId64` |
 
-Benign for in-range values on LP64 (where `int` and `unsigned` share a width),
-but a signed/unsigned format mismatch is technically UB and trivially fixed by
-matching the specifier. Also in this group: `fastx.cc:175` passes three
-arguments to a `format` that one caller fills with only two conversions
-(`wrongPrintfScanfArgNum`) — the extra argument is evaluated and ignored, so it
-is harmless, but worth aligning.
+A signed/unsigned conversion mismatch is technically UB even when benign for
+in-range values on LP64 (where `int` and `unsigned` share a width); matching the
+specifier removes it. The vendored `sha1.c` `%d` sites from the old list are now
+under `#ifdef VERBOSE` (not compiled) and left untouched. `fastx.cc:175`
+(`wrongPrintfScanfArgNum` — one caller supplies an extra, ignored argument) was
+harmless and no longer flagged; left as-is.
 
-- **Effort:** Low · **Impact:** Low · **Criticality:** Low · *verified*
+- **Effort:** Low · **Impact:** Low · **Criticality:** Low · **Fixed** (`-Wformat-signedness` clean tree-wide)
 
 ### Notable false positives (recorded — no action)
 
@@ -2916,7 +2920,7 @@ No item is marked "Ignored" — nothing has been triaged as won't-fix; the
 | S26 | SHA-1/MD5 transform: write-through-`const` + unaligned type-punning (UB) | Security | Low | Medium | Medium | Not reachable in vsearch usage (no code change) — hashing runs on a fresh heap-aligned `std::vector` copy; vendored code is thread-safe as-is. **Do NOT enable `SHA1HANDSOFF`** (its `static` workspace would race — SHA-1 runs in search workers) |
 | S27 | zlib/bzip2 loaded by bare soname → search-path trust (Windows DLL planting) | Security | Low | Low/Med | Low | Latent |
 | ST1 | `memset` on `searchinfo_s` (has `std::vector` members) → leak/UB | Static analysis | Low–Med | Medium | Low–Med | Latent |
-| ST2 | `printf` format/arg signedness mismatches (batch, ~13 sites) | Static analysis | Low | Low | Low | Latent |
+| ST2 | `printf` format/arg signedness mismatches (batch) | Static analysis | Low | Low | Low | Fixed (`302b365`) — `-Wformat-signedness` clean tree-wide |
 | B1 | `--log` qmin message → `stderr` not `fp_log` (3 sites `310e7de`+`6dbba98`; `rereplicate.cc` sibling `273c40d`) | Bug | Low | Low–Med | Medium | Fixed |
 | B2 | MSA consensus `;length=` reported one too large (`--consout --lengthout`, `bb45598`) | Bug | Low | Low | Low | Fixed |
 | I1 | Unchecked output write/flush/close → silent truncation | I/O robustness | Medium | Med–High | Low–Med | Fixed (`e9405c6`) |
@@ -3093,11 +3097,10 @@ Real memory-safety bugs, but they require a **deliberately malformed** `.udb`/`.
   thread-safe as-is, and `SHA1HANDSOFF` must stay off — see callout), **S27**
   (Windows DLL-planting load path), ~~**S7**~~ (not a bug on 64-bit),
   ~~**S21**~~ (fixed — `hash_mask` now `uint64_t`), ~~**S8**~~ (not reachable +
-  vendored), ~~**S11**~~ (not a bug on 64-bit — exact-fit), **ST2** (format
-  signedness). **Remaining Band 4 is exactly three items, none a reachable
-  memory-safety bug:** **S25** (CIGAR walk bound) and **S27** (Windows
-  DLL-planting) — crafted-input/platform, best via Band 8 fuzzing — plus **ST2**
-  (cosmetic `printf` signedness, ~13 sites).
+  vendored), ~~**S11**~~ (not a bug on 64-bit — exact-fit), ~~**ST2**~~ (fixed —
+  `-Wformat-signedness` clean tree-wide, `302b365`). **Remaining Band 4 is
+  exactly two items, neither a reachable memory-safety bug:** **S25** (CIGAR
+  walk bound) and **S27** (Windows DLL-planting) — crafted-input/platform, best via Band 8 fuzzing.
 
 ### Band 5 — Library-API correctness & lifecycle
 
